@@ -1,0 +1,34 @@
+{
+  "scenario": "m0-reference",
+  "cpu_ops": 100000,
+  "dma_ops": 100000,
+  "seeds": [
+    {
+      "seed": 0,
+      "events": 1298634,
+      "state": "6b020f8191178bcb3ed23d151ac8ce8c8275670eb70804b5bcd44435f6d2e6bb",
+      "execution": "4542a6ab0a0c39ee5fb4d3eb52244eb27c28e98a1d28060a1abab19e731d9549",
+      "trace": "42d52a7f1fcedb76b89bc079065c58220491654897aee3d84954421a0eee0fd3"
+    },
+    {
+      "seed": 1,
+      "events": 1298681,
+      "state": "8ce184cd8621fc224771c64959d2b39d0a3273f73327a97b308be795fd124395",
+      "execution": "63408af3fd9dd7b8f00e3dd3f4ad691e8cb03a29ddf92757c3e584b5c9fc7c0a",
+      "trace": "2f4388df92871bea48c97717d99c09e44412352b75c9b99abf7cd3f47d4d454a"
+    },
+    {
+      "seed": 3735928559,
+      "events": 1298659,
+      "state": "fda5bdaa09350aa69b5ca9c707c1880780b49861dcbf12db6bac35f74d0b2cd9",
+      "execution": "ca18736492c8f48757608813b08672e0395a19fc7f45f1bf5d0c4da95705423e",
+      "trace": "65891131d71e388de0baa0fe005604e3f123a49327beb5734d0480084dc40ea5"
+    }
+  ],
+  "mid_snapshot": {
+    "file": "m0-reference.mid.snap",
+    "seed": 3735928559,
+    "after_events": 649329,
+    "blake3": "0587301add6d6d60fe95f14ea407bc4ae6dafd2eca80c42dcaadedac5593bcda"
+  }
+}
