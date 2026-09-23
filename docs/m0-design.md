@@ -39,9 +39,9 @@ M0 contains no CPU, no OS, and no UI. It is done when a small multi-clock, multi
 contracts/                        (repo: SystemScope/contracts)
 └─ crates/systemscope-contracts/
    ├─ time.rs        Tick, SimulationClock, Duration, Frequency, ClockDomain
-   ├─ event.rs       Phase, EventKey, When
+   ├─ event.rs       Phase, EventKey, ScheduleWhen
    ├─ error.rs       SimError
-   ├─ component.rs   Component, SimContext, PortSpec, ComponentId
+   ├─ component.rs   Component, InitContext, SimContext, PortSpec, ComponentId
    ├─ topology.rs    Link, TopologySpec
    ├─ protocol/
    │  └─ mem.rs      mem.v0 messages
@@ -159,23 +159,27 @@ pub struct EventKey { tick: Tick, phase: Phase, sequence: u64 }   // ordered lex
 ### 4.2 Scheduling API
 
 ```rust
-pub enum When {
+// Component-facing: never expressed in ticks.
+pub enum ScheduleWhen {
     Now,
-    Ticks(u64),
     After(Duration),
     Cycles { domain: ClockDomainId, k: u64 },
 }
 
-// on SimContext:
-fn send(&mut self, port: PortId, msg: Message, when: When, phase: Phase) -> Result<(), SimError>;
-fn wake_self(&mut self, when: When, phase: Phase, token: u64) -> Result<(), SimError>;
+// on InitContext and SimContext:
+fn send(&mut self, port: PortId, msg: Message, when: ScheduleWhen, phase: Phase) -> Result<(), SimError>;
+fn wake_self(&mut self, when: ScheduleWhen, phase: Phase, token: u64) -> Result<(), SimError>;
 ```
+
+- **Components never handle ticks.** `ScheduleWhen` has no tick variant, and contexts expose no clock or domain objects. A component that wrote a raw tick count would silently change meaning whenever the session resolution changed.
+- **Only the runtime resolves `ScheduleWhen` to an absolute `Tick`**, then adds link latency (§6). Absolute ticks exist only inside the runtime and its tests.
+- **The runtime stamps every event with its source.** `send()` and `wake_self()` take no source argument; the context attaches the `ComponentId` of the component that is running. Components cannot forge a source.
 
 ### 4.3 Scheduling Rules
 
 | Rule | Statement | On violation |
 |---|---|---|
-| **S1** | The target tick is ≥ `now`. `When` delays are unsigned, so this holds by construction for them; absolute ticks are checked. | `SimError::PastTick` |
+| **S1** | The target tick is ≥ `now`. `ScheduleWhen` delays are unsigned, so this holds by construction for them; runtime-internal absolute ticks are checked. | `SimError::PastTick` |
 | **S2** | If the target tick equals `now`, the target phase must be ≥ the current phase. Phases are monotonic within a tick. | `SimError::PhaseViolation`, a fatal error with a diagnostic |
 | **S3** | Components cannot schedule into `Observe`. | `SimError::PhaseViolation` |
 | **S4** | `sequence` is assigned by the runtime in scheduling order. | — |
@@ -183,6 +187,8 @@ fn wake_self(&mut self, when: When, phase: Phase, token: u64) -> Result<(), SimE
 | **S6** | `sequence` is checked-incremented and never wraps. | `SimError::SequenceOverflow` |
 
 Work that needs an earlier phase must move to `tick + 1` or later.
+
+**Every scheduler operation is atomic.** A failed `schedule` or `pop` leaves the queue, sequence counter, and S5 counter exactly as they were. A handler is *not* atomic: if it schedules three events and the fourth fails, the first three stay queued. This is safe because any error puts the runtime into `Faulted` (§5.1), from which the run can never resume.
 
 ### 4.4 Runtime Loop
 
@@ -241,7 +247,7 @@ Any change to this encoding, or to a protocol message's field layout, changes ev
 pub trait Component {
     fn type_name(&self) -> &'static str;
     fn ports(&self) -> Vec<PortSpec>;
-    fn init(&mut self, ctx: &mut dyn SimContext) -> Result<(), SimError>;
+    fn init(&mut self, ctx: &mut dyn InitContext) -> Result<(), SimError>;
     fn handle_event(&mut self, ev: &Delivered, ctx: &mut dyn SimContext) -> Result<(), SimError>;
 
     fn snapshot_schema_version(&self) -> u32;
@@ -257,19 +263,47 @@ pub enum Delivered {
 }
 ```
 
-`SimContext` gives a component:
+Two contexts give a component everything it may touch:
 
-- `now()` and `phase()`
-- `send()` and `wake_self()`
-- `clock(domain)`, which is read-only
-- `rng()`, returning the component's `SimRng`
-- `trace(record)`
+| | `InitContext` (in `init`) | `SimContext` (in `handle_event`) |
+|---|---|---|
+| `send()`, `wake_self()` | yes, relative to tick 0; any phase except `Observe` | yes, relative to now; subject to S1–S6 |
+| `now()`, `phase()` | no: nothing has been dispatched yet | yes, for diagnostics and traces |
+| `rng()` | yes | yes |
+| `trace(record)` | yes | yes |
+| clocks, clock domains, other components | no | no |
 
-It gives **no access to other components**.
+**Components never reach each other directly.** The runtime owns every component (`Vec<Box<dyn Component>>`), and no context offers a way to reach another component. A direct call therefore cannot be written, not merely forbidden. All interaction goes through the event queue: `send()` enqueues and returns, the sending handler finishes, and the runtime dispatches the receiver later. This holds even for a zero-latency link, so there is no reentrancy.
+
+**Errors are sticky.** A context remembers the first error it returned. If the component swallows that error and returns `Ok`, the runtime still faults.
 
 - **There is no global `step()`.** A clocked component models a clock step by waking itself on its domain's edges (`wake_self(Cycles { domain, k: 1 }, …)`). Idle components cost nothing.
 - **`SimRng` uses a fixed, specified algorithm.** It must not be one whose output can change between library versions. It is seeded from `(session_seed, component_path)`, and its state is part of the component snapshot.
 - **`ComponentId`s are assigned in topology declaration order.** `component_path` is a stable, human-readable name such as `soc.cpu0`. The declaration order itself must be deterministic (§6).
+
+> **Component invariant.** A component cannot see other components and never handles physical ticks. Every interaction happens through events whose time and source the runtime assigns.
+
+### 5.1 Lifecycle
+
+```text
+New session:      build topology → elaborate → init (ComponentId order) → Ready → run
+Restored session: build topology → elaborate → restore                  → Ready → run
+                                                  ↑ init is never called
+Any error (elaboration, init, handler, scheduler)                        → Faulted
+```
+
+| State | `init` | `run` / `step` | `snapshot` | `inspect` |
+|---|---|---|---|---|
+| `Elaborated` | once | no | no | yes |
+| `Ready` | no | yes | yes | yes |
+| `Faulted` | no | no | no | yes |
+
+- **Initialization order is fixed.** Components are initialized in `ComponentId` order, one at a time. Initial events therefore receive deterministic sequence numbers.
+- **Restore never calls `init`.** Initial events already live in the restored queue. Calling `init` again would duplicate them and shift every later sequence number, breaking replay.
+- **`Faulted` is terminal.** It records the error that caused it. `run` and `step` are refused, and `snapshot` is refused because a snapshot must be a resumable checkpoint. `inspect()` stays available for diagnosis.
+  - An init failure faults the session even though earlier components already initialized. Handler failures work the same way.
+  - A post-mortem `fault_dump()` that is explicitly *not* resumable may be added later. It is out of scope for M0.
+- **Reset means a new session.** A handler may have mutated its component before failing, so clearing the scheduler is not enough. Reset discards the runtime and builds a new one from the same topology and seed: `build topology → elaborate → init`.
 
 ---
 
@@ -296,7 +330,7 @@ Elaboration runs once before `init` and validates the topology:
 - The topology is immutable after elaboration.
 - Its canonical hash (`topology_hash`) is stored in the trace header and in every snapshot.
 
-A message sent on a port is delivered to the peer port after the link latency, if there is one. It is delivered in the phase the sender requested, subject to rule S2.
+A message sent on a port is delivered to the peer port after the link latency, if there is one. The runtime resolves `ScheduleWhen` from now, then adds the latency from that tick (`Duration` rounded up, or `Cycles` counted from the next edge). It is delivered in the phase the sender requested, subject to rule S2 at the final tick. The message's protocol must match the sending port's protocol, otherwise the send fails with `SimError::ProtocolMismatch`.
 
 ### `mem.v0` (the only M0 protocol)
 
