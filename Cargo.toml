@@ -1,0 +1,21 @@
+[workspace]
+resolver = "3"
+members = ["runtime", "components/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.98.1"
+
+[workspace.dependencies]
+# Local sibling checkout during multi-repo development (see plan.md §10).
+systemscope-contracts = { path = "../contracts/crates/systemscope-contracts" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+float_arithmetic = "deny"
+disallowed_methods = "deny"
+disallowed_types = "deny"

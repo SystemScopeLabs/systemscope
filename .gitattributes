@@ -1,0 +1,5 @@
+* text=auto eol=lf
+
+# Exact-byte test artifacts
+*.jsonl -text
+*.snap -text

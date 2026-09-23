@@ -1,0 +1,12 @@
+# Determinism rules (docs/m0-design.md §8.3).
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "wall-clock time breaks determinism; use Tick" },
+    { path = "std::time::SystemTime::now", reason = "wall-clock time breaks determinism; use Tick" },
+    { path = "std::thread::spawn", reason = "M0 simulation is single-threaded" },
+]
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "iteration order is not deterministic; use BTreeMap" },
+    { path = "std::collections::HashSet", reason = "iteration order is not deterministic; use BTreeSet" },
+    { path = "std::time::Instant", reason = "wall-clock time breaks determinism; use Tick" },
+    { path = "std::time::SystemTime", reason = "wall-clock time breaks determinism; use Tick" },
+]
