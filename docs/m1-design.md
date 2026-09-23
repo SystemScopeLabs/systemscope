@@ -175,7 +175,7 @@ x[32]   u32, with x[0] hard-wired to 0
 | Invariant | Rule |
 |---|---|
 | XLEN | 32 |
-| `x0` | Always reads 0. Writes to it are discarded. It is not stored. |
+| `x0` | Always reads 0. Writes to it are discarded. It is not stored: `RegisterFile` holds only `x1` to `x31`, in index order. |
 | `pc` | Always 4-byte aligned. With no C extension, a misaligned target traps on the jump or branch that produces it (§6), so `pc` itself never becomes misaligned. |
 | Instruction width | 32 bits, little-endian |
 | Arithmetic | Wraps modulo 2^32 |
@@ -184,9 +184,11 @@ x[32]   u32, with x[0] hard-wired to 0
 
 ### 5.2 Decode
 
-Decoding is a pure function `decode(u32) -> Result<Instr, Illegal>`, total over all 2^32 words. It never panics.
+Decoding is a pure function `decode(u32) -> Result<Instr, Illegal>`, total over all 2^32 words. It never panics. `Illegal { word }` keeps the raw word for the trap value (§6). Decode, the immediate extractors, and the register file depend on nothing in the simulation.
 
-- **Immediates are extracted in one place:** `imm_i`, `imm_s`, `imm_b`, `imm_u`, `imm_j`. No instruction extracts immediate bits on its own.
+- **`Instr` has no representation for an illegal encoding.** Variants follow the formats, with an operation enum where a format has several instructions: `Lui`, `Auipc`, `Jal`, `Jalr`, `Branch { op: BranchOp }`, `Load { op: LoadOp }`, `Store { op: StoreOp }`, `OpImm { op: ImmOp }`, `ShiftImm { op: ShiftOp, shamt }`, `Op { op: RegOp }`, `Fence`, `Ecall`, `Ebreak`. Operands are already extracted, and `decode` produces only in-range immediates and shift amounts, so execution never re-examines `funct3` or `funct7`. `Instr` does not keep the raw word; the CPU keeps it separately for traces and traps.
+- **Registers are `Reg`,** an index that is always below 32: the decoder builds it from a 5-bit field, and `Reg::new` rejects 32 and above.
+- **Immediates are extracted in one place:** `imm_i`, `imm_s`, `imm_b`, `imm_u`, `imm_j`. No instruction extracts immediate bits on its own. The signed ones return `i32`, already sign-extended, with branch and jump offsets as even byte offsets. `imm_u` returns the `u32` with the low 12 bits zero.
 - **The 40 instructions:**
 
   | Group | Instructions |
