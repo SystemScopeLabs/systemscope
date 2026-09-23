@@ -463,6 +463,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "systemscope-rv32i"
+version = "0.0.0"
+
+[[package]]
 name = "systemscope-toy"
 version = "0.0.0"
 dependencies = [

@@ -1,0 +1,13 @@
+[package]
+name = "systemscope-rv32i"
+description = "RV32I decode, architectural state, and CPU component for SystemScope M1"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# Decode and the register file are pure: they depend on nothing in the simulation.
+# The CPU component will depend only on contracts (docs/m1-design.md §3).
+[dependencies]
+
+[lints]
+workspace = true
