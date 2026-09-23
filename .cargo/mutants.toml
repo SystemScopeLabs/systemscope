@@ -1,0 +1,3 @@
+# cargo-mutants (https://mutants.rs): nightly exploration of mutations nobody thought
+# of. Targeted mutation checks written for each design rule stay in the regular tests.
+test_tool = "nextest"

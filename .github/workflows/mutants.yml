@@ -1,0 +1,48 @@
+name: Mutants
+
+# Nightly and on demand only: exploratory, never a PR gate.
+on:
+  schedule:
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    working-directory: systemscope
+
+jobs:
+  mutants:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: systemscope
+      # systemscope depends on `../contracts` by path (plan.md §10), so reproduce the
+      # sibling layout. Until contracts is pinned by revision, this tracks its main.
+      - uses: actions/checkout@v4
+        with:
+          repository: SystemScope/contracts
+          path: contracts
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: systemscope
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants,cargo-nextest
+      # The checkout is disposable, so mutate it in place.
+      # Mutate only this repository; contracts has its own nightly run.
+      - run: cargo mutants --workspace --in-place --no-shuffle
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants.out
+          path: systemscope/mutants.out
