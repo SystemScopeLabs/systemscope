@@ -2,10 +2,13 @@
 //!
 //! [`AddressBus`] is the only component that knows the memory map: it routes each
 //! `mem.v1` request to the one region that contains it, as a region-relative offset, and
-//! answers every other request with an access fault. It knows nothing about the CPU.
+//! answers every other request with an access fault. [`Ram`] is a sparse, canonical
+//! memory that serves those offsets. Neither knows about the CPU.
 //!
-//! Like the M0 toy components, it depends only on `systemscope-contracts`.
+//! Like the M0 toy components, they depend only on `systemscope-contracts`.
 
 pub mod bus;
+pub mod ram;
 
 pub use bus::{AddressBus, BusConfigError, Region};
+pub use ram::{Ram, RamConfig, RamConfigError, RamImage, Segment};
