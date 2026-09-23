@@ -40,6 +40,7 @@ contracts/                        (repo: SystemScope/contracts)
 └─ crates/systemscope-contracts/
    ├─ time.rs        Tick, SimulationClock, Duration, Frequency, ClockDomain
    ├─ event.rs       Phase, EventKey, When
+   ├─ error.rs       SimError
    ├─ component.rs   Component, SimContext, PortSpec, ComponentId
    ├─ topology.rs    Link, TopologySpec
    ├─ protocol/
@@ -174,7 +175,7 @@ fn wake_self(&mut self, when: When, phase: Phase, token: u64) -> Result<(), SimE
 
 | Rule | Statement | On violation |
 |---|---|---|
-| **S1** | The target tick is ≥ `now`. Delays are unsigned, so this holds by construction. | — |
+| **S1** | The target tick is ≥ `now`. `When` delays are unsigned, so this holds by construction for them; absolute ticks are checked. | `SimError::PastTick` |
 | **S2** | If the target tick equals `now`, the target phase must be ≥ the current phase. Phases are monotonic within a tick. | `SimError::PhaseViolation`, a fatal error with a diagnostic |
 | **S3** | Components cannot schedule into `Observe`. | `SimError::PhaseViolation` |
 | **S4** | `sequence` is assigned by the runtime in scheduling order. | — |
@@ -189,7 +190,7 @@ Work that needs an earlier phase must move to `tick + 1` or later.
 loop:
     ev = queue.pop_min()                        // by EventKey
     if ev.key.tick > run_until: push back; stop
-    now, current_phase = ev.key.tick, ev.key.phase
+    last_dispatched = ev.key                    // now and current phase derive from it
     execution_digest = H(execution_digest ‖ canonical(ev))
     target.handle_event(ev, ctx)                // ctx enforces S1–S6
     observers.on_after_dispatch(ev, world)      // read-only; may request Pause
@@ -318,8 +319,8 @@ Each initiator allocates `TxnId`s from its own counter, so they are deterministi
 pub struct RuntimeSnapshot {
     format_version: u32,
     session: SessionInfo,          // seed, ticks_per_second, clock domains, topology_hash, contracts version
-    now: Tick,
-    current_phase: Phase,
+    last_dispatched: Option<EventKey>,    // now and current phase derive from it
+    dispatched_in_phase: u64,             // S5 count within last_dispatched's (tick, phase)
     next_sequence: u64,
     execution_digest: [u8; 32],
     queue: Vec<Event>,             // sorted by EventKey
@@ -327,7 +328,10 @@ pub struct RuntimeSnapshot {
 }
 ```
 
-- **Snapshots may be taken at any event boundary**, including mid-tick between phases. `current_phase` records where the run was.
+- **Snapshots may be taken at any event boundary**, including mid-tick between phases. `last_dispatched` and `dispatched_in_phase` record exactly where the run was, including S5 progress.
+- **The queue is exported sorted by key and may be restored in any order.** Keys are unique, so dispatch order never depends on queue internals.
+- **Restore rejects scheduler states no valid run could produce:** duplicate sequences, sequences not below `next_sequence`, pending events at or before `last_dispatched`, pending `Observe` events, or a `dispatched_in_phase` inconsistent with `last_dispatched` or the S5 limit.
+- **`max_events_per_phase` is session configuration**, not snapshot state.
 - **Encoding is canonical and follows the primitive rules of §4.5.** The same logical state always produces the same bytes. That rules out `HashMap` iteration, floats, and pointer-dependent ordering. Maps are `BTreeMap` or sorted `Vec`s.
 - **Restore requires the same `topology_hash` and, for every component, the same `snapshot_schema_version`.** Otherwise it fails with `RestoreError::TopologyMismatch` or `RestoreError::SchemaVersion`. Migrations are out of scope for M0.
 - **Observer state and pending observe points are not simulation state.** They are never included in snapshots or digests.
@@ -473,7 +477,7 @@ These are not acceptance gates, but they are required for M0 exit.
 
 - **Clock math:** `edge(3·10^9) == 10^12` at 3 GHz; `edge` is strictly increasing; `next_edge_index` is minimal, including just before, at, and just after edges (property test). Edges, durations, and overflow errors match an exact 256-bit oracle across the full `u64` parameter range; `FrequencyAboveResolution` is returned exactly when `ticks_per_second × den < num`.
 - **Duration:** ceiling conversion, zero duration, and overflow into `TimeOverflow`.
-- **Scheduling:** an S2 violation raises `PhaseViolation`, scheduling into `Observe` is rejected, the S5 guard triggers `SameTickLivelock`, and starting the counter at `u64::MAX` triggers `SequenceOverflow`.
+- **Scheduling:** an S1 violation raises `PastTick`, an S2 violation raises `PhaseViolation`, scheduling into `Observe` is rejected, the S5 guard allows exactly `max_events_per_phase` events per `(tick, phase)` and then triggers `SameTickLivelock`, and starting the counter at `u64::MAX` triggers `SequenceOverflow`. Every schedule/pop outcome, including errors, matches a naive linear-scan reference model (property test). Same `(tick, phase)` events dispatch in insertion order, and restoring a snapshot from an arbitrarily permuted queue resumes identically.
 - **Elaboration:** protocol or version mismatches, `Initiator`↔`Initiator` links, unconnected ports, and duplicate `component_path`s are all rejected. Building the same spec twice yields the same `topology_hash`; reordering two declarations changes it.
 - **Canonical encoding:** golden byte vectors for `canonical(ev)` for each `MemMsg` variant and for `Wake`.
 
