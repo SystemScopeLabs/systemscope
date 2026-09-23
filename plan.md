@@ -224,7 +224,7 @@ Each layer uses the language that fits its nature, and **each language is introd
 Start with **two repositories**. This keeps contracts independent while avoiding coordination overhead while they are still changing rapidly.
 
 ```text
-SystemScope (GitHub org)
+SystemScopeLabs (GitHub org)
 ├─ contracts     Time · Event · Component · Protocol · Trace · Capability
 └─ systemscope   this repository
    ├─ runtime/
@@ -237,7 +237,7 @@ SystemScope (GitHub org)
 - `systemscope` depends on `contracts` as a **git dependency pinned to a revision**. During local development, a Cargo `[patch]` overrides it with a path.
 - A contract change lands in `contracts` first. `systemscope` then bumps the pinned revision.
 - Once contracts stabilize, components split out into their own repositories: `cpu`, `storage`, `network`, …
-- Because the org is already named SystemScope, repositories do not repeat a `systemscope-` prefix.
+- Because the org is already named after SystemScope, repositories do not repeat a `systemscope-` prefix.
 - Future repositories: `linux`, `windows`, `riscv`, `x86`, `cuda`, `rocm`.
 
 ---

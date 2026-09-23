@@ -36,7 +36,7 @@ M0 contains no CPU, no OS, and no UI. It is done when a small multi-clock, multi
 ## 2. Repository and Crate Layout
 
 ```text
-contracts/                        (repo: SystemScope/contracts)
+contracts/                        (repo: SystemScopeLabs/contracts)
 └─ crates/systemscope-contracts/
    ├─ time.rs        Tick, SimulationClock, Duration, Frequency, ClockDomain
    ├─ event.rs       Phase, EventKey, ScheduleWhen
@@ -50,7 +50,7 @@ contracts/                        (repo: SystemScope/contracts)
    ├─ trace.rs       TraceRecord, Value, TraceHeader, stream encoding
    └─ observe.rs     StateView, EventView, WorldView, Observer, Control
 
-systemscope/                      (repo: SystemScope/systemscope, this repository)
+systemscope/                      (repo: SystemScopeLabs/systemscope, this repository)
 ├─ runtime/                       systemscope-runtime: scheduler, TopologyBuilder and elaboration, lifecycle, snapshots, sinks
 ├─ components/toy/                systemscope-toy: ToyCpu, ToyDma, ToyBus, ToyMemory
 ├─ reference/                     systemscope-reference: builds m0-reference (§9.1) for tests and tools
@@ -795,4 +795,4 @@ These are not acceptance gates, but they are required for M0 exit.
 - **Same-phase scheduling.** Should the same `(tick, phase)` allow zero-delay chains? S2 currently allows it, guarded by S5. Revisit if hidden ordering dependencies appear.
 - **Livelock budget.** Is the default `max_events_per_phase` right?
 - **Duration precision.** Femtosecond granularity is assumed to be sufficient.
-- **Bootstrapping contracts.** Until the GitHub org exists, `contracts` is developed as a sibling directory referenced by path.
+- **Bootstrapping contracts.** `contracts` is still consumed as a sibling directory referenced by path; CI checks out `SystemScopeLabs/contracts` at a pinned commit next to this repository. When should this become the git dependency plan.md §10 describes?
