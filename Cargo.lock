@@ -441,6 +441,15 @@ name = "systemscope-contracts"
 version = "0.0.0"
 
 [[package]]
+name = "systemscope-platform"
+version = "0.0.0"
+dependencies = [
+ "proptest",
+ "systemscope-contracts",
+ "systemscope-runtime",
+]
+
+[[package]]
 name = "systemscope-reference"
 version = "0.0.0"
 dependencies = [

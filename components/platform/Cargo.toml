@@ -1,0 +1,19 @@
+[package]
+name = "systemscope-platform"
+description = "Platform components for SystemScope M1: address bus and sparse RAM"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# Components depend only on contracts, never on the runtime (docs/m1-design.md §3).
+[dependencies]
+systemscope-contracts.workspace = true
+
+[dev-dependencies]
+proptest = "1"
+# Tests drive the components through the real runtime; the library itself never
+# depends on it.
+systemscope-runtime.workspace = true
+
+[lints]
+workspace = true
