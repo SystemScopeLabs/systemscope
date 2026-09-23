@@ -27,6 +27,7 @@ use systemscope_contracts::event::{Phase, ScheduleWhen};
 use systemscope_contracts::protocol::Message;
 use systemscope_contracts::protocol::mem::{self, MemMsg, TxnId};
 use systemscope_contracts::time::ClockDomainId;
+use systemscope_contracts::trace::Value;
 
 /// The CPU's only port: a `mem.v0` initiator.
 pub const PORT: PortId = PortId(0);
@@ -157,12 +158,21 @@ impl ToyCpu {
             },
         };
         ctx.send(PORT, msg.into(), ScheduleWhen::Now, Phase::Request)?;
+        let write = matches!(op, Op::Write { .. });
+        ctx.trace(
+            "toy.cpu.issue",
+            vec![
+                ("txn", Value::U64(txn.0)),
+                ("addr", Value::U64(op.addr())),
+                ("write", Value::Bool(write)),
+            ],
+        );
         self.outstanding.insert(txn, op);
         self.issued += 1;
         Ok(())
     }
 
-    fn commit(&mut self) -> Result<(), SimError> {
+    fn commit(&mut self, ctx: &mut dyn SimContext) -> Result<(), SimError> {
         for (txn, data) in std::mem::take(&mut self.arrived) {
             let op = self
                 .outstanding
@@ -192,6 +202,13 @@ impl ToyCpu {
                 self.fold(u64::from(byte));
             }
             self.committed += 1;
+            ctx.trace(
+                "toy.cpu.commit",
+                vec![
+                    ("txn", Value::U64(txn.0)),
+                    ("checksum", Value::U64(self.checksum)),
+                ],
+            );
         }
         Ok(())
     }
@@ -240,7 +257,7 @@ impl Component for ToyCpu {
             }
             Delivered::Wake { token: COMMIT } => {
                 self.commit_scheduled = false;
-                self.commit()?;
+                self.commit(ctx)?;
                 if !self.issue_scheduled && self.can_issue() {
                     self.schedule_issue(ctx)?;
                 }
