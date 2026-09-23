@@ -52,6 +52,7 @@ contracts/                        (repo: SystemScope/contracts)
 systemscope/                      (repo: SystemScope/systemscope, this repository)
 ├─ runtime/                       systemscope-runtime: scheduler, TopologyBuilder and elaboration, lifecycle, snapshots, sinks
 ├─ components/toy/                systemscope-toy: ToyCpu, ToyDma, ToyBus, ToyMemory
+├─ reference/                     systemscope-reference: builds m0-reference (§9.1) for tests and tools
 ├─ tests/acceptance/              AT-1, AT-2, AT-3
 ├─ tests/golden/                  golden digests and snapshots
 ├─ xtask/                         bless, perfetto export, CI helpers
@@ -573,17 +574,68 @@ ToyDma  (clock "io",  1.5 GHz = 3_000_000_000/2) ──mem.v0──┘
 ```
 
 - **ToyCpu** issues a seeded stream of reads and writes, with at most 4 outstanding and random think-time in cycles. It checks read data against a shadow copy and folds the results into a checksum register in `Commit`.
-- **ToyDma** issues seeded write bursts.
-- **ToyBus** arbitrates its two initiator ports in `Transfer`. It is designed to hit same-tick collisions, so it exercises the phase and sequence ordering rules.
+- **ToyDma** issues seeded write bursts (below).
+- **ToyBus** merges the two initiators onto the memory port and arbitrates between them in `Transfer` (below). It is designed to hit same-tick collisions, so it exercises the phase and sequence ordering rules.
 - **ToyMemory** has fixed latencies, `After(50 ns)` for reads and `After(30 ns)` for writes, and responds in `Complete`. Memory order is request dispatch order: a request is accepted when it is dispatched, writes become visible and reads are sampled at acceptance, and the response is emitted after the fixed latency. Response timing never affects visibility.
-- **ToyCpu's shadow check** updates the shadow copy when a write's response commits. This is exact because the CPU never has two operations to the same slot in flight.
+- **ToyCpu's shadow check** updates the shadow copy when a write's response commits. This is exact because the CPU never has two operations to the same slot in flight, and because no other initiator writes the CPU's slots (address map below).
+
+**Topology.** Components are declared as `soc.cpu0`, `soc.dma0`, `soc.bus`, `soc.mem`, in that order, and clock domains as `cpu`, `io`, `bus`. Every link has latency `Cycles { domain: bus, k: 1 }`, one bus cycle counted from the next bus edge. Links are declared in this order: CPU ↔ bus port `cpu`, DMA ↔ bus port `dma`, bus port `mem` ↔ memory.
+
+**Address map.** The CPU and the DMA own disjoint regions, so neither can invalidate the other's view of memory. M0 models no coherence or sharing between initiators.
+
+| Region | Addresses | Owner |
+|---|---|---|
+| CPU | `0 .. cpu_slots × 8`, 8-byte slots | ToyCpu reads and writes, checked against its shadow copy |
+| DMA | the next `dma_slots × 16` bytes, 16-byte slots | ToyDma writes only |
+
+**ToyDma** runs on the `io` clock and issues only `WriteReq`s, at most one per `io` cycle, in `Request`, in bursts:
+
+- A burst starts at a slot drawn uniformly from its region and writes consecutive slots, wrapping at the region's end. Its length is uniform in `1..=max_burst`, capped by the operations left. Data bytes come from `ctx.rng()`.
+- After a burst's last write, the DMA idles for a number of `io` cycles uniform in `1..=max_gap_cycles`.
+- At most `max_outstanding` writes are in flight. When the limit is reached, the DMA pauses until a response frees a place. A paused burst then resumes one `io` cycle later, and a finished burst starts its gap then.
+- `TxnId`s come from the DMA's own counter, starting at 0, independent of the CPU's. The CPU and the DMA therefore routinely have the same `TxnId` in flight at once.
+- Its snapshot holds its configuration, its counters, the current burst's next slot and remaining length, whether a wake is pending, the outstanding writes, and a checksum over completed writes. Its RNG state belongs to the runtime (§5.2), never to the DMA.
+
+**ToyBus** runs on the `bus` clock. Its ports are, in order, `cpu` (target), `dma` (target), and `mem` (initiator). The upstream port index is the bus's identity for an initiator: `0` for `cpu`, `1` for `dma`.
+
+- **Requests must arrive in `Request`.** A request is appended to its port's FIFO queue. A request delivered in any later phase faults the session. So every request that arrives at a tick is queued before that tick's arbitration runs, whatever its sequence number.
+- **Arbitration** runs as a `Wake` in `Transfer` on bus edges. When a request arrives and no arbitration is pending, the bus schedules one at `Cycles { domain: bus, k: 0 }`, the first bus edge at or after now. Links deliver on bus edges, so that is the same tick. Each arbitration grants **at most one request**. Afterwards, if any queue is non-empty, the next arbitration is scheduled one bus cycle later (`k: 1`).
+- **Round-robin.** The bus holds a priority pointer `p ∈ {0, 1}`, initially `0` (CPU first).
+  - If exactly one queue is non-empty, its head wins.
+  - If both are non-empty, the head of queue `p` wins. This is a *contended* grant.
+  - After **every** grant, contended or not, `p` becomes the other port: `p = 1 − winner`.
+  - The result depends only on which queues are non-empty and on `p`. It never depends on arrival sequence across ports or on container iteration order.
+- **Remapping.** A grant does three things:
+  - It allocates the next downstream `TxnId` from the bus's own counter, starting at 0.
+  - It records `downstream → (upstream port, upstream TxnId, read or write)` in an ordered map.
+  - It forwards the request on `mem` with the downstream `TxnId`, in `Transfer`, with all other fields unchanged.
+- **Responses** from memory are not arbitrated. On arrival, the bus:
+  - removes the mapping for the response's `TxnId`;
+  - checks that the response kind matches the request;
+  - sends the response on the recorded upstream port, with the upstream `TxnId`, in the phase it arrived in (`Complete`).
+
+  A response for an unknown or mismatched `TxnId` faults the session.
+- **Snapshot:**
+  - Contents: configuration, the next downstream `TxnId`, the priority pointer, whether an arbitration is pending, both queues in order, and the map in ascending downstream `TxnId` order.
+  - Restore rejects a pointer outside `{0, 1}`, a queued response, map entries out of order or at or above the next downstream `TxnId`, and an unknown port.
+- **Trace:**
+  - Each grant emits `toy.bus.grant` (`port`, `txn`, `downstream`, `contended`), and each routed response emits `toy.bus.route` (`downstream`, `port`, `txn`).
+  - The runtime's dispatch records already show every hop, so Perfetto shows each hop as its own slice: `(cpu, txn)` and `(dma, txn)` in the initiators' processes, and `(bus, downstream)` in the bus's.
+  - No trace format change is needed.
 
 The clock mix is chosen on purpose. 3 GHz has a period that is not a whole number of ticks. 1.5 GHz exercises `freq_den ≠ 1`. `Duration`-based latency exercises cross-fidelity conversion.
 
 - **Seeds:**
   - **Fixed seeds** `{0, 1, 0xDEADBEEF}` run on every CI run. Only these have golden digests.
   - **One random seed** runs nightly. It is printed so failures can be reproduced. It has no golden digest and is **never compared against committed golden files**. It is only checked for reproducibility (AT-1 step 1), for snapshot/restore equivalence (AT-2 steps 1–3), and for observation invariance (AT-3).
-- **Run length:** until both initiators finish 100,000 operations, or `T_end = 10 ms` of simulated time, whichever comes first.
+- **Run length:** until both initiators finish 100,000 operations, or `T_end = 10 ms` of simulated time, whichever comes first. Development tests use the same topology with fewer operations.
+- **Workload parameters:**
+
+  | Component | Parameters |
+  |---|---|
+  | ToyCpu | 4 outstanding, think time `1..=8` cycles, 8-byte accesses, 64 slots, 40% writes |
+  | ToyDma | 8 outstanding, bursts `1..=8`, gaps `1..=128` cycles, 16-byte writes, 64 slots |
+  | ToyMemory | `64 × 8 + 64 × 16` bytes, read `50 ns`, write `30 ns` |
 
 ### 9.2 Digests
 
