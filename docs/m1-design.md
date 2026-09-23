@@ -244,6 +244,13 @@ CommitPending  Commit (same tick)   apply the effect, or record the trap
 
 This gives observers a precise meaning: `on_after_dispatch` of the `Complete` event shows the state before the instruction commits, and of the `Commit` event the state after.
 
+**Pure execution.** Execution is a pure function of the decoded `Instr`, `pc`, and the values of the source registers, which the caller reads and passes in. It reads and changes no architectural state. Its result is a `PendingEffect { reg_write: Option<RegWrite { rd, value }>, next_pc }`, which the CPU holds as pending state and applies only if the instruction retires.
+
+- **ALU instructions** (`LUI`, `AUIPC`, `OP-IMM`, `OP`) go through `execute_alu(instr, pc, rs1, rs2)`, which returns `NotAlu` for every other instruction. Source values an instruction does not use are ignored.
+- **Every ALU instruction writes `rd` and sets `next_pc = pc + 4`,** with wrap-around.
+- **An `x0` destination stays in the effect.** `RegWrite { rd: x0, .. }` is produced like any other write, so traces keep the instruction's `rd` and HINTs need no special case. The register file discards it when the effect is applied.
+- Arithmetic wraps modulo 2^32. `SLT`/`SLTI` compare as `i32`; `SLTU`/`SLTIU` compare as `u32`, with the `SLTIU` immediate sign-extended first. Bitwise immediates use the sign-extended 32-bit pattern. Every shift uses the low 5 bits of its amount, in registers and in `shamt` alike.
+
 **Reset:** at `init` the CPU schedules the first `FetchIssue` at tick 0 (`Cycles { domain: cpu, k: 0 }`, `Request`), with `pc = entry` and every register 0.
 
 ### 5.4 Timing
