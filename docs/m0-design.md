@@ -38,7 +38,7 @@ M0 contains no CPU, no OS, and no UI. It is done when a small multi-clock, multi
 ```text
 contracts/                        (repo: SystemScope/contracts)
 └─ crates/systemscope-contracts/
-   ├─ time.rs        Tick, SimulationClock, Duration, ClockDomain
+   ├─ time.rs        Tick, SimulationClock, Duration, Frequency, ClockDomain
    ├─ event.rs       Phase, EventKey, When
    ├─ component.rs   Component, SimContext, PortSpec, ComponentId
    ├─ topology.rs    Link, TopologySpec
@@ -75,38 +75,42 @@ pub struct SimulationClock {
 ```
 
 - The resolution is chosen at session start and is never hard-coded. The default is `1_000_000_000_000` (1 tick = 1 ps).
-- The maximum simulated time is `u64::MAX / ticks_per_second`, about 213 days at 1 ps. Exceeding it raises `SimError::TimeOverflow`; time never wraps.
+- The maximum simulated time is `u64::MAX / ticks_per_second`, about 213 days at 1 ps. Exceeding it raises `TimeError::TimeOverflow`; time never wraps. The event layer wraps `TimeError` in `SimError`.
 - Floating point is not used anywhere in time computation.
 
 ### 3.2 Duration
 
 ```rust
 pub struct Duration { femtoseconds: u128 }   // physical time, independent of tick resolution
-// constructors: Duration::from_ns(50), from_us(100), from_ps(333), …
+// constructors: Duration::from_fs(1), from_ps(333), from_ns(50), from_us(100), from_ms(1), from_s(1)
 ```
 
 Converting a `Duration` to ticks **rounds up**, so a latency is never shortened:
 
 ```text
-ticks(d) = ceil(d.femtoseconds × ticks_per_second / 10^15)      (u128 arithmetic)
+ticks(d) = ceil(d.femtoseconds × ticks_per_second / 10^15)
 ```
 
 ### 3.3 ClockDomain
 
 ```rust
-pub struct ClockDomain {
-    id: ClockDomainId,
-    freq_num: u64,           // frequency in Hz = freq_num / freq_den
-    freq_den: u64,
-    offset: Tick,            // tick of edge 0
-    edge_rounding: Rounding, // Floor (default) | Ceil
+pub struct Frequency { num: u64, den: u64 }  // exactly num / den Hz; both non-zero
+
+impl ClockDomain {
+    pub fn new(
+        clock: &SimulationClock,             // period is derived from the session resolution
+        id: ClockDomainId,
+        frequency: Frequency,
+        offset: Tick,                        // tick of edge 0
+        edge_rounding: Rounding,             // Floor (default) | Ceil
+    ) -> Result<ClockDomain, TimeError>;
 }
 ```
 
 Edge *n* is always computed **absolutely**, never by accumulating a rounded period:
 
 ```text
-edge(n) = offset + round( n × ticks_per_second × freq_den / freq_num )   (u128 intermediate)
+edge(n) = offset + round( n × ticks_per_second × den / num )
 ```
 
 - `next_edge_index(t)` is the smallest `n` such that `edge(n) ≥ t`.
@@ -118,6 +122,13 @@ Worked example, 3 GHz at 1 ps resolution:
 edge(n) = floor(n × 1000 / 3)   →  0, 333, 666, 1000, 1333, 1666, 2000, …
 edge(3 × 10^9) = 10^12 exactly  →  no drift, however long the run
 ```
+
+### 3.4 Arithmetic and Limits
+
+- **Period representation.** At construction, the period in ticks, `ticks_per_second × den / num`, is reduced to `P / Q` by their GCD. `Q ≤ num` always fits in `u64`. `P` can need up to 128 bits and is stored as `u128`. No valid clock is rejected because of storage width.
+- **Bounded products.** Edges are computed as `n × ⌊P/Q⌋ + round(n × (P mod Q) / Q)`. The second product is below `2^64 × 2^64` and always fits in `u128`. The first may overflow, and then the edge would not fit in a tick anyway.
+- **Checked arithmetic.** Every multiplication and addition in the time model is checked. Any overflow yields `TimeError::TimeOverflow`, exactly when the true result does not fit in a `u64` tick. Nothing wraps or truncates.
+- **`FrequencyAboveResolution`.** A clock whose adjacent edges cannot be distinguished at the chosen session resolution is rejected. This happens when its period is shorter than one tick (`ticks_per_second × den < num`). It is not a limit on fast clocks as such: choosing a finer resolution admits them.
 
 Components only ever speak in cycles or `Duration`. **Only the runtime projects them onto ticks.**
 
@@ -460,7 +471,7 @@ Golden files change only through `cargo xtask bless`. The commit that does so mu
 
 These are not acceptance gates, but they are required for M0 exit.
 
-- **Clock math:** `edge(3·10^9) == 10^12` at 3 GHz; `edge` is monotonic; `next_edge_index` is correct at, just before, and just after every edge (property test).
+- **Clock math:** `edge(3·10^9) == 10^12` at 3 GHz; `edge` is strictly increasing; `next_edge_index` is minimal, including just before, at, and just after edges (property test). Edges, durations, and overflow errors match an exact 256-bit oracle across the full `u64` parameter range; `FrequencyAboveResolution` is returned exactly when `ticks_per_second × den < num`.
 - **Duration:** ceiling conversion, zero duration, and overflow into `TimeOverflow`.
 - **Scheduling:** an S2 violation raises `PhaseViolation`, scheduling into `Observe` is rejected, the S5 guard triggers `SameTickLivelock`, and starting the counter at `u64::MAX` triggers `SequenceOverflow`.
 - **Elaboration:** protocol or version mismatches, `Initiator`↔`Initiator` links, unconnected ports, and duplicate `component_path`s are all rejected. Building the same spec twice yields the same `topology_hash`; reordering two declarations changes it.
