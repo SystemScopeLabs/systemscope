@@ -764,13 +764,23 @@ These are not acceptance gates, but they are required for M0 exit.
 
 ## 10. M0 Exit Criteria
 
-- [ ] `systemscope-contracts` defines every type in §3–§8, each with rustdoc.
-- [ ] The runtime implements scheduling rules S1–S6, elaboration, snapshot/restore, and both trace sinks.
-- [ ] `m0-reference` runs, and its Perfetto output opens in ui.perfetto.dev with per-component tracks and transaction slices.
-- [ ] **AT-1, AT-2, and AT-3 pass in CI on Linux and Windows.**
-- [ ] Determinism lints (§8.3) are enforced in CI.
-- [ ] All supporting unit and property tests pass.
-- [ ] Contract changes discovered during M0 are reflected back into this document.
+- [x] `systemscope-contracts` defines every type in §3–§8, each with rustdoc.
+- [x] The runtime implements scheduling rules S1–S6, elaboration, snapshot/restore, and both trace sinks.
+- [x] `m0-reference` runs, and its Perfetto output opens in ui.perfetto.dev with per-component tracks and transaction slices.
+- [x] **AT-1, AT-2, and AT-3 pass in CI on Linux and Windows.**
+- [x] Determinism lints (§8.3) are enforced in CI.
+- [x] All supporting unit and property tests pass.
+- [x] Contract changes discovered during M0 are reflected back into this document.
+
+Evidence, per item:
+
+1. Every type §2 places in `contracts` is defined there. `Link`, `RuntimeSnapshot`, `RunOutcome`, and `Stop` belong to the runtime, as §2 places them. `missing_docs` is a warning in both workspaces, and CI clippy denies warnings.
+2. The scheduler enforces S1–S6, checked against a reference model in `runtime/tests/scheduler_props.rs`. The runtime tests also cover lifecycle, snapshot/restore, and the JSONL and Perfetto exporters.
+3. The Perfetto output was opened in ui.perfetto.dev and checked by hand. It shows `soc.cpu0` and `soc.mem` tracks grouped by component, `ReadReq`/`WriteReq` slices, and the expected latencies.
+4. The systemscope CI run at 7e4cffc passed AT-1, AT-2, and AT-3 on ubuntu-latest and windows-latest. It used contracts pinned at 7a0a271, and the golden files were unchanged.
+5. `clippy.toml` and `[workspace.lints]` in both repositories carry the §8.3 rules, and CI runs clippy with `-D warnings`.
+6. Both repositories' CI pass nextest on both operating systems.
+7. Each contract change during M0 has a matching update to this document.
 
 ---
 
