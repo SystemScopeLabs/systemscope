@@ -54,6 +54,7 @@ These decisions were settled while reviewing the M1 plan against the upstream `r
 | Access faults | Reported by the new `mem.v1` protocol | 4 |
 | `mem.v0` | Frozen for M0. It is never modified. | 4 |
 | M0 regression | M0 golden digests stay byte-identical throughout M1 | 4.4, 11 |
+| Serialized compatibility id | Decoupled from the crate's SemVer version. The M0 value `"0.0.0"` is kept. | 4.5 |
 | `riscv-tests` environment | A SystemScope test environment, with no CSRs | 10.2 |
 | `rv32ui` scope | The 42 upstream tests minus `fence_i` and `ma_data`: exactly 40 | 10.2 |
 | External tools | Fixtures built and Spike/ACT4 run on Linux; both operating systems run the same committed ELFs | 10.6 |
@@ -141,7 +142,19 @@ pub enum MemFault     { AccessFault }
 
 - `mem.v0`, `ToyCpu`, `ToyDma`, `ToyBus`, `ToyMemory`, and `m0-reference` are not modified in M1.
 - **The M0 golden digests must stay byte-identical** for the whole of M1. The M0 acceptance tests keep running in CI, and they already fail on any change to `tests/golden/m0-reference.json`.
-- **`contracts_version` is part of the M0 digests.** It is written into `SessionInfo` and the trace header, so it feeds `StateDigest` and `TraceDigest` (not `ExecutionDigest`). The contracts crate version therefore stays unchanged during M1 development. If a version bump is ever wanted, it gets its own commit that re-blesses the M0 golden file, and that commit must show that every event count and `ExecutionDigest` is unchanged and only `StateDigest` and `TraceDigest` moved.
+- **The serialized contracts identifier does not change** (§4.5), so adding `mem.v1` cannot move the M0 `StateDigest` or `TraceDigest`.
+
+### 4.5 Contracts Compatibility Id
+
+In M0, the string written as `contracts_version` into `SessionInfo` (m0-design §7) and the trace header (m0-design §8.1) is the contracts crate's Cargo version (`env!("CARGO_PKG_VERSION")`, currently `"0.0.0"`). It feeds `StateDigest` and `TraceDigest`. Tying it to the package version would mean the crate's SemVer version could never change without moving the M0 golden digests.
+
+M1.0 separates the two:
+
+- **The crate version is ordinary SemVer.** It changes like any other crate version, for example when `mem.v1` is added, and never reaches a digest.
+- **The serialized value becomes a fixed compatibility id,** a constant in `contracts`, independent of Cargo. It keeps the M0 value `"0.0.0"`. The field name, position, and encoding in `SessionInfo` and the trace header are unchanged, so every M0 snapshot and trace stays byte-identical.
+- **The compatibility id changes only when snapshots or traces from one session can no longer be restored or resumed by the other.** An example is a change to an existing encoding. Adding a protocol, as `mem.v1` does, does not change it: every existing snapshot and trace decodes exactly as before.
+- **Changing it is a deliberate re-bless.** The commit changes the constant, re-blesses the golden files, and must show that every event count and `ExecutionDigest` is unchanged. Only `StateDigest` and `TraceDigest` may move.
+- The id looks like a version but is compared only for equality. It carries no ordering and no SemVer meaning.
 
 ---
 
@@ -216,7 +229,9 @@ CommitPending  Commit (same tick)   apply the effect, or record the trap
 - **Fetch goes through memory.** `FetchIssue` sends `ReadReq { addr: pc, len: 4 }` on `mem`. The instruction word is the little-endian `u32` of the response's four bytes.
 - **Decode and execute happen when the fetch response arrives,** in `Complete`. They compute the instruction's effect into CPU-internal pending state and change no architectural state.
 - **A load or store** then issues its one data request in `Request` of the next CPU cycle. Rule S2 forbids an earlier phase in the same tick (m0-design §4.3). Its response arrives in `Complete`.
-- **Architectural state changes only in `Commit`.** The CPU wakes itself in `Commit` of the same tick (`Cycles { domain: cpu, k: 0 }`) and applies the pending effect: `x[rd] ← value` if `rd ≠ 0`, then `pc ← next_pc`, and `instret += 1`. A trapping instruction applies nothing (§6).
+- **Architectural state changes only in `Commit`.** The CPU wakes itself in `Commit` of the same tick (`Cycles { domain: cpu, k: 0 }`) and resolves the pending instruction in one of two ways:
+  - **It retires:** `x[rd] ← value` if `rd ≠ 0`, then `pc ← next_pc`, then `instret += 1`, and the CPU emits `rv32.commit`.
+  - **It traps:** it does **not** retire. Registers, `pc`, and `instret` are unchanged, and the CPU emits `rv32.trap` and halts (§6). This holds for every trap cause, `ECALL` and `EBREAK` included.
 - **Memory and device state follow their target's rules,** not the CPU's `Commit`. A store is visible at the RAM when the RAM accepts it, as in M0 (m0-design §9.1), and a UART byte is output when the UART accepts it. With one outstanding operation, no instruction can observe the difference.
 - After a commit, the next `FetchIssue` is a wake at the next CPU cycle's `Request`.
 
@@ -239,7 +254,7 @@ These numbers are deterministic and pinned by the golden digests, but they are *
 The CPU halts for exactly two reasons:
 
 - **`Halted(Trap(RvTrap))`**: an architectural trap (§6). `ECALL` is the normal way a program ends.
-- **`Halted(InstructionLimit)`**: `instret` reached `max_instructions`, a construction parameter that catches runaway programs. It is not a trap.
+- **`Halted(InstructionLimit)`**: right after the instruction that brings `instret` to `max_instructions` retires, in the same `Commit`, the CPU emits `rv32.halt` and halts without scheduling another fetch. `max_instructions` is a construction parameter that catches runaway programs. This halt is not a trap: that last instruction retired normally and has its `rv32.commit` record.
 
 A halted CPU schedules nothing more. With no pending events, `run` returns `Stop::Drained`.
 
@@ -291,7 +306,7 @@ pub enum TrapCause {
 }
 ```
 
-- **Traps are precise.** The trapping instruction writes no register, does not change `pc`, and, for stores, writes no memory. `RvTrap.pc` is the address of the trapping instruction.
+- **Traps are precise.** The trapping instruction does not retire: it writes no register, does not change `pc`, does not increment `instret`, and, for stores, writes no memory. `RvTrap.pc` is the address of the trapping instruction.
 - The CPU records the trap in `Commit` and enters `Halted(Trap)`. In M2 and M3, a privileged backend connects this same boundary to real machine or supervisor traps.
 
 | Cause | Raised by | `tval` |
@@ -344,6 +359,8 @@ The only component that knows the memory map.
   - Contents: `size`, `image_hash`, then every page holding at least one non-zero byte, in ascending page order.
   - All-zero pages are omitted. The same memory contents therefore always encode to the same bytes, whatever history produced them (m0-design §7).
   - Restore rejects a different `size` or `image_hash`, pages out of order or out of range, and all-zero pages.
+  - **Restore replaces the whole memory.** It first clears every page, including those loaded from the initial image at construction, then inserts the snapshot's pages. An omitted page means "all zero now", never "as in the initial image". Otherwise a program that zeroed an image page would see it reappear after a restore.
+  - The initial image is used only by a new session. Restore never reads it; only `image_hash` is compared.
 - `inspect()` shows `size`, `image_hash`, and the number of non-zero pages, never the contents.
 
 ### 7.3 SimpleUart (F1)
@@ -510,9 +527,10 @@ ACT4 builds self-checking ELFs: it runs each test on the Sail reference model, c
   - `RVMODEL_HALT_PASS` and `RVMODEL_HALT_FAIL` are expressed through the §10.2 convention (`a0`, then `ECALL`).
   - No trap handler is provided.
 - A UDB configuration declaring RV32I only, with misaligned accesses trapping.
+- `include_priv_tests: false`, set from the start. ACT4 then leaves out every test that depends on privilege modes.
 - A linker script for `0x8000_0000`.
 
-**Open risk, to settle at M1.10:** whether the RV32I tests in ACT4 need Zicsr or a trap handler in their harness. If they do, the affected tests are listed as exclusions with reasons, exactly as in §10.2. SystemScope does not gain CSRs to run a test harness.
+**Open risk, to settle at M1.10:** with privilege tests excluded, whether `rvmodel_macros.h` or any remaining unprivileged test still needs Zicsr or a trap handler. If they do, the affected tests are listed as exclusions with reasons, exactly as in §10.2. SystemScope does not gain CSRs to run a test harness.
 
 ### 10.5 CI
 
@@ -547,7 +565,7 @@ The toolchain needed to build ELFs (a RISC-V GCC or Clang), Spike, Sail, and ACT
 - [ ] `systemscope-rv32i` implements all 40 RV32I instructions and every trap of §6.
 - [ ] `systemscope-platform` implements `AddressBus`, `Ram` (sparse pages), and `SimpleUart`. `systemscope-elf` loads and validates ELF32 images.
 - [ ] **M1-A1 to M1-A8 pass in CI on Linux and Windows,** with M1-A3 on Linux.
-- [ ] The M0 golden digests are byte-identical to `v0.1.0-m0`.
+- [ ] The M0 golden digests are byte-identical to `v0.1.0-m0`, and the serialized compatibility id is decoupled from the crate version (§4.5).
 - [ ] The fixture manifest pins every external tool version and lists every exclusion with its reason.
 - [ ] Contract changes discovered during M1 are reflected back into this document.
 
@@ -555,7 +573,7 @@ The toolchain needed to build ELFs (a RISC-V GCC or Clang), Spike, Sail, and ACT
 
 ## 12. Implementation Order
 
-1. **M1.0:** this document; the `plan.md` M1 update; the `mem.v1` contract in `contracts`, followed by a pin bump in `systemscope`.
+1. **M1.0:** this document; the `plan.md` M1 update; in `contracts`, the compatibility id (§4.5) and the `mem.v1` contract, followed by a pin bump in `systemscope`, with the M0 golden digests unchanged.
 2. **M1.1:** `decode`, the immediate extractors, and the register file, with `IllegalInstruction` from the start.
 3. **M1.2:** the ALU instructions, with the independent test interpreter.
 4. **M1.3:** branches and jumps, including misaligned-target traps.
@@ -574,8 +592,7 @@ The tag follows the M0 convention: a SemVer prerelease identifier marking a mile
 
 ## 13. Open Questions
 
-- **ACT4 prerequisites.** Do the RV32I tests need Zicsr or a trap handler in their harness (§10.4)?
+- **ACT4 prerequisites.** With `include_priv_tests: false`, do `rvmodel_macros.h` or any remaining RV32I test still need Zicsr or a trap handler (§10.4)?
 - **Spike configuration.** Which ISA string does the pinned Spike accept for RV32I, and does it exit cleanly on the `tohost` store under the §10.2 environment? To be verified at M1.9 and pinned in the manifest.
 - **Spike job placement.** M1-A3 is planned as a blocking Linux job. If building Spike makes CI too slow even with caching, it could move to a prebuilt, pinned binary, but not to nightly-only, since M1-A3 is an exit criterion.
-- **Contracts version.** When, if ever, should the contracts crate version change? A change re-blesses the M0 `StateDigest` and `TraceDigest` values (§4.4).
 - **`hello.elf` source.** C, which needs the pinned toolchain's libc-free build, or assembly?
