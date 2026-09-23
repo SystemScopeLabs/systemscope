@@ -715,7 +715,7 @@ The clock mix is chosen on purpose. 3 GHz has a period that is not a whole numbe
 
    `StateDigest` and `ExecutionDigest` must equal `D`. The trace prefix, taken from the dropped runtime and resumed on the new one (§8.1), together with the resumed suffix must equal the reference `TraceDigest`.
 3. **Round-trip law.** At every checkpoint, check that `encode(restore(decode(bytes))) == bytes`.
-4. **Portability.** `tests/golden/m0-reference.mid.snap` is a committed snapshot. Restoring it and running to the end must match the golden digests on both CI operating systems.
+4. **Portability.** `tests/golden/m0-reference.mid.snap` is a committed snapshot, restored on its own on both CI operating systems. Its bytes must match the golden BLAKE3, it must decode and restore (with the schema, topology, and session checks), and re-encoding it must give the same bytes. Running it to the end must give the golden event count, `StateDigest`, and `ExecutionDigest`. The file carries no trace prefix, so this check cannot reproduce the full-run `TraceDigest`. Trace continuity across a restore is checked by step 2 instead, which resumes each checkpoint's snapshot together with its trace prefix through `resume_trace(prefix)`.
 5. **Negative cases.**
    - A changed `snapshot_schema_version` must fail with `RestoreError::SchemaVersion`.
    - A changed topology must fail with `RestoreError::TopologyMismatch`.
