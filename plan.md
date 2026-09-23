@@ -228,7 +228,7 @@ SystemScopeLabs (GitHub org)
 ├─ contracts     Time · Event · Component · Protocol · Trace · Capability
 └─ systemscope   this repository
    ├─ runtime/
-   ├─ components/   cpu/ · memory/ · storage/ · os/ …
+   ├─ components/   rv32i/ · platform/ · storage/ · os/ …
    ├─ visualizer/   (M4+)
    ├─ tests/        acceptance tests
    └─ docs/
@@ -249,7 +249,7 @@ The final goal is not reduced. Instead, we cut out the **first complete system s
 | Milestone | Scope | Exit criteria |
 |---|---|---|
 | **M0** | Time, event queue, component contract, deterministic DES, Perfetto trace | All criteria in [m0-design.md §10](docs/m0-design.md#10-m0-exit-criteria), including the three determinism acceptance tests passing in CI on Linux and Windows |
-| **M1** | RV32I CPU + RAM, bare-metal ELF execution, UART output | All `riscv-tests` rv32ui tests pass, Spike commit-log lockstep matches, ACT RV32I passes |
+| **M1** | RV32I CPU + RAM, bare-metal ELF execution, UART output | All criteria in [m1-design.md §11](docs/m1-design.md#11-m1-exit-criteria): the 40 selected `riscv-tests` rv32ui tests (all but `fence_i` and `ma_data`) pass under the SystemScope test environment, Spike commit-log lockstep matches, ACT4 RV32I passes, on Linux and Windows, with the M0 golden digests unchanged |
 | **M2** | Interrupts, DMA, block storage (abstract SSD model) | A bare-metal program completes a block read via a DMA-completion interrupt, and the acceptance tests still pass |
 | **M3** | Modeled OS Backend: process, syscalls, Sv32 virtual memory | The full path from executable to output runs through models, with page tables living in simulated RAM |
 | **M4** | SystemScope Visualizer: topology, timeline, state, step, step back | The M3 scenario can be explored with step and step back in the UI |
