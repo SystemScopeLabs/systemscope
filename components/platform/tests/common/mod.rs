@@ -1,0 +1,213 @@
+//! Test harnesses shared by the platform tests. Test-only: nothing here is part of the
+//! crate.
+//!
+//! - [`MockCtx`] drives one component directly, recording what it sends and traces, so
+//!   unit and property tests run without a runtime.
+//! - [`Script`] is a stateless `mem.v1` initiator for runtime tests: it schedules every
+//!   request during `init`, so its pending requests live in the runtime's queue and it
+//!   has nothing to snapshot. Responses show up in the runtime's dispatch records.
+
+#![allow(dead_code)]
+
+use systemscope_contracts::component::{
+    Component, ComponentId, Delivered, InitContext, PortId, PortSpec, Role, SimContext,
+};
+use systemscope_contracts::error::SimError;
+use systemscope_contracts::event::{Phase, ScheduleWhen};
+use systemscope_contracts::protocol::Message;
+use systemscope_contracts::protocol::mem_v1::{self, MemMsg, TxnId};
+use systemscope_contracts::rng::SimRng;
+use systemscope_contracts::snapshot::{RestoreError, SnapshotReader, SnapshotWriter};
+use systemscope_contracts::time::{ClockDomainId, Tick};
+use systemscope_contracts::trace::Value;
+
+/// One `send` a component made.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sent {
+    pub port: PortId,
+    pub msg: MemMsg,
+    pub when: ScheduleWhen,
+    pub phase: Phase,
+}
+
+/// One `trace` record a component made.
+pub type Traced = (&'static str, Vec<(&'static str, Value)>);
+
+/// Platform components use no randomness.
+struct NoRng;
+
+impl SimRng for NoRng {
+    fn next_u64(&mut self) -> u64 {
+        panic!("platform components must not draw random numbers")
+    }
+}
+
+/// A `SimContext` that records instead of scheduling.
+pub struct MockCtx {
+    pub phase: Phase,
+    pub sent: Vec<Sent>,
+    pub traced: Vec<Traced>,
+    rng: NoRng,
+}
+
+impl MockCtx {
+    pub fn new(phase: Phase) -> MockCtx {
+        MockCtx {
+            phase,
+            sent: Vec::new(),
+            traced: Vec::new(),
+            rng: NoRng,
+        }
+    }
+
+    /// Delivers `msg` on `port` of `component`, in this context's phase.
+    pub fn deliver(
+        &mut self,
+        component: &mut dyn Component,
+        port: PortId,
+        msg: MemMsg,
+    ) -> Result<(), SimError> {
+        let ev = Delivered::Message {
+            port,
+            msg: msg.into(),
+        };
+        component.handle_event(&ev, self)
+    }
+
+    /// The only message sent since the last call, which is cleared.
+    pub fn take_one(&mut self) -> Sent {
+        assert_eq!(
+            self.sent.len(),
+            1,
+            "expected exactly one send: {:?}",
+            self.sent
+        );
+        self.sent.pop().unwrap()
+    }
+}
+
+impl InitContext for MockCtx {
+    fn component(&self) -> ComponentId {
+        ComponentId(0)
+    }
+
+    fn send(
+        &mut self,
+        port: PortId,
+        msg: Message,
+        when: ScheduleWhen,
+        phase: Phase,
+    ) -> Result<(), SimError> {
+        let Message::MemV1(msg) = msg else {
+            panic!("platform components speak mem.v1 only");
+        };
+        self.sent.push(Sent {
+            port,
+            msg,
+            when,
+            phase,
+        });
+        Ok(())
+    }
+
+    fn wake_self(&mut self, _: ScheduleWhen, _: Phase, _: u64) -> Result<(), SimError> {
+        panic!("platform components never wake themselves")
+    }
+
+    fn rng(&mut self) -> &mut dyn SimRng {
+        &mut self.rng
+    }
+
+    fn trace(&mut self, kind: &'static str, fields: Vec<(&'static str, Value)>) {
+        self.traced.push((kind, fields));
+    }
+}
+
+impl SimContext for MockCtx {
+    fn now(&self) -> Tick {
+        Tick::ZERO
+    }
+
+    fn phase(&self) -> Phase {
+        self.phase
+    }
+}
+
+pub fn read(txn: u64, addr: u64, len: u32) -> MemMsg {
+    MemMsg::ReadReq {
+        txn: TxnId(txn),
+        addr,
+        len,
+    }
+}
+
+pub fn write(txn: u64, addr: u64, data: &[u8]) -> MemMsg {
+    MemMsg::WriteReq {
+        txn: TxnId(txn),
+        addr,
+        data: data.to_vec(),
+    }
+}
+
+/// A component's snapshot bytes.
+pub fn snapshot_of(component: &dyn Component) -> Vec<u8> {
+    let mut w = SnapshotWriter::new();
+    component.snapshot(&mut w);
+    w.into_bytes()
+}
+
+/// Restores `bytes` into `component`, requiring every byte to be read.
+pub fn restore_into(component: &mut dyn Component, bytes: &[u8]) -> Result<(), RestoreError> {
+    let mut r = SnapshotReader::new(bytes);
+    let schema = component.snapshot_schema_version();
+    component.restore(&mut r, schema)?;
+    r.finish().map_err(RestoreError::Decode)
+}
+
+/// A stateless initiator that sends `requests[i].1` at cycle `requests[i].0` of `clock`,
+/// in `Request`, all scheduled during `init`.
+pub struct Script {
+    pub clock: ClockDomainId,
+    pub requests: Vec<(u64, MemMsg)>,
+}
+
+impl Component for Script {
+    fn type_name(&self) -> &'static str {
+        "test.script"
+    }
+
+    fn ports(&self) -> Vec<PortSpec> {
+        vec![PortSpec {
+            name: "mem",
+            protocol: mem_v1::PROTOCOL,
+            role: Role::Initiator,
+        }]
+    }
+
+    fn init(&mut self, ctx: &mut dyn InitContext) -> Result<(), SimError> {
+        for (k, msg) in &self.requests {
+            let when = ScheduleWhen::Cycles {
+                domain: self.clock,
+                k: *k,
+            };
+            ctx.send(PortId(0), msg.clone().into(), when, Phase::Request)?;
+        }
+        Ok(())
+    }
+
+    /// Responses are recorded by the runtime's dispatch records; nothing to do.
+    fn handle_event(&mut self, _: &Delivered, _: &mut dyn SimContext) -> Result<(), SimError> {
+        Ok(())
+    }
+
+    fn snapshot_schema_version(&self) -> u32 {
+        1
+    }
+
+    /// Stateless: every pending request is in the runtime's queue.
+    fn snapshot(&self, _: &mut SnapshotWriter) {}
+
+    fn restore(&mut self, _: &mut SnapshotReader<'_>, _: u32) -> Result<(), RestoreError> {
+        Ok(())
+    }
+}
