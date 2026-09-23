@@ -353,37 +353,48 @@ pub enum TrapCause {
 
 ### 7.1 AddressBus
 
-The only component that knows the memory map.
+The only component that knows the memory map. Implemented in M1.4a.
 
-- **Ports:** `cpu` (`mem.v1` target), then one `mem.v1` initiator port per region, in region order.
-- **Regions:** `(name, base, size)`, given at construction. The constructor rejects:
+- **Ports:** `cpu` (`mem.v1` target), then one `mem.v1` initiator port per region, named after the region, in region order.
+- **Regions:** `(name, base, size)`, given at construction. A region covers the half-open range `[base, base + size)`; its last byte is `base + (size − 1)`, so a region may end exactly at `u64::MAX`. The constructor rejects:
   - a zero size;
-  - a region that wraps past `u64::MAX`;
-  - overlapping regions.
+  - a region whose last byte would be past `u64::MAX`;
+  - overlapping regions (adjacent regions are fine);
+  - duplicate names, and the name `cpu`, which would collide with the upstream port.
 - **Routing:**
-  - A request whose whole range `[addr, addr + len)` lies inside one region is forwarded on that region's port, in `Transfer`, with `addr − base`. Targets therefore see offsets and can be reused at any base.
-  - A request that hits no region, or crosses a region boundary, is answered by the bus itself with a `Fault { AccessFault }` response in `Complete`.
-- **`TxnId`s:** the bus has one upstream port, so it forwards the CPU's `TxnId` unchanged. It records `txn → (region, read or write)` in an ordered map, to check each response's port and kind. A response for an unknown `txn`, or on the wrong port, faults the session.
-- **Responses** are relayed upstream in the phase they arrived in (`Complete`).
-- **Snapshot:** configuration and the outstanding map.
-- **Trace:** `platform.bus.fault` (`txn`, `addr`, `len`) whenever the bus answers a request itself.
+  - A request whose whole range `[addr, addr + len)` lies inside one region is forwarded on that region's port, in `Transfer`, with `addr − base`. Targets therefore see offsets and can be reused at any base. All range arithmetic is checked; `addr = u64::MAX`, `len = 1` is a valid one-byte access.
+  - The bus never splits a request. A request that hits no region, runs past the end of its region, crosses into another region, or runs past `u64::MAX` is answered by the bus itself with a `Fault { AccessFault }` response in `Complete` of the same tick. It is not forwarded and leaves nothing outstanding.
+- **Session faults (`ComponentFault`).** An `AccessFault` is an architectural outcome the CPU turns into a trap (M1.4b). A protocol violation is a model bug and faults the session instead:
+  - a zero-length request (`MemMsg::access()` is `Empty`);
+  - a request that arrives in a phase other than `Request`;
+  - a request that reuses a `TxnId` that is still outstanding;
+  - a response on the `cpu` port, or a request on a region port;
+  - a response for an unknown `txn` (including a second response for the same `txn`), on the wrong region's port, or of the wrong kind (a `WriteResp` for a read, or the reverse).
+- **`TxnId`s:** the bus has one upstream port, so it forwards the CPU's `TxnId` unchanged. It records `txn → (region, read or write)` in a `BTreeMap`, to check each response's port and kind.
+- **Responses** are relayed upstream unchanged, in the phase they arrived in (`Complete` for the platform's targets).
+- **Snapshot:** the configuration (every region's name, base, and size, which also fix the port mapping), then the outstanding map in ascending `txn` order. Restore rejects a different memory map and a non-canonical outstanding map. Forwarded requests and relayed responses in flight live in the runtime's event queue, not in the bus.
+- **Inspect:** the number of regions and of outstanding transactions.
+- **Trace:** `platform.bus.fault` with fields `txn`, `addr`, `len` (all `U64`, in that order; `len` is the payload length for writes) whenever the bus answers a request itself, and never otherwise.
 
 ### 7.2 Ram
 
-- **Port:** `mem` (`mem.v1` target).
-- **Configuration:** `size` and the initial image from the loader (§8), identified by `image_hash`.
-- **Storage is sparse:** a `BTreeMap<u32, Box<[u8; 4096]>>` of pages. Unmapped pages read as zero.
+Implemented in M1.4a.
+
+- **Port:** `mem` (`mem.v1` target). Addresses are offsets into the RAM.
+- **Configuration:** `size` (1 byte to 4 GiB), the response latency, and the initial image from the loader (§8), identified by `image_hash`. The image is a list of `(offset, bytes)` segments; the constructor rejects segments past `size` and overlapping segments.
+- **Storage is sparse:** a `BTreeMap<u32, Box<[u8; 4096]>>` of pages, indexed by offset / 4096. Unmapped pages read as zero. Accesses may cross page boundaries.
+- **Canonical at all times:** the map never holds an all-zero page. A write that leaves a page all zero removes it, and a write of zeros to an absent page allocates nothing. The initial image is stored the same way.
 - **Semantics:**
   - A request is accepted when it is dispatched. Writes become visible and reads are sampled at acceptance, as in `ToyMemory`.
-  - The response follows after a fixed latency (§9), in `Complete`.
-  - A request outside `[0, size)` gets a `Fault` response. The bus should never send one, but the RAM does not rely on that.
+  - The response follows after the fixed latency (§9), in `Complete`. The response waits in the runtime's event queue; the RAM keeps no copy of it.
+  - A request not wholly inside `[0, size)` gets a `Fault { AccessFault }` response, and a faulting write changes nothing. The bus should never send one, but the RAM does not rely on that. A zero-length request faults the session.
 - **Snapshot:**
-  - Contents: `size`, `image_hash`, then every page holding at least one non-zero byte, in ascending page order.
+  - Contents: `size`, `image_hash`, the latency, then every page holding at least one non-zero byte, as `(index, 4096 bytes)` in ascending page order.
   - All-zero pages are omitted. The same memory contents therefore always encode to the same bytes, whatever history produced them (m0-design §7).
-  - Restore rejects a different `size` or `image_hash`, pages out of order or out of range, and all-zero pages.
+  - Restore rejects a different `size`, `image_hash`, or latency; pages out of order, duplicated, or out of range; pages that are not 4096 bytes; all-zero pages; and non-zero bytes past `size` in a partial last page.
   - **Restore replaces the whole memory.** It first clears every page, including those loaded from the initial image at construction, then inserts the snapshot's pages. An omitted page means "all zero now", never "as in the initial image". Otherwise a program that zeroed an image page would see it reappear after a restore.
   - The initial image is used only by a new session. Restore never reads it; only `image_hash` is compared.
-- `inspect()` shows `size`, `image_hash`, and the number of non-zero pages, never the contents.
+- `inspect()` shows `size`, `image_hash`, and the number of non-zero pages, never the contents. The RAM emits no trace records.
 
 ### 7.3 SimpleUart (F1)
 
@@ -599,7 +610,10 @@ The toolchain needed to build ELFs (a RISC-V GCC or Clang), Spike, Sail, and ACT
 2. **M1.1:** `decode`, the immediate extractors, and the register file, with `IllegalInstruction` from the start.
 3. **M1.2:** the ALU instructions, with the independent test interpreter.
 4. **M1.3:** branches and jumps, including misaligned-target traps.
-5. **M1.4:** `AddressBus` and `Ram`; the `Rv32iCpu` component fetching through memory; loads, stores, misaligned and access-fault traps.
+5. **M1.4:** memory, in three steps:
+   - **M1.4a:** `systemscope-platform` with `AddressBus` and `Ram` (§7.1, §7.2), tested on their own with a test-only initiator.
+   - **M1.4b:** the pure semantics of loads and stores: effective addresses, misaligned and access-fault traps.
+   - **M1.4c:** the `Rv32iCpu` component, fetching and accessing data through the bus in a runtime.
 6. **M1.5:** the ELF loader.
 7. **M1.6:** the SystemScope `riscv-tests` environment, the fixture pipeline, and the 40 `rv32ui` tests. This comes early because it is the strongest oracle available.
 8. **M1.7:** `SimpleUart` and `hello.elf`.
