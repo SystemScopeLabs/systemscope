@@ -2,7 +2,9 @@
 //!
 //! See `docs/m0-design.md` for the specification.
 
+pub mod export;
 pub mod rng;
 pub mod runtime;
 pub mod scheduler;
 pub mod topology;
+pub mod trace;

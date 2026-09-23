@@ -12,6 +12,7 @@ use systemscope_contracts::time::{
     ClockDomain, ClockDomainId, Frequency, Rounding, SimulationClock, Tick, TimeError,
 };
 use systemscope_contracts::topology::LinkLatency;
+use systemscope_contracts::trace::LinkDecl;
 
 use crate::runtime::{Peer, Runtime, SessionConfig, Slot};
 
@@ -70,7 +71,7 @@ struct Declared {
     component: Box<dyn Component>,
 }
 
-struct LinkDecl {
+struct DeclaredLink {
     a: (ComponentId, String),
     b: (ComponentId, String),
     latency: Option<LinkLatency>,
@@ -81,7 +82,7 @@ pub struct TopologyBuilder {
     clock: SimulationClock,
     domains: Vec<ClockDomain>,
     components: Vec<Declared>,
-    links: Vec<LinkDecl>,
+    links: Vec<DeclaredLink>,
 }
 
 impl TopologyBuilder {
@@ -136,7 +137,7 @@ impl TopologyBuilder {
         b: (ComponentId, &str),
         latency: Option<LinkLatency>,
     ) {
-        self.links.push(LinkDecl {
+        self.links.push(DeclaredLink {
             a: (a.0, a.1.to_owned()),
             b: (b.0, b.1.to_owned()),
             latency,
@@ -171,6 +172,7 @@ impl TopologyBuilder {
             });
         }
 
+        let mut links = Vec::with_capacity(self.links.len());
         let mut peers: Vec<Vec<Option<Peer>>> =
             slots.iter().map(|s| vec![None; s.ports.len()]).collect();
         for link in &self.links {
@@ -192,6 +194,11 @@ impl TopologyBuilder {
                     return Err(ElaborationError::PortAlreadyLinked(name.clone()));
                 }
             }
+            links.push(LinkDecl {
+                a,
+                b,
+                latency: link.latency,
+            });
             peers[a.0.0 as usize][usize::from(a.1.0)] = Some(Peer {
                 component: b.0,
                 port: b.1,
@@ -224,6 +231,7 @@ impl TopologyBuilder {
             self.domains,
             slots,
             peers,
+            links,
             config,
         ))
     }

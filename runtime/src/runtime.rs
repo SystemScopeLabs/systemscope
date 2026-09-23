@@ -17,9 +17,14 @@ use systemscope_contracts::protocol::Message;
 use systemscope_contracts::rng::SimRng;
 use systemscope_contracts::time::{ClockDomain, SimulationClock, Tick};
 use systemscope_contracts::topology::LinkLatency;
+use systemscope_contracts::trace::{
+    CONTRACTS_VERSION, ComponentDecl, LinkDecl, TraceAt, TraceHeader, TraceOrigin, TraceRecord,
+    Value,
+};
 
 use crate::rng::Xoshiro256StarStar;
 use crate::scheduler::{Scheduler, SchedulerConfig};
+use crate::trace::{Trace, dispatch_record};
 
 /// Settings fixed for the lifetime of a session.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -101,6 +106,7 @@ pub(crate) struct Slot {
 /// running component and its context never borrow the same storage.
 struct SlotInfo {
     path: String,
+    type_name: &'static str,
     ports: Vec<PortSpec>,
 }
 
@@ -114,9 +120,14 @@ pub struct Runtime {
     slots: Vec<SlotInfo>,
     /// `peers[component][port]` is the other end of that port's link.
     peers: Vec<Vec<Peer>>,
+    /// Links in declaration order, for the trace header.
+    links: Vec<LinkDecl>,
+    seed: u64,
     scheduler: Scheduler<Pending>,
     lifecycle: Lifecycle,
     fault: Option<SimError>,
+    /// Recorded trace, if tracing was started. Never read by the simulation.
+    trace: Option<Vec<TraceRecord>>,
 }
 
 impl Runtime {
@@ -125,6 +136,7 @@ impl Runtime {
         domains: Vec<ClockDomain>,
         slots: Vec<Slot>,
         peers: Vec<Vec<Peer>>,
+        links: Vec<LinkDecl>,
         config: SessionConfig,
     ) -> Runtime {
         let rngs = slots
@@ -136,6 +148,7 @@ impl Runtime {
             .map(|s| {
                 let info = SlotInfo {
                     path: s.path,
+                    type_name: s.component.type_name(),
                     ports: s.ports,
                 };
                 (info, s.component)
@@ -148,9 +161,12 @@ impl Runtime {
             rngs,
             slots,
             peers,
+            links,
+            seed: config.seed,
             scheduler: Scheduler::new(config.scheduler),
             lifecycle: Lifecycle::Elaborated,
             fault: None,
+            trace: None,
         }
     }
 
@@ -184,6 +200,43 @@ impl Runtime {
         self.slots.iter().map(|s| s.path.as_str())
     }
 
+    /// Starts recording a trace. Allowed only before `init`, so the trace holds every
+    /// record from the start. Tracing never changes what the simulation does.
+    pub fn start_trace(&mut self) -> Result<(), RuntimeError> {
+        self.require(Lifecycle::Elaborated)?;
+        self.trace = Some(Vec::new());
+        Ok(())
+    }
+
+    /// Stops tracing and returns what was recorded, or `None` if tracing never started.
+    pub fn take_trace(&mut self) -> Option<Trace> {
+        let records = self.trace.take()?;
+        Some(Trace {
+            header: self.trace_header(),
+            records,
+        })
+    }
+
+    /// The trace header describing this session.
+    pub fn trace_header(&self) -> TraceHeader {
+        TraceHeader {
+            ticks_per_second: self.clock.ticks_per_second(),
+            seed: self.seed,
+            contracts_version: CONTRACTS_VERSION.to_owned(),
+            clock_domains: self.domains.clone(),
+            components: self
+                .slots
+                .iter()
+                .map(|s| ComponentDecl {
+                    path: s.path.clone(),
+                    type_name: s.type_name,
+                    ports: s.ports.clone(),
+                })
+                .collect(),
+            links: self.links.clone(),
+        }
+    }
+
     /// Initializes every component in `ComponentId` order. Allowed once, when elaborated.
     ///
     /// Any failure faults the session, even though earlier components already
@@ -192,7 +245,7 @@ impl Runtime {
         self.require(Lifecycle::Elaborated)?;
         for index in 0..self.slots.len() {
             let me = ComponentId(index as u32);
-            let (component, mut ctx) = self.context(me);
+            let (component, mut ctx) = self.context(me, TraceAt::Init);
             let result = component.init(&mut ctx);
             if let Err(e) = ctx.error.map_or(result, Err) {
                 return Err(self.enter_fault(e));
@@ -215,7 +268,11 @@ impl Runtime {
             target,
             delivery,
         } = event.payload;
-        let (component, mut ctx) = self.context(target);
+        let at = TraceAt::Event(event.key);
+        if let Some(records) = &mut self.trace {
+            records.push(dispatch_record(at, source, target, &delivery));
+        }
+        let (component, mut ctx) = self.context(target, at);
         let result = component.handle_event(&delivery, &mut ctx);
         if let Err(e) = ctx.error.map_or(result, Err) {
             return Err(self.enter_fault(e));
@@ -254,7 +311,7 @@ impl Runtime {
     }
 
     /// Splits the runtime into the running component and a context for it.
-    fn context(&mut self, me: ComponentId) -> (&mut dyn Component, Ctx<'_>) {
+    fn context(&mut self, me: ComponentId, at: TraceAt) -> (&mut dyn Component, Ctx<'_>) {
         let index = me.0 as usize;
         let ctx = Ctx {
             me,
@@ -264,6 +321,8 @@ impl Runtime {
             peers: &self.peers[index],
             scheduler: &mut self.scheduler,
             rng: &mut self.rngs[index],
+            trace: self.trace.as_mut(),
+            at,
             error: None,
         };
         (self.components[index].as_mut(), ctx)
@@ -313,6 +372,9 @@ struct Ctx<'a> {
     peers: &'a [Peer],
     scheduler: &'a mut Scheduler<Pending>,
     rng: &'a mut Xoshiro256StarStar,
+    /// Where records go, or `None` when tracing is off. Write-only for the component.
+    trace: Option<&'a mut Vec<TraceRecord>>,
+    at: TraceAt,
     /// First error returned to the component. Sticky: the runtime faults on it.
     error: Option<SimError>,
 }
@@ -399,6 +461,18 @@ impl InitContext for Ctx<'_> {
 
     fn rng(&mut self) -> &mut dyn SimRng {
         self.rng
+    }
+
+    fn trace(&mut self, kind: &'static str, fields: Vec<(&'static str, Value)>) {
+        if let Some(records) = &mut self.trace {
+            records.push(TraceRecord {
+                at: self.at,
+                origin: TraceOrigin::Component,
+                component: self.me,
+                kind,
+                fields,
+            });
+        }
     }
 }
 
