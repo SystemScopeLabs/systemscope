@@ -20,10 +20,14 @@ use systemscope_contracts::error::SimError;
 use systemscope_contracts::event::{Phase, ScheduleWhen};
 use systemscope_contracts::protocol::Message;
 use systemscope_contracts::protocol::mem::{self, MemMsg};
+use systemscope_contracts::snapshot::{RestoreError, SnapshotReader, SnapshotWriter};
 use systemscope_contracts::time::Duration;
 
 /// The memory's only port: a `mem.v0` target.
 pub const PORT: PortId = PortId(0);
+
+/// Layout of [`ToyMemory`]'s snapshot.
+pub const SNAPSHOT_SCHEMA: u32 = 1;
 
 /// Size and timing of a [`ToyMemory`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +53,12 @@ impl ToyMemory {
             config,
             bytes: vec![0; config.size as usize],
         }
+    }
+
+    fn write_config(&self, w: &mut SnapshotWriter) {
+        w.u32(self.config.size);
+        w.u128(self.config.read_latency.as_femtoseconds());
+        w.u128(self.config.write_latency.as_femtoseconds());
     }
 
     fn range(&self, addr: u64, len: usize) -> Result<std::ops::Range<usize>, SimError> {
@@ -109,5 +119,31 @@ impl Component for ToyMemory {
             ScheduleWhen::After(latency),
             Phase::Complete,
         )
+    }
+
+    fn snapshot_schema_version(&self) -> u32 {
+        SNAPSHOT_SCHEMA
+    }
+
+    /// Schema 1: the configuration, then the contents.
+    fn snapshot(&self, w: &mut SnapshotWriter) {
+        self.write_config(w);
+        w.bytes(&self.bytes);
+    }
+
+    fn restore(&mut self, r: &mut SnapshotReader<'_>, _: u32) -> Result<(), RestoreError> {
+        let mut config = SnapshotWriter::new();
+        self.write_config(&mut config);
+        if r.raw(config.as_bytes().len())? != config.as_bytes() {
+            return Err(RestoreError::InvalidState(
+                "toy memory: snapshot was taken with a different configuration",
+            ));
+        }
+        let bytes = r.bytes()?;
+        if bytes.len() != self.bytes.len() {
+            return Err(RestoreError::InvalidState("toy memory: wrong content size"));
+        }
+        self.bytes.copy_from_slice(bytes);
+        Ok(())
     }
 }

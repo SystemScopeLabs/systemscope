@@ -19,6 +19,7 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 
+use systemscope_contracts::canonical::DecodeError;
 use systemscope_contracts::component::{
     Component, Delivered, InitContext, PortId, PortSpec, Role, SimContext,
 };
@@ -26,6 +27,7 @@ use systemscope_contracts::error::SimError;
 use systemscope_contracts::event::{Phase, ScheduleWhen};
 use systemscope_contracts::protocol::Message;
 use systemscope_contracts::protocol::mem::{self, MemMsg, TxnId};
+use systemscope_contracts::snapshot::{RestoreError, SnapshotReader, SnapshotWriter};
 use systemscope_contracts::time::ClockDomainId;
 use systemscope_contracts::trace::Value;
 
@@ -37,6 +39,9 @@ pub const ISSUE: u64 = 0;
 
 /// Wake token that commits arrived responses.
 pub const COMMIT: u64 = 1;
+
+/// Layout of [`ToyCpu`]'s snapshot.
+pub const SNAPSHOT_SCHEMA: u32 = 1;
 
 /// Workload and timing of a [`ToyCpu`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -213,6 +218,17 @@ impl ToyCpu {
         Ok(())
     }
 
+    fn write_config(&self, w: &mut SnapshotWriter) {
+        let c = &self.config;
+        w.u32(c.clock.0);
+        w.u64(c.ops);
+        w.u32(c.max_outstanding);
+        w.u64(c.max_think_cycles.get());
+        w.u32(c.access_len);
+        w.u32(c.slots);
+        w.u64(c.write_percent);
+    }
+
     /// FNV-1a style fold over 64-bit words.
     fn fold(&mut self, word: u64) {
         self.checksum = (self.checksum ^ word).wrapping_mul(0x0000_0100_0000_01b3);
@@ -285,6 +301,113 @@ impl Component for ToyCpu {
                 return Err(SimError::ComponentFault("toy cpu: unknown wake token"));
             }
         }
+        Ok(())
+    }
+
+    fn snapshot_schema_version(&self) -> u32 {
+        SNAPSHOT_SCHEMA
+    }
+
+    /// Schema 1: the configuration, the counters and flags, then the outstanding, arrived,
+    /// and shadow collections, then the checksum.
+    fn snapshot(&self, w: &mut SnapshotWriter) {
+        self.write_config(w);
+        w.u64(self.issued);
+        w.u64(self.committed);
+        w.u64(self.next_txn);
+        w.bool(self.issue_scheduled);
+        w.bool(self.commit_scheduled);
+        w.len(self.outstanding.len());
+        for (txn, op) in &self.outstanding {
+            w.u64(txn.0);
+            match op {
+                Op::Read { addr } => {
+                    w.u8(0);
+                    w.u64(*addr);
+                }
+                Op::Write { addr, data } => {
+                    w.u8(1);
+                    w.u64(*addr);
+                    w.bytes(data);
+                }
+            }
+        }
+        w.len(self.arrived.len());
+        for (txn, data) in &self.arrived {
+            w.u64(txn.0);
+            match data {
+                None => w.u8(0),
+                Some(data) => {
+                    w.u8(1);
+                    w.bytes(data);
+                }
+            }
+        }
+        w.len(self.shadow.len());
+        for (addr, data) in &self.shadow {
+            w.u64(*addr);
+            w.bytes(data);
+        }
+        w.u64(self.checksum);
+    }
+
+    fn restore(&mut self, r: &mut SnapshotReader<'_>, _: u32) -> Result<(), RestoreError> {
+        let mut config = SnapshotWriter::new();
+        self.write_config(&mut config);
+        if r.raw(config.as_bytes().len())? != config.as_bytes() {
+            return Err(RestoreError::InvalidState(
+                "toy cpu: snapshot was taken with a different configuration",
+            ));
+        }
+        self.issued = r.u64()?;
+        self.committed = r.u64()?;
+        self.next_txn = r.u64()?;
+        self.issue_scheduled = r.bool()?;
+        self.commit_scheduled = r.bool()?;
+        let tag = |what, tag| RestoreError::Decode(DecodeError::InvalidTag { what, tag });
+        self.outstanding = BTreeMap::new();
+        let mut previous = None;
+        for _ in 0..r.len()? {
+            let txn = TxnId(r.u64()?);
+            if previous.is_some_and(|p| txn <= p) {
+                return Err(RestoreError::InvalidState(
+                    "toy cpu: outstanding transactions out of order",
+                ));
+            }
+            previous = Some(txn);
+            let op = match r.u8()? {
+                0 => Op::Read { addr: r.u64()? },
+                1 => Op::Write {
+                    addr: r.u64()?,
+                    data: r.bytes()?.to_vec(),
+                },
+                t => return Err(tag("toy cpu operation", t)),
+            };
+            self.outstanding.insert(txn, op);
+        }
+        self.arrived = Vec::new();
+        for _ in 0..r.len()? {
+            let txn = TxnId(r.u64()?);
+            let data = match r.u8()? {
+                0 => None,
+                1 => Some(r.bytes()?.to_vec()),
+                t => return Err(tag("toy cpu arrival", t)),
+            };
+            self.arrived.push((txn, data));
+        }
+        self.shadow = BTreeMap::new();
+        let mut previous = None;
+        for _ in 0..r.len()? {
+            let addr = r.u64()?;
+            if previous.is_some_and(|p| addr <= p) {
+                return Err(RestoreError::InvalidState(
+                    "toy cpu: shadow slots out of order",
+                ));
+            }
+            previous = Some(addr);
+            self.shadow.insert(addr, r.bytes()?.to_vec());
+        }
+        self.checksum = r.u64()?;
         Ok(())
     }
 }

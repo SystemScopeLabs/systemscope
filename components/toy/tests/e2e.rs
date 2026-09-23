@@ -9,6 +9,7 @@ use systemscope_contracts::error::SimError;
 use systemscope_contracts::event::{Phase, ScheduleWhen};
 use systemscope_contracts::protocol::Message;
 use systemscope_contracts::protocol::mem::{self, MemMsg};
+use systemscope_contracts::snapshot::{RestoreError, SnapshotReader, SnapshotWriter};
 use systemscope_contracts::time::{
     ClockDomainId, Duration, Frequency, Rounding, SimulationClock, Tick,
 };
@@ -248,6 +249,15 @@ impl Component for StaleMemory {
         };
         let after = ScheduleWhen::After(Duration::from_ns(10));
         ctx.send(*port, resp.into(), after, Phase::Complete)
+    }
+
+    // Not snapshotted by these tests.
+    fn snapshot_schema_version(&self) -> u32 {
+        0
+    }
+    fn snapshot(&self, _: &mut SnapshotWriter) {}
+    fn restore(&mut self, _: &mut SnapshotReader<'_>, _: u32) -> Result<(), RestoreError> {
+        Ok(())
     }
 }
 

@@ -11,6 +11,7 @@ use systemscope_contracts::error::SimError;
 use systemscope_contracts::event::{Phase, ScheduleWhen};
 use systemscope_contracts::protocol::Message;
 use systemscope_contracts::protocol::mem::{self, MemMsg, TxnId};
+use systemscope_contracts::snapshot::{RestoreError, SnapshotReader, SnapshotWriter};
 use systemscope_contracts::time::{Duration, SimulationClock, Tick};
 use systemscope_runtime::runtime::SessionConfig;
 use systemscope_runtime::topology::TopologyBuilder;
@@ -49,6 +50,15 @@ impl Component for Driver {
         {
             self.responses.borrow_mut().push((ctx.now(), msg.clone()));
         }
+        Ok(())
+    }
+
+    // Not snapshotted by these tests.
+    fn snapshot_schema_version(&self) -> u32 {
+        0
+    }
+    fn snapshot(&self, _: &mut SnapshotWriter) {}
+    fn restore(&mut self, _: &mut SnapshotReader<'_>, _: u32) -> Result<(), RestoreError> {
         Ok(())
     }
 }
