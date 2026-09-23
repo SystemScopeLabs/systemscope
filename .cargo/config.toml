@@ -1,0 +1,3 @@
+[alias]
+# Workspace tasks (xtask/): `cargo xtask bless` regenerates the golden files.
+xtask = "run --package xtask --"

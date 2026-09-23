@@ -1,0 +1,17 @@
+[package]
+name = "systemscope-acceptance"
+description = "SystemScope M0 acceptance tests AT-1 to AT-3 and their golden files"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+blake3 = "1"
+serde_json = "1"
+systemscope-contracts.workspace = true
+systemscope-reference.workspace = true
+systemscope-runtime.workspace = true
+
+[lints]
+workspace = true

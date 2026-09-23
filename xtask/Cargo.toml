@@ -1,0 +1,13 @@
+[package]
+name = "xtask"
+description = "SystemScope workspace tasks: cargo xtask bless"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+systemscope-acceptance.workspace = true
+
+[lints]
+workspace = true
