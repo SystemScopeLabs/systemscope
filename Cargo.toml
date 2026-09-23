@@ -10,6 +10,7 @@ rust-version = "1.98.1"
 [workspace.dependencies]
 # Local sibling checkout during multi-repo development (see plan.md §10).
 systemscope-contracts = { path = "../contracts/crates/systemscope-contracts" }
+systemscope-runtime = { path = "runtime" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

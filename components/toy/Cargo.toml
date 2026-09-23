@@ -9,5 +9,10 @@ rust-version.workspace = true
 [dependencies]
 systemscope-contracts.workspace = true
 
+[dev-dependencies]
+# Tests drive the components through the real runtime; the library itself never
+# depends on it.
+systemscope-runtime.workspace = true
+
 [lints]
 workspace = true

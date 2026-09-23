@@ -342,6 +342,7 @@ name = "systemscope-toy"
 version = "0.0.0"
 dependencies = [
  "systemscope-contracts",
+ "systemscope-runtime",
 ]
 
 [[package]]
