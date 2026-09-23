@@ -55,10 +55,11 @@ jobs:
         with:
           path: systemscope
       # systemscope depends on `../contracts` by path (plan.md §10), so reproduce the
-      # sibling layout. Until contracts is pinned by revision, this tracks its main.
+      # sibling layout, with contracts pinned to a pushed revision (bump it deliberately).
       - uses: actions/checkout@v4
         with:
-          repository: SystemScope/contracts
+          repository: SystemScopeLabs/contracts
+          ref: 7a0a27187211e84f860f6738a468c6cc4be51bab
           path: contracts
       - name: Install pinned toolchain
         run: rustup toolchain install
@@ -89,7 +90,8 @@ jobs:
           path: systemscope
       - uses: actions/checkout@v4
         with:
-          repository: SystemScope/contracts
+          repository: SystemScopeLabs/contracts
+          ref: 7a0a27187211e84f860f6738a468c6cc4be51bab
           path: contracts
       - name: Install pinned toolchain
         run: |
