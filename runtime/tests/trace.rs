@@ -7,6 +7,7 @@ use systemscope_contracts::component::{
 use systemscope_contracts::error::SimError;
 use systemscope_contracts::event::{EventKey, Phase, ScheduleWhen};
 use systemscope_contracts::protocol::mem::{self, MemMsg, TxnId};
+use systemscope_contracts::snapshot::{RestoreError, SnapshotReader, SnapshotWriter};
 use systemscope_contracts::time::{Duration, SimulationClock, Tick};
 use systemscope_contracts::topology::LinkLatency;
 use systemscope_contracts::trace::{
@@ -47,6 +48,15 @@ impl Component for Requester {
         ctx.trace("req.done", Vec::new());
         ctx.wake_self(ScheduleWhen::Now, Phase::Commit, 5)
     }
+
+    // Not snapshotted by these tests.
+    fn snapshot_schema_version(&self) -> u32 {
+        0
+    }
+    fn snapshot(&self, _: &mut SnapshotWriter) {}
+    fn restore(&mut self, _: &mut SnapshotReader<'_>, _: u32) -> Result<(), RestoreError> {
+        Ok(())
+    }
 }
 
 /// Answers reads with two bytes after 10 ns.
@@ -77,6 +87,15 @@ impl Component for Responder {
         };
         let after = ScheduleWhen::After(Duration::from_ns(10));
         ctx.send(*port, resp.into(), after, Phase::Complete)
+    }
+
+    // Not snapshotted by these tests.
+    fn snapshot_schema_version(&self) -> u32 {
+        0
+    }
+    fn snapshot(&self, _: &mut SnapshotWriter) {}
+    fn restore(&mut self, _: &mut SnapshotReader<'_>, _: u32) -> Result<(), RestoreError> {
+        Ok(())
     }
 }
 
@@ -196,10 +215,12 @@ fn header_describes_the_session() {
         ticks_per_second,
         seed,
         contracts_version,
+        topology_hash,
         clock_domains,
         components,
         links,
     } = trace.header;
+    assert_eq!(topology_hash, build().topology_hash());
     assert_eq!(ticks_per_second, 1_000_000_000_000);
     assert_eq!(seed, 77);
     assert_eq!(contracts_version, CONTRACTS_VERSION);

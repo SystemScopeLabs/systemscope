@@ -6,6 +6,7 @@ use std::rc::Rc;
 use systemscope_contracts::component::{Component, Delivered, InitContext, PortSpec, SimContext};
 use systemscope_contracts::error::SimError;
 use systemscope_contracts::event::{Phase, ScheduleWhen};
+use systemscope_contracts::snapshot::{RestoreError, SnapshotReader, SnapshotWriter};
 use systemscope_contracts::time::{Duration, SimulationClock};
 use systemscope_runtime::runtime::SessionConfig;
 use systemscope_runtime::topology::TopologyBuilder;
@@ -49,6 +50,15 @@ impl Component for Drawer {
             let after = ScheduleWhen::After(Duration::from_ns(1));
             ctx.wake_self(after, Phase::Request, token + 1)?;
         }
+        Ok(())
+    }
+
+    // Not snapshotted by these tests.
+    fn snapshot_schema_version(&self) -> u32 {
+        0
+    }
+    fn snapshot(&self, _: &mut SnapshotWriter) {}
+    fn restore(&mut self, _: &mut SnapshotReader<'_>, _: u32) -> Result<(), RestoreError> {
         Ok(())
     }
 }

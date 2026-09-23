@@ -10,6 +10,7 @@ use systemscope_contracts::error::SimError;
 use systemscope_contracts::event::{Phase, ScheduleWhen};
 use systemscope_contracts::protocol::Message;
 use systemscope_contracts::protocol::mem::{self, MemMsg, TxnId};
+use systemscope_contracts::snapshot::{RestoreError, SnapshotReader, SnapshotWriter};
 use systemscope_contracts::time::{
     ClockDomainId, Duration, Frequency, Rounding, SimulationClock, Tick,
 };
@@ -67,6 +68,15 @@ impl Component for Pinger {
             .push(format!("pinger@{}:{} {ev:?}", ctx.now(), ctx.phase()));
         Ok(())
     }
+
+    // Not snapshotted by these tests.
+    fn snapshot_schema_version(&self) -> u32 {
+        0
+    }
+    fn snapshot(&self, _: &mut SnapshotWriter) {}
+    fn restore(&mut self, _: &mut SnapshotReader<'_>, _: u32) -> Result<(), RestoreError> {
+        Ok(())
+    }
 }
 
 /// Answers every read after 50 ns, in COMPLETE.
@@ -106,6 +116,15 @@ impl Component for Echo {
             Phase::Complete,
         )
     }
+
+    // Not snapshotted by these tests.
+    fn snapshot_schema_version(&self) -> u32 {
+        0
+    }
+    fn snapshot(&self, _: &mut SnapshotWriter) {}
+    fn restore(&mut self, _: &mut SnapshotReader<'_>, _: u32) -> Result<(), RestoreError> {
+        Ok(())
+    }
 }
 
 type InitFn = Box<dyn FnMut(&mut dyn InitContext) -> Result<(), SimError>>;
@@ -130,6 +149,15 @@ impl Component for Scripted {
     }
     fn handle_event(&mut self, ev: &Delivered, ctx: &mut dyn SimContext) -> Result<(), SimError> {
         (self.on_event)(ev, ctx)
+    }
+
+    // Not snapshotted by these tests.
+    fn snapshot_schema_version(&self) -> u32 {
+        0
+    }
+    fn snapshot(&self, _: &mut SnapshotWriter) {}
+    fn restore(&mut self, _: &mut SnapshotReader<'_>, _: u32) -> Result<(), RestoreError> {
+        Ok(())
     }
 }
 

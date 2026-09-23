@@ -4,12 +4,18 @@
 //! encoding is the only source of truth: [`Trace::digest`] hashes that encoding, and the
 //! exporters in [`crate::export`] are views of the same records.
 
-use systemscope_contracts::component::{ComponentId, Delivered};
+use std::fmt;
+
+use systemscope_contracts::canonical::CanonicalEvent;
+use systemscope_contracts::component::{ComponentId, Delivered, PortId};
+use systemscope_contracts::event::EventKey;
 use systemscope_contracts::protocol::Message;
-use systemscope_contracts::protocol::mem::MemMsg;
+use systemscope_contracts::protocol::mem::{MemMsg, TxnId};
 use systemscope_contracts::trace::{
     DISPATCH_KIND, TraceAt, TraceHeader, TraceOrigin, TraceRecord, Value, encode_stream,
 };
+
+use crate::runtime::chain;
 
 /// A complete recorded trace.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,4 +91,141 @@ fn message_fields(msg: &Message, fields: &mut Vec<(&'static str, Value)>) {
             fields.extend([("msg", Value::Str("WriteResp".into())), ("txn", txn(t))])
         }
     }
+}
+
+/// Why a trace prefix was not accepted by `resume_trace` (§8.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResumeError {
+    /// The runtime was not restored, has already stepped, or has already resumed a trace.
+    NotFreshlyRestored,
+    /// The prefix's header differs from this session's.
+    HeaderMismatch,
+    /// The record at this index cannot appear where it does in a trace.
+    MalformedRecord(usize),
+    /// The prefix's dispatch records do not reproduce the snapshot's execution history.
+    HistoryMismatch,
+}
+
+impl fmt::Display for ResumeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ResumeError::NotFreshlyRestored => {
+                f.write_str("a trace resumes only right after restore, before any step")
+            }
+            ResumeError::HeaderMismatch => f.write_str("trace header differs from the session"),
+            ResumeError::MalformedRecord(i) => write!(f, "record {i} is out of place"),
+            ResumeError::HistoryMismatch => {
+                f.write_str("trace prefix does not match the snapshot's event history")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ResumeError {}
+
+/// The event a `runtime.dispatch` record describes, if it is exactly what
+/// [`dispatch_record`] writes for that event.
+pub(crate) fn dispatched_event(r: &TraceRecord) -> Option<CanonicalEvent> {
+    let TraceAt::Event(key) = r.at else {
+        return None;
+    };
+    if r.origin != TraceOrigin::Runtime || r.kind != DISPATCH_KIND {
+        return None;
+    }
+    let get = |i: usize, name: &str| match r.fields.get(i) {
+        Some((n, v)) if *n == name => Some(v),
+        _ => None,
+    };
+    let int = |i, name| match get(i, name) {
+        Some(Value::U64(v)) => Some(*v),
+        _ => None,
+    };
+    let bytes = |i, name| match get(i, name) {
+        Some(Value::Bytes(v)) => Some(v.clone()),
+        _ => None,
+    };
+    let source = ComponentId(u32::try_from(int(0, "source")?).ok()?);
+    let delivery = if r.fields.len() == 2 && get(1, "token").is_some() {
+        Delivered::Wake {
+            token: int(1, "token")?,
+        }
+    } else {
+        let port = PortId(u16::try_from(int(1, "port")?).ok()?);
+        let Some(Value::Str(msg)) = get(4, "msg") else {
+            return None;
+        };
+        let txn = TxnId(int(5, "txn")?);
+        let mem = match msg.as_str() {
+            "ReadReq" => MemMsg::ReadReq {
+                txn,
+                addr: int(6, "addr")?,
+                len: u32::try_from(int(7, "len")?).ok()?,
+            },
+            "ReadResp" => MemMsg::ReadResp {
+                txn,
+                data: bytes(6, "data")?,
+            },
+            "WriteReq" => MemMsg::WriteReq {
+                txn,
+                addr: int(6, "addr")?,
+                data: bytes(7, "data")?,
+            },
+            "WriteResp" => MemMsg::WriteResp { txn },
+            _ => return None,
+        };
+        Delivered::Message {
+            port,
+            msg: Message::Mem(mem),
+        }
+    };
+    // Rebuilding the record checks every remaining field: protocol, version, and count.
+    let rebuilt = dispatch_record(r.at, source, r.component, &delivery);
+    (rebuilt == *r).then_some(CanonicalEvent {
+        key,
+        source,
+        target: r.component,
+        delivery,
+    })
+}
+
+/// Checks that `records` is a well-formed trace prefix whose dispatch history ends at
+/// `last` with execution digest `digest`.
+pub(crate) fn check_prefix(
+    records: &[TraceRecord],
+    components: usize,
+    last: Option<EventKey>,
+    digest: &[u8; 32],
+) -> Result<(), ResumeError> {
+    let mut replayed = [0; 32];
+    let mut current: Option<EventKey> = None;
+    for (index, r) in records.iter().enumerate() {
+        let malformed = ResumeError::MalformedRecord(index);
+        if r.component.0 as usize >= components {
+            return Err(malformed);
+        }
+        match r.origin {
+            TraceOrigin::Runtime => {
+                let ev = dispatched_event(r).ok_or(malformed)?;
+                if current.is_some_and(|k| ev.key <= k) {
+                    return Err(malformed);
+                }
+                replayed = chain(&replayed, &ev);
+                current = Some(ev.key);
+            }
+            TraceOrigin::Component => {
+                let in_place = match (r.at, current) {
+                    (TraceAt::Init, None) => true,
+                    (TraceAt::Event(k), Some(c)) => k == c,
+                    _ => false,
+                };
+                if !in_place {
+                    return Err(malformed);
+                }
+            }
+        }
+    }
+    if current != last || replayed != *digest {
+        return Err(ResumeError::HistoryMismatch);
+    }
+    Ok(())
 }

@@ -145,6 +145,16 @@ impl<T> Scheduler<T> {
         self.last_dispatched.map_or(Phase::Request, |k| k.phase)
     }
 
+    /// Key of the most recently dispatched event, if any.
+    pub fn last_dispatched(&self) -> Option<EventKey> {
+        self.last_dispatched
+    }
+
+    /// The session limits this scheduler enforces.
+    pub fn config(&self) -> SchedulerConfig {
+        self.config
+    }
+
     /// The sequence number the next scheduled event will receive.
     pub fn next_sequence(&self) -> u64 {
         self.next_sequence

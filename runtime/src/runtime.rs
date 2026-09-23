@@ -8,6 +8,7 @@
 
 use std::fmt;
 
+use systemscope_contracts::canonical::{CanonicalEvent, Encoder};
 use systemscope_contracts::component::{
     Component, ComponentId, Delivered, InitContext, PortId, PortSpec, SimContext,
 };
@@ -15,16 +16,17 @@ use systemscope_contracts::error::SimError;
 use systemscope_contracts::event::{EventKey, Phase, ScheduleWhen};
 use systemscope_contracts::protocol::Message;
 use systemscope_contracts::rng::SimRng;
+use systemscope_contracts::snapshot::RestoreError;
 use systemscope_contracts::time::{ClockDomain, SimulationClock, Tick};
 use systemscope_contracts::topology::LinkLatency;
 use systemscope_contracts::trace::{
     CONTRACTS_VERSION, ComponentDecl, LinkDecl, TraceAt, TraceHeader, TraceOrigin, TraceRecord,
-    Value,
+    Value, encode_topology,
 };
 
 use crate::rng::Xoshiro256StarStar;
 use crate::scheduler::{Scheduler, SchedulerConfig};
-use crate::trace::{Trace, dispatch_record};
+use crate::trace::{ResumeError, Trace, check_prefix, dispatch_record};
 
 /// Settings fixed for the lifetime of a session.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -53,6 +55,11 @@ pub enum RuntimeError {
     Faulted(SimError),
     /// The call is not allowed in this lifecycle state.
     InvalidState(Lifecycle),
+    /// A snapshot could not be restored. The session is now faulted.
+    Restore(RestoreError),
+    /// `restore` was called after `start_trace`. A restored session continues its trace
+    /// with `resume_trace` instead.
+    TraceNeedsPrefix,
 }
 
 impl fmt::Display for RuntimeError {
@@ -60,6 +67,10 @@ impl fmt::Display for RuntimeError {
         match self {
             RuntimeError::Faulted(e) => write!(f, "session faulted: {e}"),
             RuntimeError::InvalidState(s) => write!(f, "not allowed in state {s:?}"),
+            RuntimeError::Restore(e) => write!(f, "restore failed: {e}"),
+            RuntimeError::TraceNeedsPrefix => {
+                f.write_str("a restored session resumes its trace with resume_trace")
+            }
         }
     }
 }
@@ -69,9 +80,9 @@ impl std::error::Error for RuntimeError {}
 /// What the runtime delivers when an event runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Pending {
-    source: ComponentId,
-    target: ComponentId,
-    delivery: Delivered,
+    pub(crate) source: ComponentId,
+    pub(crate) target: ComponentId,
+    pub(crate) delivery: Delivered,
 }
 
 /// One dispatched event, as seen by the driver.
@@ -104,30 +115,43 @@ pub(crate) struct Slot {
 
 /// Elaborated facts about a component, kept apart from the component itself so a
 /// running component and its context never borrow the same storage.
-struct SlotInfo {
-    path: String,
-    type_name: &'static str,
-    ports: Vec<PortSpec>,
+pub(crate) struct SlotInfo {
+    pub(crate) path: String,
+    pub(crate) type_name: &'static str,
+    pub(crate) ports: Vec<PortSpec>,
 }
 
 /// A simulation session. Owns every component; components never reach each other.
 pub struct Runtime {
-    clock: SimulationClock,
-    domains: Vec<ClockDomain>,
-    components: Vec<Box<dyn Component>>,
+    pub(crate) clock: SimulationClock,
+    pub(crate) domains: Vec<ClockDomain>,
+    pub(crate) components: Vec<Box<dyn Component>>,
     /// One random stream per component, owned here so snapshots can capture them.
-    rngs: Vec<Xoshiro256StarStar>,
-    slots: Vec<SlotInfo>,
+    pub(crate) rngs: Vec<Xoshiro256StarStar>,
+    pub(crate) slots: Vec<SlotInfo>,
     /// `peers[component][port]` is the other end of that port's link.
     peers: Vec<Vec<Peer>>,
-    /// Links in declaration order, for the trace header.
+    /// Links in declaration order, for the trace header and the topology hash.
     links: Vec<LinkDecl>,
-    seed: u64,
-    scheduler: Scheduler<Pending>,
-    lifecycle: Lifecycle,
+    pub(crate) topology_hash: [u8; 32],
+    pub(crate) config: SessionConfig,
+    pub(crate) scheduler: Scheduler<Pending>,
+    /// Chained BLAKE3 over every dispatched event's `canonical(ev)` (§4.4).
+    pub(crate) execution_digest: [u8; 32],
+    pub(crate) lifecycle: Lifecycle,
     fault: Option<SimError>,
+    /// Restored and not yet stepped: the only time `resume_trace` is accepted.
+    pub(crate) freshly_restored: bool,
     /// Recorded trace, if tracing was started. Never read by the simulation.
-    trace: Option<Vec<TraceRecord>>,
+    pub(crate) trace: Option<Vec<TraceRecord>>,
+}
+
+/// Absorbs one event into an execution digest: `H(digest ‖ canonical(ev))`.
+pub(crate) fn chain(digest: &[u8; 32], ev: &CanonicalEvent) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(digest);
+    h.update(&ev.to_bytes());
+    *h.finalize().as_bytes()
 }
 
 impl Runtime {
@@ -143,7 +167,7 @@ impl Runtime {
             .iter()
             .map(|s| Xoshiro256StarStar::for_component(config.seed, &s.path))
             .collect();
-        let (slots, components) = slots
+        let (slots, components): (Vec<SlotInfo>, _) = slots
             .into_iter()
             .map(|s| {
                 let info = SlotInfo {
@@ -154,6 +178,8 @@ impl Runtime {
                 (info, s.component)
             })
             .unzip();
+        let mut topology = Encoder::new();
+        encode_topology(&mut topology, &component_decls(&slots), &links);
         Runtime {
             clock,
             domains,
@@ -162,12 +188,25 @@ impl Runtime {
             slots,
             peers,
             links,
-            seed: config.seed,
+            topology_hash: *blake3::hash(topology.as_bytes()).as_bytes(),
+            config,
             scheduler: Scheduler::new(config.scheduler),
+            execution_digest: [0; 32],
             lifecycle: Lifecycle::Elaborated,
             fault: None,
+            freshly_restored: false,
             trace: None,
         }
+    }
+
+    /// `topology_hash`: BLAKE3 of the structural topology (§6).
+    pub fn topology_hash(&self) -> [u8; 32] {
+        self.topology_hash
+    }
+
+    /// `ExecutionDigest` so far: 32 zero bytes, chained with every dispatched event.
+    pub fn execution_digest(&self) -> [u8; 32] {
+        self.execution_digest
     }
 
     /// The current lifecycle state.
@@ -208,6 +247,28 @@ impl Runtime {
         Ok(())
     }
 
+    /// Continues a trace across a restore (§8.1). Accepted only right after `restore`,
+    /// before the first step, and only for the prefix of the run the snapshot came from:
+    /// its header must equal this session's, and replaying its dispatch records must
+    /// reproduce the restored `ExecutionDigest` and last dispatched key.
+    pub fn resume_trace(&mut self, prefix: Trace) -> Result<(), ResumeError> {
+        if self.lifecycle != Lifecycle::Ready || !self.freshly_restored {
+            return Err(ResumeError::NotFreshlyRestored);
+        }
+        if prefix.header != self.trace_header() {
+            return Err(ResumeError::HeaderMismatch);
+        }
+        check_prefix(
+            &prefix.records,
+            self.slots.len(),
+            self.scheduler.last_dispatched(),
+            &self.execution_digest,
+        )?;
+        self.trace = Some(prefix.records);
+        self.freshly_restored = false;
+        Ok(())
+    }
+
     /// Stops tracing and returns what was recorded, or `None` if tracing never started.
     pub fn take_trace(&mut self) -> Option<Trace> {
         let records = self.trace.take()?;
@@ -221,18 +282,11 @@ impl Runtime {
     pub fn trace_header(&self) -> TraceHeader {
         TraceHeader {
             ticks_per_second: self.clock.ticks_per_second(),
-            seed: self.seed,
+            seed: self.config.seed,
             contracts_version: CONTRACTS_VERSION.to_owned(),
+            topology_hash: self.topology_hash,
             clock_domains: self.domains.clone(),
-            components: self
-                .slots
-                .iter()
-                .map(|s| ComponentDecl {
-                    path: s.path.clone(),
-                    type_name: s.type_name,
-                    ports: s.ports.clone(),
-                })
-                .collect(),
+            components: component_decls(&self.slots),
             links: self.links.clone(),
         }
     }
@@ -268,6 +322,15 @@ impl Runtime {
             target,
             delivery,
         } = event.payload;
+        let ev = CanonicalEvent {
+            key: event.key,
+            source,
+            target,
+            delivery,
+        };
+        self.execution_digest = chain(&self.execution_digest, &ev);
+        self.freshly_restored = false;
+        let CanonicalEvent { delivery, .. } = ev;
         let at = TraceAt::Event(event.key);
         if let Some(records) = &mut self.trace {
             records.push(dispatch_record(at, source, target, &delivery));
@@ -304,6 +367,16 @@ impl Runtime {
         }
     }
 
+    pub(crate) fn require_state(&self, state: Lifecycle) -> Result<(), RuntimeError> {
+        self.require(state)
+    }
+
+    /// Faults the session after a failed restore.
+    pub(crate) fn fail_restore(&mut self, error: RestoreError) -> RuntimeError {
+        self.lifecycle = Lifecycle::Faulted;
+        RuntimeError::Restore(error)
+    }
+
     fn enter_fault(&mut self, error: SimError) -> RuntimeError {
         self.lifecycle = Lifecycle::Faulted;
         self.fault = Some(error);
@@ -327,6 +400,18 @@ impl Runtime {
         };
         (self.components[index].as_mut(), ctx)
     }
+}
+
+/// Components as the trace header and topology hash record them.
+fn component_decls(slots: &[SlotInfo]) -> Vec<ComponentDecl> {
+    slots
+        .iter()
+        .map(|s| ComponentDecl {
+            path: s.path.clone(),
+            type_name: s.type_name,
+            ports: s.ports.clone(),
+        })
+        .collect()
 }
 
 /// Resolves a component's scheduling request to an absolute tick. Runtime only.

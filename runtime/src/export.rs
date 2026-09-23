@@ -356,6 +356,7 @@ mod tests {
                 ticks_per_second: 1_000_000_000_000,
                 seed: 0,
                 contracts_version: "v".into(),
+                topology_hash: [0; 32],
                 clock_domains: Vec::new(),
                 components: vec![decl("a"), decl("b"), decl("mem")],
                 links: Vec::new(),
