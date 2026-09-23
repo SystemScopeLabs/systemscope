@@ -11,6 +11,7 @@ use systemscope_contracts::component::{ComponentId, Delivered, PortId};
 use systemscope_contracts::event::EventKey;
 use systemscope_contracts::protocol::Message;
 use systemscope_contracts::protocol::mem::{MemMsg, TxnId};
+use systemscope_contracts::protocol::mem_v1::{self, MemFault, ReadOutcome, WriteOutcome};
 use systemscope_contracts::trace::{
     DISPATCH_KIND, TraceAt, TraceHeader, TraceOrigin, TraceRecord, Value, encode_stream,
 };
@@ -67,7 +68,10 @@ pub(crate) fn dispatch_record(
 
 /// Appends `msg` (the variant name) and the message's fields in declaration order.
 fn message_fields(msg: &Message, fields: &mut Vec<(&'static str, Value)>) {
-    let Message::Mem(mem) = msg;
+    let mem = match msg {
+        Message::Mem(mem) => mem,
+        Message::MemV1(mem) => return mem_v1_fields(mem, fields),
+    };
     let txn = |t: &systemscope_contracts::protocol::mem::TxnId| Value::U64(t.0);
     match mem {
         MemMsg::ReadReq { txn: t, addr, len } => fields.extend([
@@ -89,6 +93,50 @@ fn message_fields(msg: &Message, fields: &mut Vec<(&'static str, Value)>) {
         ]),
         MemMsg::WriteResp { txn: t } => {
             fields.extend([("msg", Value::Str("WriteResp".into())), ("txn", txn(t))])
+        }
+    }
+}
+
+/// The `mem.v1` fields, with an outcome flattened into `outcome` (its variant name)
+/// followed by that variant's field (`docs/m1-design.md` §4.3).
+fn mem_v1_fields(msg: &mem_v1::MemMsg, fields: &mut Vec<(&'static str, Value)>) {
+    let name = |s: &str| Value::Str(s.into());
+    let fault = |f: &MemFault| match f {
+        MemFault::AccessFault => ("fault", name("AccessFault")),
+    };
+    match msg {
+        mem_v1::MemMsg::ReadReq { txn, addr, len } => fields.extend([
+            ("msg", name("ReadReq")),
+            ("txn", Value::U64(txn.0)),
+            ("addr", Value::U64(*addr)),
+            ("len", Value::U64(u64::from(*len))),
+        ]),
+        mem_v1::MemMsg::ReadResp { txn, outcome } => {
+            fields.extend([("msg", name("ReadResp")), ("txn", Value::U64(txn.0))]);
+            match outcome {
+                ReadOutcome::Data { data } => fields.extend([
+                    ("outcome", name("Data")),
+                    ("data", Value::Bytes(data.clone())),
+                ]),
+                ReadOutcome::Fault { fault: f } => {
+                    fields.extend([("outcome", name("Fault")), fault(f)])
+                }
+            }
+        }
+        mem_v1::MemMsg::WriteReq { txn, addr, data } => fields.extend([
+            ("msg", name("WriteReq")),
+            ("txn", Value::U64(txn.0)),
+            ("addr", Value::U64(*addr)),
+            ("data", Value::Bytes(data.clone())),
+        ]),
+        mem_v1::MemMsg::WriteResp { txn, outcome } => {
+            fields.extend([("msg", name("WriteResp")), ("txn", Value::U64(txn.0))]);
+            match outcome {
+                WriteOutcome::Done => fields.push(("outcome", name("Done"))),
+                WriteOutcome::Fault { fault: f } => {
+                    fields.extend([("outcome", name("Fault")), fault(f)])
+                }
+            }
         }
     }
 }
@@ -155,28 +203,69 @@ pub(crate) fn dispatched_event(r: &TraceRecord) -> Option<CanonicalEvent> {
             return None;
         };
         let txn = TxnId(int(5, "txn")?);
-        let mem = match msg.as_str() {
-            "ReadReq" => MemMsg::ReadReq {
-                txn,
-                addr: int(6, "addr")?,
-                len: u32::try_from(int(7, "len")?).ok()?,
-            },
-            "ReadResp" => MemMsg::ReadResp {
-                txn,
-                data: bytes(6, "data")?,
-            },
-            "WriteReq" => MemMsg::WriteReq {
-                txn,
-                addr: int(6, "addr")?,
-                data: bytes(7, "data")?,
-            },
-            "WriteResp" => MemMsg::WriteResp { txn },
+        let str_at = |i, name| match get(i, name) {
+            Some(Value::Str(v)) => Some(v.as_str()),
+            _ => None,
+        };
+        let msg = match int(3, "version")? {
+            0 => Message::Mem(match msg.as_str() {
+                "ReadReq" => MemMsg::ReadReq {
+                    txn,
+                    addr: int(6, "addr")?,
+                    len: u32::try_from(int(7, "len")?).ok()?,
+                },
+                "ReadResp" => MemMsg::ReadResp {
+                    txn,
+                    data: bytes(6, "data")?,
+                },
+                "WriteReq" => MemMsg::WriteReq {
+                    txn,
+                    addr: int(6, "addr")?,
+                    data: bytes(7, "data")?,
+                },
+                "WriteResp" => MemMsg::WriteResp { txn },
+                _ => return None,
+            }),
+            1 => {
+                let fault = || match str_at(7, "fault")? {
+                    "AccessFault" => Some(MemFault::AccessFault),
+                    _ => None,
+                };
+                Message::MemV1(match msg.as_str() {
+                    "ReadReq" => mem_v1::MemMsg::ReadReq {
+                        txn,
+                        addr: int(6, "addr")?,
+                        len: u32::try_from(int(7, "len")?).ok()?,
+                    },
+                    "ReadResp" => mem_v1::MemMsg::ReadResp {
+                        txn,
+                        outcome: match str_at(6, "outcome")? {
+                            "Data" => ReadOutcome::Data {
+                                data: bytes(7, "data")?,
+                            },
+                            "Fault" => ReadOutcome::Fault { fault: fault()? },
+                            _ => return None,
+                        },
+                    },
+                    "WriteReq" => mem_v1::MemMsg::WriteReq {
+                        txn,
+                        addr: int(6, "addr")?,
+                        data: bytes(7, "data")?,
+                    },
+                    "WriteResp" => mem_v1::MemMsg::WriteResp {
+                        txn,
+                        outcome: match str_at(6, "outcome")? {
+                            "Done" => WriteOutcome::Done,
+                            "Fault" => WriteOutcome::Fault { fault: fault()? },
+                            _ => return None,
+                        },
+                    },
+                    _ => return None,
+                })
+            }
             _ => return None,
         };
-        Delivered::Message {
-            port,
-            msg: Message::Mem(mem),
-        }
+        Delivered::Message { port, msg }
     };
     // Rebuilding the record checks every remaining field: protocol, version, and count.
     let rebuilt = dispatch_record(r.at, source, r.component, &delivery);
@@ -228,4 +317,178 @@ pub(crate) fn check_prefix(
         return Err(ResumeError::HistoryMismatch);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use systemscope_contracts::event::Phase;
+    use systemscope_contracts::time::Tick;
+
+    use super::*;
+
+    fn at() -> TraceAt {
+        TraceAt::Event(EventKey {
+            tick: Tick(3),
+            phase: Phase::Transfer,
+            sequence: 4,
+        })
+    }
+
+    fn record(msg: mem_v1::MemMsg) -> TraceRecord {
+        let delivery = Delivered::Message {
+            port: PortId(2),
+            msg: Message::MemV1(msg),
+        };
+        dispatch_record(at(), ComponentId(1), ComponentId(0), &delivery)
+    }
+
+    fn s(v: &str) -> Value {
+        Value::Str(v.into())
+    }
+
+    fn fault() -> MemFault {
+        MemFault::AccessFault
+    }
+
+    /// Every `mem.v1` variant and outcome, with the fields its dispatch record carries
+    /// after `source`, `port`, `protocol` and `version`.
+    fn cases() -> Vec<(mem_v1::MemMsg, Vec<(&'static str, Value)>)> {
+        use mem_v1::MemMsg::*;
+        vec![
+            (
+                ReadReq {
+                    txn: TxnId(u64::MAX),
+                    addr: u64::MAX,
+                    len: 1,
+                },
+                vec![
+                    ("msg", s("ReadReq")),
+                    ("txn", Value::U64(u64::MAX)),
+                    ("addr", Value::U64(u64::MAX)),
+                    ("len", Value::U64(1)),
+                ],
+            ),
+            (
+                ReadResp {
+                    txn: TxnId(0),
+                    outcome: ReadOutcome::Data {
+                        data: vec![0xDE, 0xAD],
+                    },
+                },
+                vec![
+                    ("msg", s("ReadResp")),
+                    ("txn", Value::U64(0)),
+                    ("outcome", s("Data")),
+                    ("data", Value::Bytes(vec![0xDE, 0xAD])),
+                ],
+            ),
+            (
+                ReadResp {
+                    txn: TxnId(7),
+                    outcome: ReadOutcome::Fault { fault: fault() },
+                },
+                vec![
+                    ("msg", s("ReadResp")),
+                    ("txn", Value::U64(7)),
+                    ("outcome", s("Fault")),
+                    ("fault", s("AccessFault")),
+                ],
+            ),
+            (
+                WriteReq {
+                    txn: TxnId(8),
+                    addr: 0,
+                    data: vec![0xAA],
+                },
+                vec![
+                    ("msg", s("WriteReq")),
+                    ("txn", Value::U64(8)),
+                    ("addr", Value::U64(0)),
+                    ("data", Value::Bytes(vec![0xAA])),
+                ],
+            ),
+            (
+                WriteResp {
+                    txn: TxnId(8),
+                    outcome: WriteOutcome::Done,
+                },
+                vec![
+                    ("msg", s("WriteResp")),
+                    ("txn", Value::U64(8)),
+                    ("outcome", s("Done")),
+                ],
+            ),
+            (
+                WriteResp {
+                    txn: TxnId(9),
+                    outcome: WriteOutcome::Fault { fault: fault() },
+                },
+                vec![
+                    ("msg", s("WriteResp")),
+                    ("txn", Value::U64(9)),
+                    ("outcome", s("Fault")),
+                    ("fault", s("AccessFault")),
+                ],
+            ),
+        ]
+    }
+
+    #[test]
+    fn mem_v1_dispatch_fields_flatten_the_outcome() {
+        for (msg, tail) in cases() {
+            let mut fields = vec![
+                ("source", Value::U64(1)),
+                ("port", Value::U64(2)),
+                ("protocol", s("mem")),
+                ("version", Value::U64(1)),
+            ];
+            fields.extend(tail);
+            assert_eq!(record(msg.clone()).fields, fields, "{msg:?}");
+        }
+    }
+
+    #[test]
+    fn mem_v1_dispatch_records_parse_back_to_their_event() {
+        for (msg, _) in cases() {
+            let ev = dispatched_event(&record(msg.clone())).expect("parses");
+            assert_eq!(
+                ev.delivery,
+                Delivered::Message {
+                    port: PortId(2),
+                    msg: Message::MemV1(msg),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn altered_mem_v1_dispatch_records_are_rejected() {
+        let fault = record(cases()[2].0.clone());
+        let replace = |r: &TraceRecord, i: usize, v: Value| {
+            let mut r = r.clone();
+            r.fields[i].1 = v;
+            dispatched_event(&r)
+        };
+        assert_eq!(replace(&fault, 6, s("Bogus")), None);
+        assert_eq!(replace(&fault, 7, s("BusError")), None);
+        // Version 0 names mem.v0, whose ReadResp has no outcome field.
+        assert_eq!(replace(&fault, 3, Value::U64(0)), None);
+        assert_eq!(replace(&fault, 3, Value::U64(2)), None);
+        let done = record(cases()[4].0.clone());
+        let mut extra = done.clone();
+        extra.fields.push(("fault", s("AccessFault")));
+        assert_eq!(dispatched_event(&extra), None);
+        // A mem.v0 record relabelled as version 1 is not a mem.v1 record.
+        let v0 = dispatch_record(
+            at(),
+            ComponentId(1),
+            ComponentId(0),
+            &Delivered::Message {
+                port: PortId(2),
+                msg: Message::Mem(MemMsg::WriteResp { txn: TxnId(8) }),
+            },
+        );
+        assert!(dispatched_event(&v0).is_some());
+        assert_eq!(replace(&v0, 3, Value::U64(1)), None);
+    }
 }
