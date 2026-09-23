@@ -71,40 +71,24 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-      - run: cargo nextest run --workspace --locked --profile ci
+      - name: Unit and integration tests
+        run: cargo nextest run --workspace --exclude systemscope-acceptance --locked --profile ci --no-fail-fast
       # nextest does not run doctests.
-      - run: cargo test --workspace --doc --locked
-
-  coverage:
-    name: coverage (report only)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          path: systemscope
-      # systemscope depends on `../contracts` by path (plan.md §10), so reproduce the
-      # sibling layout. Until contracts is pinned by revision, this tracks its main.
-      - uses: actions/checkout@v4
-        with:
-          repository: SystemScope/contracts
-          path: contracts
-      - name: Install pinned toolchain
+      - name: Doctests
+        run: cargo test --workspace --doc --locked
+      # docs/m0-design.md §9 on the full m0-reference. The golden digests and the portable
+      # snapshot are checked on both operating systems.
+      - name: Acceptance harness self-tests
+        run: cargo nextest run -p systemscope-acceptance --locked --profile ci --no-fail-fast --lib --bins
+      - name: AT-1 reproducibility (fixed seeds, golden digests)
+        run: cargo nextest run -p systemscope-acceptance --locked --profile ci --no-fail-fast --test at1
+      - name: AT-2 snapshot/restore equivalence (checkpoints, portable snapshot)
+        run: cargo nextest run -p systemscope-acceptance --locked --profile ci --no-fail-fast --test at2
+      - name: AT-3 observation invariance (O0-O5, compile-fail)
+        run: cargo nextest run -p systemscope-acceptance --locked --profile ci --no-fail-fast --test at3 --test compile_fail
+      # Only `cargo xtask bless` writes golden files; a test that wrote one would show here.
+      - name: Golden files unchanged
+        shell: bash
         run: |
-          rustup toolchain install
-          rustup component add llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: systemscope
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-llvm-cov,cargo-nextest
-      - run: cargo llvm-cov nextest --workspace --locked --profile ci --lcov --output-path lcov.info
-      - name: Summary
-        run: |
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          cargo llvm-cov report --summary-only >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: lcov
-          path: systemscope/lcov.info
+          git diff --exit-code
+          test -z "$(git status --porcelain)"

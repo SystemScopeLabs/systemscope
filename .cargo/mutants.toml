@@ -1,3 +1,6 @@
 # cargo-mutants (https://mutants.rs): nightly exploration of mutations nobody thought
 # of. Targeted mutation checks written for each design rule stay in the regular tests.
 test_tool = "nextest"
+# The acceptance harness and xtask are checked by targeted mutations and fault-injection
+# self-tests (docs/m0-design.md §9); mutating them here would only slow the run.
+exclude_globs = ["tests/acceptance/**", "xtask/**"]

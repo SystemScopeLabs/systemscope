@@ -1,0 +1,113 @@
+name: Nightly
+
+# One random seed per night, printed so a failure can be reproduced with
+# `M0_SEED=<seed> cargo nextest run -p systemscope-acceptance --run-ignored only`.
+# It has no golden digests and is never compared with tests/golden (docs/m0-design.md §9.1).
+on:
+  schedule:
+    - cron: "0 17 * * *"
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: "Seed to test (decimal or 0x hex); random when empty"
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    working-directory: systemscope
+
+jobs:
+  seed:
+    name: pick a seed
+    runs-on: ubuntu-latest
+    outputs:
+      seed: ${{ steps.pick.outputs.seed }}
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - id: pick
+        env:
+          INPUT_SEED: ${{ inputs.seed }}
+        run: |
+          seed="${INPUT_SEED:-0x$(od -An -N8 -tx8 /dev/urandom | tr -d ' \n')}"
+          echo "seed=$seed" >> "$GITHUB_OUTPUT"
+          echo "M0_SEED=$seed" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  acceptance:
+    name: AT-1..AT-3, random seed (${{ matrix.os }})
+    needs: seed
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      M0_SEED: ${{ needs.seed.outputs.seed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: systemscope
+      # systemscope depends on `../contracts` by path (plan.md §10), so reproduce the
+      # sibling layout. Until contracts is pinned by revision, this tracks its main.
+      - uses: actions/checkout@v4
+        with:
+          repository: SystemScope/contracts
+          path: contracts
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: systemscope
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - name: Seed
+        shell: bash
+        run: echo "M0_SEED=$M0_SEED"
+      # AT-1 step 1 (two processes), AT-2, and AT-3 for the random seed.
+      - name: Random-seed acceptance
+        run: cargo nextest run -p systemscope-acceptance --locked --profile ci --no-fail-fast --run-ignored only
+      - name: Report the failing seed
+        if: failure()
+        shell: bash
+        run: echo "::error::nightly acceptance failed for M0_SEED=$M0_SEED"
+
+  coverage:
+    name: coverage (report only)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: systemscope
+      - uses: actions/checkout@v4
+        with:
+          repository: SystemScope/contracts
+          path: contracts
+      - name: Install pinned toolchain
+        run: |
+          rustup toolchain install
+          rustup component add llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: systemscope
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov,cargo-nextest
+      - run: cargo llvm-cov nextest --workspace --locked --profile ci --no-fail-fast --lcov --output-path lcov.info
+      - name: Summary
+        run: |
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cargo llvm-cov report --summary-only >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lcov
+          path: systemscope/lcov.info
