@@ -407,6 +407,7 @@ dependencies = [
 name = "systemscope-toy"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "serde_json",
  "systemscope-contracts",
  "systemscope-runtime",
