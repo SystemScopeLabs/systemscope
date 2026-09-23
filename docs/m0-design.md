@@ -42,14 +42,14 @@ contracts/                        (repo: SystemScope/contracts)
    ├─ event.rs       Phase, EventKey, ScheduleWhen
    ├─ error.rs       SimError
    ├─ component.rs   Component, InitContext, SimContext, PortSpec, ComponentId
-   ├─ topology.rs    Link, TopologySpec
-   ├─ protocol/
+   ├─ topology.rs    LinkLatency
+   ├─ protocol/      ProtocolId, closed Message enum
    │  └─ mem.rs      mem.v0 messages
    ├─ snapshot.rs    SnapshotWriter/Reader, schema versioning
    └─ trace.rs       TraceRecord, Value, Observer, WorldView
 
 systemscope/                      (repo: SystemScope/systemscope, this repository)
-├─ runtime/                       systemscope-runtime: queue, scheduler, elaboration, snapshots, sinks
+├─ runtime/                       systemscope-runtime: scheduler, TopologyBuilder and elaboration, lifecycle, snapshots, sinks
 ├─ components/toy/                systemscope-toy: ToyCpu, ToyDma, ToyBus, ToyMemory
 ├─ tests/acceptance/              AT-1, AT-2, AT-3
 ├─ tests/golden/                  golden digests and snapshots
