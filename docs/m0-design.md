@@ -54,9 +54,9 @@ systemscope/                      (repo: SystemScope/systemscope, this repositor
 ├─ runtime/                       systemscope-runtime: scheduler, TopologyBuilder and elaboration, lifecycle, snapshots, sinks
 ├─ components/toy/                systemscope-toy: ToyCpu, ToyDma, ToyBus, ToyMemory
 ├─ reference/                     systemscope-reference: builds m0-reference (§9.1) for tests and tools
-├─ tests/acceptance/              AT-1, AT-2, AT-3
-├─ tests/golden/                  golden digests and snapshots
-├─ xtask/                         bless, perfetto export, CI helpers
+├─ tests/acceptance/              systemscope-acceptance: AT-1, AT-2, AT-3 harness and tests, the m0-run binary
+├─ tests/golden/                  golden digests and the portable snapshot (§9)
+├─ xtask/                         cargo xtask bless
 ├─ clippy.toml                    determinism lints (§8.3)
 ├─ rust-toolchain.toml            pinned toolchain
 └─ .github/workflows/ci.yml
@@ -652,8 +652,8 @@ The clock mix is chosen on purpose. 3 GHz has a period that is not a whole numbe
 
 - **Seeds:**
   - **Fixed seeds** `{0, 1, 0xDEADBEEF}` run on every CI run. Only these have golden digests.
-  - **One random seed** runs nightly. It is printed so failures can be reproduced. It has no golden digest and is **never compared against committed golden files**. It is only checked for reproducibility (AT-1 step 1), for snapshot/restore equivalence (AT-2 steps 1–3), and for observation invariance (AT-3).
-- **Run length:** until both initiators finish 100,000 operations, or `T_end = 10 ms` of simulated time, whichever comes first. Development tests use the same topology with fewer operations.
+  - **One random seed** runs nightly, passed to the tests as `M0_SEED`. It is printed so failures can be reproduced. It has no golden digest and is **never compared against committed golden files**. It is only checked for reproducibility (AT-1 step 1), for snapshot/restore equivalence (AT-2 steps 1–3), and for observation invariance (AT-3).
+- **Run length:** until both initiators finish 100,000 operations, or `T_end = 10 ms` of simulated time, whichever comes first. Development tests use the same topology with fewer operations. The acceptance tests always use the full workload (about 1.3 million events, 2.1 million trace records).
 - **Workload parameters:**
 
   | Component | Parameters |
@@ -674,11 +674,21 @@ The clock mix is chosen on purpose. 3 GHz has a period that is not a whole numbe
 
 *The same inputs always produce the same result, across runs, processes, and operating systems.*
 
-1. For each seed, run the scenario twice in **separate processes**. All three digests must be equal.
+1. For each seed, run the scenario twice in **separate processes**. All three digests must be equal. The `m0-run` binary runs the scenario and prints its digests with its process id. The test checks that the two ids differ from each other and from its own.
 2. For the **fixed seeds only**, the CI matrix covers **`ubuntu-latest` and `windows-latest`**. Their digests must be identical to each other and to `tests/golden/m0-reference.json`. The nightly random seed skips this step and is checked only with step 1.
 3. Different seeds must produce different `ExecutionDigest`s. This checks that the seed is actually used.
 
-Golden files change only through `cargo xtask bless`. The commit that does so must explain why in its body.
+### Golden Files
+
+| File | Contents |
+|---|---|
+| `tests/golden/m0-reference.json` | the workload, then per fixed seed: event count, `StateDigest`, `ExecutionDigest`, `TraceDigest`; the portable snapshot's seed, event index, and BLAKE3 |
+| `tests/golden/m0-reference.mid.snap` | the seed `0xDEADBEEF` run, snapshotted halfway (AT-2 step 4) |
+
+- Golden files change only through `cargo xtask bless`. It runs the scenario, prints every changed digest as old → new, and writes the files. Tests only read them.
+- CI fails if a test run leaves the working tree changed.
+- The commit that changes golden files must explain why in its body.
+- `.gitattributes` marks `*.snap` as binary, so checkouts on every OS keep the bytes. The recorded BLAKE3 catches any conversion.
 
 ### AT-2: Snapshot/Restore Equivalence
 
@@ -706,7 +716,13 @@ Golden files change only through `cargo xtask bless`. The commit that does so mu
    `StateDigest` and `ExecutionDigest` must equal `D`. The trace prefix, taken from the dropped runtime and resumed on the new one (§8.1), together with the resumed suffix must equal the reference `TraceDigest`.
 3. **Round-trip law.** At every checkpoint, check that `encode(restore(decode(bytes))) == bytes`.
 4. **Portability.** `tests/golden/m0-reference.mid.snap` is a committed snapshot. Restoring it and running to the end must match the golden digests on both CI operating systems.
-5. **Negative cases.** A changed `snapshot_schema_version` must fail with `RestoreError::SchemaVersion`. A changed topology must fail with `RestoreError::TopologyMismatch`. Each changed `SessionInfo` field must fail with `RestoreError::SessionMismatch` naming it. `resume_trace` must reject a prefix from a differently configured run, a truncated or extended prefix, and any call after the first step.
+5. **Negative cases.**
+   - A changed `snapshot_schema_version` must fail with `RestoreError::SchemaVersion`.
+   - A changed topology must fail with `RestoreError::TopologyMismatch`.
+   - Each changed `SessionInfo` field must fail with `RestoreError::SessionMismatch` naming it.
+   - Malformed bytes must fail: every truncation, trailing bytes, a wrong magic, an unknown format version, and an invalid tag.
+   - An impossible scheduler or RNG state must fail with `RestoreError::InvalidState`: a queued sequence at or above `next_sequence`, a queued event before the last dispatched one, an inconsistent `dispatched_in_phase`, a duplicate sequence, and an all-zero RNG state.
+   - `resume_trace` must reject a prefix from a differently configured run, a truncated or extended prefix, and any call after the first step.
 
 ### AT-3: Observation Invariance
 
@@ -717,14 +733,22 @@ Golden files change only through `cargo xtask bless`. The commit that does so mu
 | O0 | no observers, no sinks |
 | O1 | canonical trace recorder with JSONL and Perfetto exporters |
 | O2 | breakpoint observer pausing on every `ReadResp`; the driver resumes immediately |
-| O3 | single-step, one event per `run` call, until the end |
+| O3 | single-step, one event per `step` call, until the end |
 | O4 | `Observe` probe every 1,000 ticks, calling `inspect()` on every component |
 | O5 | O1 + O2 + O3 + O4 |
 
 - Every configuration must produce the same `StateDigest` and `ExecutionDigest`.
 - O1 and O5 must produce the same `TraceDigest`.
 - Registering observe points must leave `next_sequence` unchanged. This is asserted directly.
-- **Compile-fail test** (`trybuild`): code that tries to get `&mut` component state from `WorldView` must not compile.
+- The RNG states, `next_sequence`, every component's snapshot bytes, and the event count must equal O0's.
+- Pause, resume, and step counts are driver state. They differ between configurations and never reach the simulation.
+- **Compile-fail test** (`trybuild`): code that tries to get `&mut` component state from `WorldView` must not compile. Neither must an `inspect` that writes to its component.
+
+### CI
+
+- **Blocking, on `ubuntu-latest` and `windows-latest`:** `cargo fmt --check`, `cargo check --locked`, `clippy -D warnings` with the determinism lints, `cargo machete` (these four on Linux only), then nextest with `--no-fail-fast`, doctests, AT-1, AT-2, and AT-3. A last step fails if the tests changed any file.
+- **Nightly, not blocking:** AT-1 step 1, AT-2, and AT-3 for one random seed on both operating systems (`M0_SEED`, printed), coverage, and `cargo mutants`.
+- `contracts` is checked out next to `systemscope`, matching the path dependency.
 
 ### Supporting Unit and Property Tests
 
