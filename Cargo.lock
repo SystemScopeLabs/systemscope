@@ -465,6 +465,9 @@ dependencies = [
 [[package]]
 name = "systemscope-rv32i"
 version = "0.0.0"
+dependencies = [
+ "proptest",
+]
 
 [[package]]
 name = "systemscope-toy"

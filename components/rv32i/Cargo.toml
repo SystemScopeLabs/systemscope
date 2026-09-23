@@ -9,5 +9,8 @@ rust-version.workspace = true
 # The CPU component will depend only on contracts (docs/m1-design.md §3).
 [dependencies]
 
+[dev-dependencies]
+proptest = "1"
+
 [lints]
 workspace = true
