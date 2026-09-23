@@ -1,0 +1,5 @@
+error[E0616]: field `components` of struct `WorldView` is private
+ --> tests/ui/world_view_components_are_private.rs:9:25
+  |
+9 |         let _ = (&world.components, ComponentId(0), Delivered::Wake { token: 0 });
+  |                         ^^^^^^^^^^ private field

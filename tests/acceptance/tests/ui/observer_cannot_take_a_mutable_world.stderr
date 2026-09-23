@@ -1,0 +1,13 @@
+error[E0053]: method `on_observe` has an incompatible type for trait
+ --> tests/ui/observer_cannot_take_a_mutable_world.rs:8:42
+  |
+8 |     fn on_observe(&mut self, _: Tick, _: &mut WorldView<'_>) -> Control {
+  |                                          ^^^^^^^^^^^^^^^^^^ types differ in mutability
+  |
+  = note: expected signature `fn(&mut Meddler, Tick, &WorldView<'_>) -> Control`
+             found signature `fn(&mut Meddler, Tick, &mut WorldView<'_>) -> Control`
+help: change the parameter type to match the trait
+  |
+8 -     fn on_observe(&mut self, _: Tick, _: &mut WorldView<'_>) -> Control {
+8 +     fn on_observe(&mut self, _: Tick, _: &WorldView<'_>) -> Control {
+  |

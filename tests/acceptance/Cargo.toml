@@ -13,5 +13,8 @@ systemscope-contracts.workspace = true
 systemscope-reference.workspace = true
 systemscope-runtime.workspace = true
 
+[dev-dependencies]
+trybuild = "1"
+
 [lints]
 workspace = true

@@ -1,0 +1,5 @@
+error[E0599]: no method named `get_mut` found for mutable reference `&mut WorldView<'_>` in the current scope
+ --> tests/ui/world_view_has_no_mutable_accessor.rs:6:19
+  |
+6 |     let _ = world.get_mut(ComponentId(0));
+  |                   ^^^^^^^ method not found in `&mut WorldView<'_>`
