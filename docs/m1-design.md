@@ -244,12 +244,19 @@ CommitPending  Commit (same tick)   apply the effect, or record the trap
 
 This gives observers a precise meaning: `on_after_dispatch` of the `Complete` event shows the state before the instruction commits, and of the `Commit` event the state after.
 
-**Pure execution.** Execution is a pure function of the decoded `Instr`, `pc`, and the values of the source registers, which the caller reads and passes in. It reads and changes no architectural state. Its result is a `PendingEffect { reg_write: Option<RegWrite { rd, value }>, next_pc }`, which the CPU holds as pending state and applies only if the instruction retires.
+**Pure execution.** Execution is a pure function of the decoded `Instr`, `pc`, and the values of the source registers, which the caller reads before the instruction and passes in. It reads and changes no architectural state: no register, no `pc`, no `instret`, no runtime call, no event. Its result is a `PendingEffect { reg_write: Option<RegWrite { rd, value }>, next_pc }`, which the CPU holds as pending state and applies only if the instruction retires. An instruction that can trap returns an `ExecOutcome`: either `Effect(PendingEffect)` or `Trap(PendingTrap { cause, tval })`, never both. `PendingTrap` has no `pc`: the trapping instruction's address is the `pc` execution was called with, and the CPU adds it to build the `RvTrap` (§6) in `Commit`. Each instruction family has its own function, and each returns a family-specific error (`NotAlu`, `NotControl`) for instructions outside its family.
 
 - **ALU instructions** (`LUI`, `AUIPC`, `OP-IMM`, `OP`) go through `execute_alu(instr, pc, rs1, rs2)`, which returns `NotAlu` for every other instruction. Source values an instruction does not use are ignored.
 - **Every ALU instruction writes `rd` and sets `next_pc = pc + 4`,** with wrap-around.
 - **An `x0` destination stays in the effect.** `RegWrite { rd: x0, .. }` is produced like any other write, so traces keep the instruction's `rd` and HINTs need no special case. The register file discards it when the effect is applied.
 - Arithmetic wraps modulo 2^32. `SLT`/`SLTI` compare as `i32`; `SLTU`/`SLTIU` compare as `u32`, with the `SLTIU` immediate sign-extended first. Bitwise immediates use the sign-extended 32-bit pattern. Every shift uses the low 5 bits of its amount, in registers and in `shamt` alike.
+- **Branches and jumps** go through `execute_control(instr, pc, rs1, rs2)`, which returns `NotControl` for every other instruction. Address arithmetic wraps modulo 2^32; a target that wraps past 0 is an ordinary address.
+- `BEQ`/`BNE` compare for equality, `BLT`/`BGE` as `i32`, `BLTU`/`BGEU` as `u32`. A branch never writes a register.
+- **A branch that is not taken** retires with `next_pc = pc + 4`. It never checks its target, so it never traps, even when `pc + offset` is misaligned.
+- **A taken branch** targets `pc + offset`, **`JAL`** targets `pc + offset`, and **`JALR`** targets `(rs1 + offset) & !1`. `JALR` clears bit 0 first and checks alignment afterwards, so a sum ending in `01` is aligned and one ending in `10` or `11` is not.
+- **The target must be 4-byte aligned** (no C extension, so IALIGN = 32). If it is, the instruction retires with `next_pc = target`, and `JAL`/`JALR` write `rd = pc + 4`, `x0` included. If not, the result is `Trap(PendingTrap { cause: InstructionAddressMisaligned, tval: target })`, and the link write is not made: it exists only in a retiring `Effect`.
+- `JALR` with `rd = rs1` needs no special case: the target comes from the `rs1` value passed in, read before the instruction, and `rd` is written only when the effect is applied.
+- **An aligned target is never a control-flow trap,** mapped or not. The branch or jump retires; if nothing answers at the target, the next fetch gets `Fault` and raises `InstructionAccessFault` on that fetch (§6). Target computation is not access validation.
 
 **Reset:** at `init` the CPU schedules the first `FetchIssue` at tick 0 (`Cycles { domain: cpu, k: 0 }`, `Request`), with `pc = entry` and every register 0.
 
@@ -321,11 +328,12 @@ pub enum TrapCause {
 ```
 
 - **Traps are precise.** The trapping instruction does not retire: it writes no register, does not change `pc`, does not increment `instret`, and, for stores, writes no memory. `RvTrap.pc` is the address of the trapping instruction.
+- Pure execution reports a trap as `PendingTrap { cause, tval }` (§5.3), and the CPU adds `pc` when it builds the `RvTrap`. The `TrapCause` in code lists only the causes implemented so far; the others are added with the parts of the CPU that raise them.
 - The CPU records the trap in `Commit` and enters `Halted(Trap)`. In M2 and M3, a privileged backend connects this same boundary to real machine or supervisor traps.
 
 | Cause | Raised by | `tval` |
 |---|---|---|
-| `InstructionAddressMisaligned` | A taken branch, `JAL`, or `JALR` whose target is not 4-byte aligned. It is raised on that instruction, which does not write `rd`. A not-taken branch never raises it. | the target |
+| `InstructionAddressMisaligned` | A taken branch, `JAL`, or `JALR` whose target is not 4-byte aligned. It is raised on that instruction, which does not write `rd`. A not-taken branch never raises it, and an aligned but unmapped target does not either. | the target, with bit 0 already cleared for `JALR` |
 | `InstructionAccessFault` | A fetch whose response is `Fault` | `pc` |
 | `IllegalInstruction` | `decode` returns `Illegal` (§5.2) | the instruction bits |
 | `Breakpoint` | `EBREAK` | `pc` |
