@@ -121,6 +121,9 @@ pub enum MemFault     { AccessFault }
 
 - `TxnId` is the same type as in `mem.v0`, with the same rules: allocated by each initiator from its own counter, unique per initiator, and part of its snapshot.
 - Requests are unchanged from `mem.v0`. Only responses gain an outcome.
+- **Requests are never empty:** a `ReadReq` has `len > 0` and a `WriteReq` has non-empty `data`. A zero-length request is not a memory access and never produces `AccessFault`. It is a protocol violation by the initiator. The first component that receives one (interconnect or target) faults the session with `SimError::ComponentFault`, the same way M0 components treat impossible messages. The wire format can represent one, so the decoder accepts it (§4.3).
+- **The range is `[addr, addr + len)`, computed with checked arithmetic.** The last byte is `addr + (len - 1)`, so an access may end exactly at `u64::MAX`. A request whose last byte would lie past `u64::MAX` is well formed but touches no mappable range: it is answered with `AccessFault` and never wraps around. This is different from a zero-length request, which is not answered at all.
+- `MemMsg::access()` classifies a request once for every receiver: `Access::Bytes { first, last }` (inclusive), `Access::OutOfRange` (answer `AccessFault`), or `Access::Empty` (fault the session). It returns `None` for responses.
 - A `Data` response carries exactly `len` bytes. A shorter or longer one faults the session: that is a component bug, not an architectural event.
 - A faulted write changes nothing at the target.
 - `MemFault` is deliberately generic. The target reports only that the access failed; the CPU decides which trap it is, from the operation that was outstanding (§6).
@@ -129,6 +132,8 @@ pub enum MemFault     { AccessFault }
 
 `mem.v1` follows the M0 primitive rules (m0-design §4.5) with no new rules. `ReadOutcome`, `WriteOutcome`, and `MemFault` are ordinary enums: a `u8` tag in declaration order, then the variant's fields. For example, `ReadResp { txn, outcome: Fault { fault: AccessFault } }` encodes as tag `1`, `txn` as `u64`, outcome tag `1`, fault tag `0`.
 
+- Tags: `ReadReq` 0, `ReadResp` 1, `WriteReq` 2, `WriteResp` 3; `ReadOutcome` `Data` 0, `Fault` 1; `WriteOutcome` `Done` 0, `Fault` 1; `MemFault` `AccessFault` 0. The contracts tests pin them with hand-written golden bytes.
+- Decoding is byte-level only. It accepts zero-length requests and a `Data` response of any length, including empty, because checking them needs the request or the topology. Receivers reject empty requests (§4.2), and the initiator checks the `Data` length against its outstanding request.
 - `canonical(ev)` already carries the protocol name and version before the payload, so `("mem", 1)` messages can never collide with `("mem", 0)` ones.
 - `Message` gains a variant, `Message::MemV1(mem_v1::MemMsg)`. The `Message` variant tag is not part of any encoding, so existing encodings do not change.
 - The strict decoder dispatches on `(name, version)`: `("mem", 0)` to `mem::MemMsg`, `("mem", 1)` to `mem_v1::MemMsg`, and anything else is rejected as before.
@@ -140,7 +145,7 @@ pub enum MemFault     { AccessFault }
 
 ### 4.4 M0 Is Frozen
 
-- `mem.v0`, `ToyCpu`, `ToyDma`, `ToyBus`, `ToyMemory`, and `m0-reference` are not modified in M1.
+- `mem.v0`, `ToyCpu`, `ToyDma`, `ToyBus`, `ToyMemory`, and `m0-reference` are not modified in M1. The one exception is compile-only: where a toy component matches on `Message`, it gains an arm for `Message::MemV1` that faults the session. The arm is unreachable, because every send is checked against the port's protocol (m0-design §6) and the toy ports are all `mem.v0`.
 - **The M0 golden digests must stay byte-identical** for the whole of M1. The M0 acceptance tests keep running in CI, and they already fail on any change to `tests/golden/m0-reference.json`.
 - **The serialized contracts identifier does not change** (§4.5), so adding `mem.v1` cannot move the M0 `StateDigest` or `TraceDigest`.
 
@@ -150,8 +155,8 @@ In M0, the string written as `contracts_version` into `SessionInfo` (m0-design �
 
 M1.0 separates the two:
 
-- **The crate version is ordinary SemVer.** It changes like any other crate version, for example when `mem.v1` is added, and never reaches a digest.
-- **The serialized value becomes a fixed compatibility id,** a constant in `contracts`, independent of Cargo. It keeps the M0 value `"0.0.0"`. The field name, position, and encoding in `SessionInfo` and the trace header are unchanged, so every M0 snapshot and trace stays byte-identical.
+- **The crate version is ordinary SemVer.** It changes when a contracts release is cut, and never reaches a digest. Consumers pin contracts by git revision, not by version, so M1.0 adds `mem.v1` without bumping it (it stays `0.0.0`).
+- **The serialized value becomes a fixed compatibility id,** the constant `systemscope_contracts::COMPATIBILITY_ID`, independent of Cargo. It keeps the M0 value `"0.0.0"`. `trace::CONTRACTS_VERSION` remains as an alias under the field's name, so existing callers are unchanged, and a contracts test pins both. The field name, position, and encoding in `SessionInfo` and the trace header are unchanged, so every M0 snapshot and trace stays byte-identical.
 - **The compatibility id changes only when snapshots or traces from one session can no longer be restored or resumed by the other.** An example is a change to an existing encoding. Adding a protocol, as `mem.v1` does, does not change it: every existing snapshot and trace decodes exactly as before.
 - **Changing it is a deliberate re-bless.** The commit changes the constant, re-blesses the golden files, and must show that every event count and `ExecutionDigest` is unchanged. Only `StateDigest` and `TraceDigest` may move.
 - The id looks like a version but is compared only for equality. It carries no ordering and no SemVer meaning.
