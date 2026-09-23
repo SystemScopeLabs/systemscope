@@ -1,10 +1,13 @@
 //! Pure instruction semantics (`docs/m1-design.md` §5.3).
 //!
-//! Execution computes what an instruction would do if it retired, as a [`PendingEffect`].
-//! It reads nothing but its arguments and changes no state: the CPU applies the effect in
-//! `Commit`, and only if the instruction retires.
+//! Execution computes what an instruction would do if it retired, as a [`PendingEffect`],
+//! or the trap it raises instead, as a [`PendingTrap`]. It reads nothing but its arguments
+//! and changes no state: the CPU applies the effect in `Commit`, and only if the
+//! instruction retires.
+//!
+//! Each instruction family has its own function: [`execute_alu`] and [`execute_control`].
 
-use crate::instr::{ImmOp, Instr, Reg, RegOp, ShiftOp};
+use crate::instr::{BranchOp, ImmOp, Instr, Reg, RegOp, ShiftOp};
 
 /// A register write an instruction makes when it retires.
 ///
@@ -25,6 +28,41 @@ pub struct PendingEffect {
     pub reg_write: Option<RegWrite>,
     /// The `pc` after the instruction.
     pub next_pc: u32,
+}
+
+/// A trap an instruction raises instead of retiring (`docs/m1-design.md` §6).
+///
+/// It carries no `pc`: the trapping instruction's address is the `pc` execution was
+/// called with, and the CPU adds it when it records the trap in `Commit`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PendingTrap {
+    /// Why the instruction trapped.
+    pub cause: TrapCause,
+    /// The trap value, as §6 defines it for `cause`.
+    pub tval: u32,
+}
+
+/// The cause of a trap.
+///
+/// Only the causes pure execution raises so far are listed; the others in §6 are added
+/// with the parts of the CPU that raise them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TrapCause {
+    /// A taken branch, `JAL`, or `JALR` whose target is not 4-byte aligned. `tval` is the
+    /// target.
+    InstructionAddressMisaligned,
+}
+
+/// The result of executing an instruction that may trap.
+///
+/// Exactly one of the two applies: a trapping instruction does not retire, so none of its
+/// effect is applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ExecOutcome {
+    /// The instruction retires with this effect.
+    Effect(PendingEffect),
+    /// The instruction traps: registers, `pc`, and `instret` stay unchanged.
+    Trap(PendingTrap),
 }
 
 /// The instruction is not an ALU instruction: a branch, jump, load, store, `FENCE`,
@@ -58,6 +96,88 @@ pub fn execute_alu(instr: &Instr, pc: u32, rs1: u32, rs2: u32) -> Result<Pending
         reg_write: Some(RegWrite { rd, value }),
         next_pc: pc.wrapping_add(4),
     })
+}
+
+/// The instruction is not a control-transfer instruction: anything but a branch, `JAL`,
+/// or `JALR`. [`execute_control`] does not execute it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NotControl;
+
+/// Executes a control-transfer instruction (a conditional branch, `JAL`, or `JALR`) at
+/// `pc`, with `rs1` and `rs2` the values of its source registers before the instruction.
+///
+/// Source values an instruction does not use are ignored, and all address arithmetic
+/// wraps modulo 2^32.
+///
+/// - A branch that is not taken retires with `next_pc = pc + 4`. Its target is never
+///   computed, so it cannot trap.
+/// - A taken branch jumps to `pc + offset`, `JAL` to `pc + offset`, and `JALR` to
+///   `(rs1 + offset) & !1`: bit 0 is cleared before alignment is checked. `JAL` and `JALR`
+///   write `pc + 4` to `rd`, even `x0`.
+/// - A target that is not 4-byte aligned raises
+///   [`TrapCause::InstructionAddressMisaligned`] with the target as `tval`, and the
+///   instruction writes no register.
+///
+/// An aligned target is never a trap here, mapped or not: fetching from it is the next
+/// instruction's business.
+pub fn execute_control(
+    instr: &Instr,
+    pc: u32,
+    rs1: u32,
+    rs2: u32,
+) -> Result<ExecOutcome, NotControl> {
+    let link = |rd| {
+        Some(RegWrite {
+            rd,
+            value: pc.wrapping_add(4),
+        })
+    };
+    let (reg_write, target) = match *instr {
+        Instr::Branch { op, offset, .. } => {
+            if !taken(op, rs1, rs2) {
+                return Ok(ExecOutcome::Effect(PendingEffect {
+                    reg_write: None,
+                    next_pc: pc.wrapping_add(4),
+                }));
+            }
+            (None, pc.wrapping_add(offset as u32))
+        }
+        Instr::Jal { rd, offset } => (link(rd), pc.wrapping_add(offset as u32)),
+        Instr::Jalr { rd, offset, .. } => (link(rd), rs1.wrapping_add(offset as u32) & !1),
+        Instr::Lui { .. }
+        | Instr::Auipc { .. }
+        | Instr::Load { .. }
+        | Instr::Store { .. }
+        | Instr::OpImm { .. }
+        | Instr::ShiftImm { .. }
+        | Instr::Op { .. }
+        | Instr::Fence
+        | Instr::Ecall
+        | Instr::Ebreak => return Err(NotControl),
+    };
+    Ok(if target & 0x3 != 0 {
+        ExecOutcome::Trap(PendingTrap {
+            cause: TrapCause::InstructionAddressMisaligned,
+            tval: target,
+        })
+    } else {
+        ExecOutcome::Effect(PendingEffect {
+            reg_write,
+            next_pc: target,
+        })
+    })
+}
+
+/// Whether a branch is taken.
+fn taken(op: BranchOp, a: u32, b: u32) -> bool {
+    match op {
+        BranchOp::Eq => a == b,
+        BranchOp::Ne => a != b,
+        BranchOp::Lt => (a as i32) < (b as i32),
+        BranchOp::Ge => (a as i32) >= (b as i32),
+        BranchOp::Ltu => a < b,
+        BranchOp::Geu => a >= b,
+    }
 }
 
 /// A register-immediate operation. The immediate is used as its sign-extended 32-bit

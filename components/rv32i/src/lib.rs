@@ -2,8 +2,9 @@
 //!
 //! This crate currently holds the simulation-independent parts: the instruction
 //! representation ([`Instr`], [`Reg`]), the decoder ([`decode()`]), the immediate
-//! extractors ([`immediate`]), the register file ([`RegisterFile`]), and pure ALU
-//! execution ([`execute_alu`], producing a [`PendingEffect`]).
+//! extractors ([`immediate`]), the register file ([`RegisterFile`]), and pure execution:
+//! [`execute_alu`] for ALU instructions and [`execute_control`] for branches and jumps,
+//! producing a [`PendingEffect`] or, for a trap, a [`PendingTrap`].
 
 pub mod decode;
 pub mod execute;
@@ -12,6 +13,9 @@ pub mod instr;
 pub mod regfile;
 
 pub use decode::{Illegal, decode};
-pub use execute::{NotAlu, PendingEffect, RegWrite, execute_alu};
+pub use execute::{
+    ExecOutcome, NotAlu, NotControl, PendingEffect, PendingTrap, RegWrite, TrapCause, execute_alu,
+    execute_control,
+};
 pub use instr::{BranchOp, ImmOp, Instr, LoadOp, Reg, RegOp, ShiftOp, StoreOp};
 pub use regfile::RegisterFile;
