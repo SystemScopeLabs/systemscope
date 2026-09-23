@@ -18,6 +18,7 @@ use systemscope_contracts::component::{
 };
 use systemscope_contracts::error::SimError;
 use systemscope_contracts::event::{Phase, ScheduleWhen};
+use systemscope_contracts::observe::StateView;
 use systemscope_contracts::protocol::Message;
 use systemscope_contracts::protocol::mem::{self, MemMsg, TxnId};
 use systemscope_contracts::snapshot::{RestoreError, SnapshotReader, SnapshotWriter};
@@ -234,6 +235,20 @@ impl Component for ToyDma {
             }
         }
         Ok(())
+    }
+
+    /// Counters and queue depths; cheap enough to call at every observe point.
+    fn inspect(&self) -> StateView {
+        StateView {
+            fields: vec![
+                ("issued", Value::U64(self.issued)),
+                ("completed", Value::U64(self.completed)),
+                ("next_txn", Value::U64(self.next_txn)),
+                ("outstanding", Value::U64(self.outstanding.len() as u64)),
+                ("burst_left", Value::U64(self.burst_left)),
+                ("checksum", Value::U64(self.checksum)),
+            ],
+        }
     }
 
     fn snapshot_schema_version(&self) -> u32 {

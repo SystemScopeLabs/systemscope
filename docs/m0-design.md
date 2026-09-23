@@ -47,7 +47,8 @@ contracts/                        (repo: SystemScope/contracts)
    │  └─ mem.rs      mem.v0 messages
    ├─ snapshot.rs    SnapshotWriter/Reader, RestoreError
    ├─ canonical.rs   Encoder/Decoder (§4.5 primitive rules), canonical(ev)
-   └─ trace.rs       TraceRecord, Value, TraceHeader, stream encoding (Observer, WorldView later)
+   ├─ trace.rs       TraceRecord, Value, TraceHeader, stream encoding
+   └─ observe.rs     StateView, EventView, WorldView, Observer, Control
 
 systemscope/                      (repo: SystemScope/systemscope, this repository)
 ├─ runtime/                       systemscope-runtime: scheduler, TopologyBuilder and elaboration, lifecycle, snapshots, sinks
@@ -202,7 +203,7 @@ loop:
     execution_digest = H(execution_digest ‖ canonical(ev))
     target.handle_event(ev, ctx)                // ctx enforces S1–S6
     observers.on_after_dispatch(ev, world)      // read-only; may request Pause
-    if an observe point is due and no simulation events remain before Observe at this tick:
+    for each due observe point, in tick order:  // §8.2
         run observers' on_observe (read-only)
 ```
 
@@ -260,8 +261,10 @@ pub trait Component {
     fn snapshot(&self, w: &mut SnapshotWriter);
     fn restore(&mut self, r: &mut SnapshotReader, schema_version: u32) -> Result<(), RestoreError>;
 
-    fn inspect(&self) -> StateView;   // read-only view for observers and the State Inspector (with observers)
+    fn inspect(&self) -> StateView { StateView::default() }   // read-only view for observers and the State Inspector
 }
+
+pub struct StateView { pub fields: Vec<(&'static str, Value)> }   // named values, no floats
 
 pub enum Delivered {
     Message { port: PortId, msg: Message },
@@ -535,18 +538,40 @@ TraceHeader + TraceRecords
 ### 8.2 Observer
 
 ```rust
+// contracts, observe.rs
 pub trait Observer {
-    fn on_after_dispatch(&mut self, ev: &EventView, world: &WorldView) -> Control;
-    fn on_observe(&mut self, now: Tick, world: &WorldView) -> Control;
-    fn on_trace(&mut self, rec: &TraceRecord);
+    fn on_after_dispatch(&mut self, ev: &EventView<'_>, world: &WorldView<'_>) -> Control { Control::Continue }
+    fn on_observe(&mut self, now: Tick, world: &WorldView<'_>) -> Control { Control::Continue }
+    fn on_trace(&mut self, rec: &TraceRecord) {}
 }
 pub enum Control { Continue, Pause }
+pub struct EventView<'a> { pub key: EventKey, pub source: ComponentId, pub target: ComponentId, pub delivery: &'a Delivered }
+pub struct WorldView<'a> { /* private: now, &'a [Box<dyn Component>] */ }
+impl WorldView<'_> {
+    pub fn now(&self) -> Tick;
+    pub fn component_count(&self) -> usize;
+    pub fn type_name(&self, id: ComponentId) -> Option<&'static str>;
+    pub fn inspect(&self, id: ComponentId) -> Option<StateView>;
+}
+// runtime
+impl Runtime {
+    pub fn add_observer(&mut self, observer: Box<dyn Observer>);
+    pub fn observe_at(&mut self, tick: Tick);
+    pub fn run(&mut self, until: Tick) -> Result<RunOutcome, RuntimeError>;
+    pub fn step(&mut self) -> Result<Option<Dispatched>, RuntimeError>;
+}
+pub struct RunOutcome { pub events: u64, pub stop: Stop }
+pub enum Stop { Paused, Drained, Horizon }
 ```
 
 - **`on_after_dispatch` runs after `handle_event` returns**, so it sees the state the event produced. M0 has no pre-dispatch hook. If breakpoints that stop *before* an event are needed later, they will be added as a separate `on_before_dispatch`, not by changing this one.
-- **`WorldView` exposes only shared references** (`&dyn Component` and `inspect()`). The Rust borrow checker therefore makes state mutation in `Observe` impossible at compile time.
-- **Observe points are kept outside the simulation queue.** Observers request them with `runtime.observe_at(tick)`, and they are held in a separate `BTreeSet<Tick>`. They never consume `sequence` numbers and never enter the execution digest.
-- **`Pause` returns control to the driver at an event boundary.** Resuming continues exactly as if no pause had happened.
+- **`WorldView` is read-only by construction.** It holds only shared references and offers nothing but the time, the component count, each component's `type_name`, and `inspect()`. It never hands out a component, `&` or `&mut`, so an observer cannot call `handle_event`, `restore`, or anything else on one. Observers receive no context, so they cannot reach an RNG or schedule events. A compile-fail test pins this.
+- **`on_trace` sees every record the session emits**, in emission order, whether or not a trace recorder is running: `Init` records if the observer was added before `init`, then each dispatch record followed by its handler's records. Records are produced whenever a recorder or an observer exists; components still cannot tell (§8.1).
+- **Observe points are kept outside the simulation queue.** `observe_at(tick)` adds the tick to a separate `BTreeSet<Tick>`, so registering a tick twice is the same as once. Points never consume `sequence` numbers, never enter the execution digest, and are never snapshotted.
+- **An observe point `T` is due once the simulation has finished tick `T`:** the next queued event is after `T`, or the queue is empty and `T` is at or before the current tick, or, during `run(until)`, the queue holds nothing at or before `until` and `T ≤ until`. Due points fire in tick order at event boundaries, with `now = T`. A point whose tick has already passed fires at the next boundary.
+- **`Pause` returns control to the driver at an event boundary.** `run(until)` returns `Stop::Paused` right after the callback that asked for it; the event that triggered an `on_after_dispatch` pause has been fully dispatched, and no further event runs. Remaining due points fire at the start of the next call. Resuming is simply calling `run` again, and it continues exactly as if no pause had happened. `Paused` is a driver outcome, not a lifecycle state and not an error; the session stays `Ready`.
+- **`step()` dispatches exactly one event** (with its observer callbacks and the points that become due) and returns it, or `None` when the queue is empty. It ignores pause requests, since it returns anyway. `run_until(until)` is `run(until)` repeated through pauses, returning the total event count.
+- **Observation never changes the simulation.** Adding observers, registering points, pausing, resuming, and stepping leave the queue, `next_sequence`, the RNGs, the components, and all three digests exactly as an unobserved run would (AT-3).
 
 ### 8.3 Determinism Rules and Enforcement
 

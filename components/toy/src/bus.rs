@@ -27,6 +27,7 @@ use systemscope_contracts::component::{
 };
 use systemscope_contracts::error::SimError;
 use systemscope_contracts::event::{Phase, ScheduleWhen};
+use systemscope_contracts::observe::StateView;
 use systemscope_contracts::protocol::Message;
 use systemscope_contracts::protocol::mem::{self, MemMsg, TxnId};
 use systemscope_contracts::snapshot::{RestoreError, SnapshotReader, SnapshotWriter};
@@ -265,6 +266,19 @@ impl Component for ToyBus {
             }
         }
         Ok(())
+    }
+
+    /// Counters and queue depths; cheap enough to call at every observe point.
+    fn inspect(&self) -> StateView {
+        StateView {
+            fields: vec![
+                ("queued_cpu", Value::U64(self.queues[0].len() as u64)),
+                ("queued_dma", Value::U64(self.queues[1].len() as u64)),
+                ("priority", Value::U64(u64::from(self.priority))),
+                ("next_downstream", Value::U64(self.next_downstream)),
+                ("routes", Value::U64(self.routes.len() as u64)),
+            ],
+        }
     }
 
     fn snapshot_schema_version(&self) -> u32 {

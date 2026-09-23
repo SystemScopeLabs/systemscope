@@ -5,7 +5,11 @@
 //! Restored session: elaborate → restore                  → Ready → run
 //! Any error                                              → Faulted (terminal)
 //! ```
+//!
+//! Observers (§8.2) watch from outside: they see each dispatched event, every trace record,
+//! and due observe points through a read-only `WorldView`, and may ask the driver to pause.
 
+use std::collections::BTreeSet;
 use std::fmt;
 
 use systemscope_contracts::canonical::{CanonicalEvent, Encoder};
@@ -14,6 +18,7 @@ use systemscope_contracts::component::{
 };
 use systemscope_contracts::error::SimError;
 use systemscope_contracts::event::{EventKey, Phase, ScheduleWhen};
+use systemscope_contracts::observe::{Control, EventView, Observer, WorldView};
 use systemscope_contracts::protocol::Message;
 use systemscope_contracts::rng::SimRng;
 use systemscope_contracts::snapshot::RestoreError;
@@ -98,6 +103,26 @@ pub struct Dispatched {
     pub delivery: Delivered,
 }
 
+/// Why [`Runtime::run`] returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stop {
+    /// An observer asked for a pause. Call `run` again to resume.
+    Paused,
+    /// The queue is empty.
+    Drained,
+    /// The next event is after `until`.
+    Horizon,
+}
+
+/// What a [`Runtime::run`] call did. Driver state only: never part of the simulation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RunOutcome {
+    /// Events dispatched by this call.
+    pub events: u64,
+    /// Why it returned.
+    pub stop: Stop,
+}
+
 /// The far end of a link, seen from one port.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Peer {
@@ -144,6 +169,12 @@ pub struct Runtime {
     pub(crate) freshly_restored: bool,
     /// Recorded trace, if tracing was started. Never read by the simulation.
     pub(crate) trace: Option<Vec<TraceRecord>>,
+    /// Records emitted by the running component, awaiting observers and the recorder.
+    emitted: Vec<TraceRecord>,
+    /// Never snapshotted, digested, or read by the simulation (§8.2).
+    observers: Vec<Box<dyn Observer>>,
+    /// Observe points, outside the event queue: they consume no sequence numbers.
+    observe_points: BTreeSet<Tick>,
 }
 
 /// Absorbs one event into an execution digest: `H(digest ‖ canonical(ev))`.
@@ -196,6 +227,9 @@ impl Runtime {
             fault: None,
             freshly_restored: false,
             trace: None,
+            emitted: Vec::new(),
+            observers: Vec::new(),
+            observe_points: BTreeSet::new(),
         }
     }
 
@@ -232,6 +266,33 @@ impl Runtime {
     /// Key of the next event to dispatch, if any.
     pub fn peek_key(&self) -> Option<EventKey> {
         self.scheduler.peek_key()
+    }
+
+    /// Key of the last dispatched event, if any.
+    pub fn last_dispatched(&self) -> Option<EventKey> {
+        self.scheduler.last_dispatched()
+    }
+
+    /// The sequence number the next scheduled event will receive.
+    pub fn next_sequence(&self) -> u64 {
+        self.scheduler.next_sequence()
+    }
+
+    /// Adds an observer (§8.2). Observers are driver state: they are never snapshotted
+    /// and cannot change the simulation.
+    pub fn add_observer(&mut self, observer: Box<dyn Observer>) {
+        self.observers.push(observer);
+    }
+
+    /// Requests an observe point at `tick`. Points live outside the event queue, so this
+    /// consumes no sequence number; registering a tick twice is the same as once.
+    pub fn observe_at(&mut self, tick: Tick) {
+        self.observe_points.insert(tick);
+    }
+
+    /// Observe points that have not fired yet.
+    pub fn pending_observe_points(&self) -> usize {
+        self.observe_points.len()
     }
 
     /// Paths of all components, indexed by `ComponentId`.
@@ -301,7 +362,9 @@ impl Runtime {
             let me = ComponentId(index as u32);
             let (component, mut ctx) = self.context(me, TraceAt::Init);
             let result = component.init(&mut ctx);
-            if let Err(e) = ctx.error.map_or(result, Err) {
+            let result = ctx.error.map_or(result, Err);
+            self.flush_records();
+            if let Err(e) = result {
                 return Err(self.enter_fault(e));
             }
         }
@@ -309,9 +372,60 @@ impl Runtime {
         Ok(())
     }
 
-    /// Dispatches the next event. Returns `None` when the queue is empty.
+    /// Dispatches exactly one event, with its observer callbacks and the observe points
+    /// that become due, and returns it. Returns `None` when the queue is empty. Pause
+    /// requests are ignored, since `step` returns anyway.
     pub fn step(&mut self) -> Result<Option<Dispatched>, RuntimeError> {
         self.require(Lifecycle::Ready)?;
+        self.fire_observe_points(None, false);
+        let dispatched = self.dispatch()?;
+        if dispatched.is_some() {
+            self.fire_observe_points(None, false);
+        }
+        Ok(dispatched.map(|(d, _)| d))
+    }
+
+    /// Dispatches events at or before `until` until none is left before then, or an
+    /// observer asks for a pause. Resuming is calling `run` again; a paused run continues
+    /// exactly as if it had never stopped.
+    pub fn run(&mut self, until: Tick) -> Result<RunOutcome, RuntimeError> {
+        self.require(Lifecycle::Ready)?;
+        let mut events = 0;
+        let outcome = |events, stop| Ok(RunOutcome { events, stop });
+        loop {
+            if self.fire_observe_points(Some(until), true) == Control::Pause {
+                return outcome(events, Stop::Paused);
+            }
+            match self.scheduler.peek_key() {
+                None => return outcome(events, Stop::Drained),
+                Some(k) if k.tick > until => return outcome(events, Stop::Horizon),
+                Some(_) => {}
+            }
+            let Some((_, control)) = self.dispatch()? else {
+                return outcome(events, Stop::Drained);
+            };
+            events += 1;
+            if control == Control::Pause {
+                return outcome(events, Stop::Paused);
+            }
+        }
+    }
+
+    /// [`Runtime::run`] through any pauses. Returns how many events ran.
+    pub fn run_until(&mut self, until: Tick) -> Result<u64, RuntimeError> {
+        let mut total = 0;
+        loop {
+            let RunOutcome { events, stop } = self.run(until)?;
+            total += events;
+            if stop != Stop::Paused {
+                return Ok(total);
+            }
+        }
+    }
+
+    /// Pops and dispatches the next event, then shows it to the observers. Returns the
+    /// event and whether any observer asked for a pause.
+    fn dispatch(&mut self) -> Result<Option<(Dispatched, Control)>, RuntimeError> {
         let event = match self.scheduler.pop() {
             Ok(Some(event)) => event,
             Ok(None) => return Ok(None),
@@ -332,31 +446,89 @@ impl Runtime {
         self.freshly_restored = false;
         let CanonicalEvent { delivery, .. } = ev;
         let at = TraceAt::Event(event.key);
-        if let Some(records) = &mut self.trace {
-            records.push(dispatch_record(at, source, target, &delivery));
+        if self.capturing() {
+            self.emitted
+                .push(dispatch_record(at, source, target, &delivery));
         }
         let (component, mut ctx) = self.context(target, at);
         let result = component.handle_event(&delivery, &mut ctx);
-        if let Err(e) = ctx.error.map_or(result, Err) {
+        let result = ctx.error.map_or(result, Err);
+        self.flush_records();
+        if let Err(e) = result {
             return Err(self.enter_fault(e));
         }
-        Ok(Some(Dispatched {
+        let dispatched = Dispatched {
             key: event.key,
             source,
             target,
             delivery,
-        }))
+        };
+        let mut control = Control::Continue;
+        if !self.observers.is_empty() {
+            let view = EventView {
+                key: dispatched.key,
+                source,
+                target,
+                delivery: &dispatched.delivery,
+            };
+            let world = WorldView::new(dispatched.key.tick, &self.components);
+            for observer in &mut self.observers {
+                if observer.on_after_dispatch(&view, &world) == Control::Pause {
+                    control = Control::Pause;
+                }
+            }
+        }
+        Ok(Some((dispatched, control)))
     }
 
-    /// Dispatches every event at or before `until`. Returns how many ran.
-    pub fn run_until(&mut self, until: Tick) -> Result<u64, RuntimeError> {
-        self.require(Lifecycle::Ready)?;
-        let mut count = 0;
-        while self.scheduler.peek_key().is_some_and(|k| k.tick <= until) {
-            self.step()?;
-            count += 1;
+    /// Fires due observe points in tick order (§8.2). A point `T` is due once tick `T` is
+    /// finished: the next event is after `T`, or the queue is empty and `T` is at or
+    /// before the current tick or the `run` horizon. With `stop_on_pause`, returns at the
+    /// first point an observer pauses on and leaves later points for the next call.
+    fn fire_observe_points(&mut self, horizon: Option<Tick>, stop_on_pause: bool) -> Control {
+        let mut control = Control::Continue;
+        while let Some(&point) = self.observe_points.first() {
+            let now = self.scheduler.now();
+            let last_finished = match self.scheduler.peek_key() {
+                Some(next) => next.tick.0.checked_sub(1).map(Tick),
+                None => Some(horizon.map_or(now, |h| h.max(now))),
+            };
+            if !last_finished.is_some_and(|last| point <= last) {
+                break;
+            }
+            self.observe_points.pop_first();
+            let world = WorldView::new(point, &self.components);
+            for observer in &mut self.observers {
+                if observer.on_observe(point, &world) == Control::Pause {
+                    control = Control::Pause;
+                }
+            }
+            if stop_on_pause && control == Control::Pause {
+                break;
+            }
         }
-        Ok(count)
+        control
+    }
+
+    /// Whether trace records are produced: for a recorder, observers, or both.
+    fn capturing(&self) -> bool {
+        self.trace.is_some() || !self.observers.is_empty()
+    }
+
+    /// Hands the running component's records to the observers, then to the recorder.
+    fn flush_records(&mut self) {
+        if self.emitted.is_empty() {
+            return;
+        }
+        for record in &self.emitted {
+            for observer in &mut self.observers {
+                observer.on_trace(record);
+            }
+        }
+        match &mut self.trace {
+            Some(records) => records.append(&mut self.emitted),
+            None => self.emitted.clear(),
+        }
     }
 
     fn require(&self, state: Lifecycle) -> Result<(), RuntimeError> {
@@ -386,6 +558,7 @@ impl Runtime {
     /// Splits the runtime into the running component and a context for it.
     fn context(&mut self, me: ComponentId, at: TraceAt) -> (&mut dyn Component, Ctx<'_>) {
         let index = me.0 as usize;
+        let capturing = self.capturing();
         let ctx = Ctx {
             me,
             clock: &self.clock,
@@ -394,7 +567,7 @@ impl Runtime {
             peers: &self.peers[index],
             scheduler: &mut self.scheduler,
             rng: &mut self.rngs[index],
-            trace: self.trace.as_mut(),
+            trace: capturing.then_some(&mut self.emitted),
             at,
             error: None,
         };
@@ -457,7 +630,7 @@ struct Ctx<'a> {
     peers: &'a [Peer],
     scheduler: &'a mut Scheduler<Pending>,
     rng: &'a mut Xoshiro256StarStar,
-    /// Where records go, or `None` when tracing is off. Write-only for the component.
+    /// Where records go, or `None` when nothing captures them. Write-only for the component.
     trace: Option<&'a mut Vec<TraceRecord>>,
     at: TraceAt,
     /// First error returned to the component. Sticky: the runtime faults on it.

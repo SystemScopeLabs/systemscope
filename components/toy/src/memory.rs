@@ -18,10 +18,12 @@ use systemscope_contracts::component::{
 };
 use systemscope_contracts::error::SimError;
 use systemscope_contracts::event::{Phase, ScheduleWhen};
+use systemscope_contracts::observe::StateView;
 use systemscope_contracts::protocol::Message;
 use systemscope_contracts::protocol::mem::{self, MemMsg};
 use systemscope_contracts::snapshot::{RestoreError, SnapshotReader, SnapshotWriter};
 use systemscope_contracts::time::Duration;
+use systemscope_contracts::trace::Value;
 
 /// The memory's only port: a `mem.v0` target.
 pub const PORT: PortId = PortId(0);
@@ -119,6 +121,13 @@ impl Component for ToyMemory {
             ScheduleWhen::After(latency),
             Phase::Complete,
         )
+    }
+
+    /// Counters and queue depths; cheap enough to call at every observe point.
+    fn inspect(&self) -> StateView {
+        StateView {
+            fields: vec![("size", Value::U64(u64::from(self.config.size)))],
+        }
     }
 
     fn snapshot_schema_version(&self) -> u32 {
