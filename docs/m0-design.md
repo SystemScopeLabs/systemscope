@@ -188,7 +188,7 @@ fn wake_self(&mut self, when: ScheduleWhen, phase: Phase, token: u64) -> Result<
 
 Work that needs an earlier phase must move to `tick + 1` or later.
 
-**Every scheduler operation is atomic.** A failed `schedule` or `pop` leaves the queue, sequence counter, and S5 counter exactly as they were. A handler is *not* atomic: if it schedules three events and the fourth fails, the first three stay queued. This is safe because any error puts the runtime into `Faulted` (§5.1), from which the run can never resume.
+**Every scheduler operation is atomic.** A failed `schedule` or `pop` leaves the queue, sequence counter, and S5 counter exactly as they were. A handler is *not* atomic: if it schedules three events and the fourth fails, the first three stay queued. This is acceptable because any error puts the runtime into `Faulted` (§5.1). A faulted session may still be inspected, partial effects included, but it is never treated as resumable simulation state.
 
 ### 4.4 Runtime Loop
 
@@ -278,7 +278,7 @@ Two contexts give a component everything it may touch:
 **Errors are sticky.** A context remembers the first error it returned. If the component swallows that error and returns `Ok`, the runtime still faults.
 
 - **There is no global `step()`.** A clocked component models a clock step by waking itself on its domain's edges (`wake_self(Cycles { domain, k: 1 }, …)`). Idle components cost nothing.
-- **`SimRng` uses a fixed, specified algorithm.** It must not be one whose output can change between library versions. It is seeded from `(session_seed, component_path)`, and its state is part of the component snapshot.
+- **Randomness comes only from `ctx.rng()`** (§5.2). Components hold no RNG of their own.
 - **`ComponentId`s are assigned in topology declaration order.** `component_path` is a stable, human-readable name such as `soc.cpu0`. The declaration order itself must be deterministic (§6).
 
 > **Component invariant.** A component cannot see other components and never handles physical ticks. Every interaction happens through events whose time and source the runtime assigns.
@@ -300,10 +300,38 @@ Any error (elaboration, init, handler, scheduler)                        → Fau
 
 - **Initialization order is fixed.** Components are initialized in `ComponentId` order, one at a time. Initial events therefore receive deterministic sequence numbers.
 - **Restore never calls `init`.** Initial events already live in the restored queue. Calling `init` again would duplicate them and shift every later sequence number, breaking replay.
-- **`Faulted` is terminal.** It records the error that caused it. `run` and `step` are refused, and `snapshot` is refused because a snapshot must be a resumable checkpoint. `inspect()` stays available for diagnosis.
+- **`Faulted` is terminal.** It records the error that caused it. `run` and `step` are refused, and `snapshot` is refused because a snapshot must be a resumable checkpoint. `inspect()` stays available for post-mortem diagnosis: it may show partially applied effects, which is why the state is never resumed.
   - An init failure faults the session even though earlier components already initialized. Handler failures work the same way.
   - A post-mortem `fault_dump()` that is explicitly *not* resumable may be added later. It is out of scope for M0.
 - **Reset means a new session.** A handler may have mutated its component before failing, so clearing the scheduler is not enough. Reset discards the runtime and builds a new one from the same topology and seed: `build topology → elaborate → init`.
+
+### 5.2 Randomness
+
+Randomness is simulation infrastructure, not a component feature. The contract fixes the interface and every derived value; the runtime owns one RNG state per component.
+
+```rust
+// contracts
+pub trait SimRng {
+    fn next_u64(&mut self) -> u64;                                   // 64 uniform bits
+    fn below(&mut self, n: NonZeroU64) -> u64 { /* fixed algorithm */ } // uniform in 0..n
+    fn chance(&mut self, num: u64, den: NonZeroU64) -> bool { self.below(den) < num }
+}
+// on InitContext and SimContext:
+fn rng(&mut self) -> &mut dyn SimRng;
+```
+
+| Aspect | Rule |
+|---|---|
+| Generator | xoshiro256\*\* (Blackman and Vigna), 256-bit state `s[0..4]`, output `rotl(s[1] × 5, 7) × 9` |
+| Seed derivation | `blake3::derive_key("SystemScope 2026-09 SimRng v1", session_seed as u64 LE ‖ component_path as u32 length + UTF-8)`; the 32 bytes become `s[0..4]` as little-endian `u64`s. Rust's `Hash`/`DefaultHasher` is never used. |
+| All-zero state | Invalid for xoshiro. A derived all-zero key is replaced by `s = [1, 0, 0, 0]`; a snapshot holding an all-zero state is rejected. |
+| `below(n)` | Rejection sampling: `t = n.wrapping_neg() % n`; draw `x` until `x ≥ t`; return `x % n`. Exactly as written, so the number of draws consumed is part of the contract. |
+| Ownership | The runtime stores one state per `ComponentId`. Components never store or copy RNG state. |
+| Independence | Each component has its own stream. Draws by one component never change another component's values. |
+| Availability | `InitContext` and `SimContext` only. Observers get no RNG. |
+| Snapshot | The runtime snapshot contains every component's 256-bit state. After restore, the next draw of every component equals the draw the uninterrupted run would have made. |
+
+Changing any rule in this table changes every digest and requires a new context string and a golden re-bless.
 
 ---
 
@@ -358,6 +386,7 @@ pub struct RuntimeSnapshot {
     next_sequence: u64,
     execution_digest: [u8; 32],
     queue: Vec<Event>,             // sorted by EventKey
+    rng_states: Vec<[u64; 4]>,            // xoshiro256** state per component, in ComponentId order
     components: Vec<ComponentSnapshot>,   // { id, schema_version, bytes }, in ComponentId order
 }
 ```
@@ -413,7 +442,7 @@ pub enum Control { Continue, Pause }
 | No `HashMap`/`HashSet` in runtime or components | clippy `disallowed-types` |
 | No threads in M0 (`std::thread::spawn`) | clippy `disallowed-methods` |
 | No floating point in contracts, runtime, or components | `#![deny(clippy::float_arithmetic)]` |
-| Randomness only through `SimRng` | review, plus the absence of a `rand` dependency in components |
+| Randomness only through `ctx.rng()` | review, plus the absence of any `rand` crate in component dependencies (dev-only oracles excepted) |
 | Pinned compiler | `rust-toolchain.toml` |
 
 CI runs clippy with `-D warnings`.
