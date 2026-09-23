@@ -211,25 +211,32 @@ fn field<'a>(r: &'a TraceRecord, name: &str) -> Option<&'a Value> {
     r.fields.iter().find(|(n, _)| *n == name).map(|(_, v)| v)
 }
 
+/// The Perfetto process and thread id of a component: `ComponentId + 1`, since Perfetto
+/// treats id 0 specially.
+pub fn perfetto_track(component: u32) -> u64 {
+    u64::from(component) + 1
+}
+
 /// Chrome JSON Trace Event format for the Perfetto UI.
 ///
-/// One track (`tid`) per component; every record is an instant event with its fields as
-/// `args`; every `mem.v0` transaction is an async slice keyed by `(initiator, txn)`, from
-/// the request's dispatch to the response's dispatch.
+/// Each component is its own process and thread (`pid = tid =` [`perfetto_track`]); every
+/// record is an instant event on its component's thread with its fields as `args`; every
+/// `mem.v0` transaction is an async slice scoped to the initiator's process and keyed by
+/// `(initiator, txn)`, from the request's dispatch to the response's dispatch.
 pub fn to_perfetto(trace: &Trace) -> String {
     let tps = trace.header.ticks_per_second;
     let mut events: Vec<String> = Vec::new();
 
-    events.push(String::from(
-        "{\"ph\":\"M\",\"pid\":1,\"tid\":0,\"name\":\"process_name\",\"args\":{\"name\":\"SystemScope\"}}",
-    ));
-    for (id, c) in trace.header.components.iter().enumerate() {
-        let mut e = format!(
-            "{{\"ph\":\"M\",\"pid\":1,\"tid\":{id},\"name\":\"thread_name\",\"args\":{{\"name\":"
-        );
-        json_str(&mut e, &c.path);
-        e.push_str("}}");
-        events.push(e);
+    for (id, c) in (0u32..).zip(&trace.header.components) {
+        let track = perfetto_track(id);
+        for kind in ["process_name", "thread_name"] {
+            let mut e = format!(
+                "{{\"ph\":\"M\",\"pid\":{track},\"tid\":{track},\"name\":\"{kind}\",\"args\":{{\"name\":"
+            );
+            json_str(&mut e, &c.path);
+            e.push_str("}}");
+            events.push(e);
+        }
     }
 
     // Open slices by (initiator, txn) → request name, so the end matches the begin.
@@ -241,9 +248,9 @@ pub fn to_perfetto(trace: &Trace) -> String {
         };
         let ts = perfetto_ts(tick, tps);
 
+        let track = perfetto_track(r.component.0);
         let mut e = format!(
-            "{{\"ph\":\"i\",\"s\":\"t\",\"pid\":1,\"tid\":{},\"ts\":{ts},\"name\":",
-            r.component.0
+            "{{\"ph\":\"i\",\"s\":\"t\",\"pid\":{track},\"tid\":{track},\"ts\":{ts},\"name\":"
         );
         json_str(&mut e, r.kind);
         let _ = write!(
@@ -285,9 +292,10 @@ pub fn to_perfetto(trace: &Trace) -> String {
             }
             _ => continue,
         };
+        let track = perfetto_track(initiator);
         events.push(format!(
-            "{{\"ph\":\"{phase}\",\"cat\":\"mem\",\"id\":\"{initiator}:{txn}\",\"pid\":1,\
-             \"tid\":{initiator},\"ts\":{ts},\"name\":\"{name}\"}}"
+            "{{\"ph\":\"{phase}\",\"cat\":\"mem\",\"id2\":{{\"local\":\"{initiator}:{txn}\"}},\
+             \"pid\":{track},\"tid\":{track},\"ts\":{ts},\"name\":\"{name}\"}}"
         ));
     }
 
@@ -365,12 +373,12 @@ mod tests {
             .filter(|l| l.contains("\"cat\":\"mem\""))
             .collect();
         assert_eq!(slices.len(), 4);
-        assert!(slices[0].contains("\"ph\":\"b\",\"cat\":\"mem\",\"id\":\"0:1\""));
-        assert!(slices[1].contains("\"ph\":\"b\",\"cat\":\"mem\",\"id\":\"1:1\""));
-        assert!(slices[2].contains("\"ph\":\"e\",\"cat\":\"mem\",\"id\":\"1:1\""));
+        assert!(slices[0].contains("\"ph\":\"b\",\"cat\":\"mem\",\"id2\":{\"local\":\"0:1\"}"));
+        assert!(slices[1].contains("\"ph\":\"b\",\"cat\":\"mem\",\"id2\":{\"local\":\"1:1\"}"));
+        assert!(slices[2].contains("\"ph\":\"e\",\"cat\":\"mem\",\"id2\":{\"local\":\"1:1\"}"));
         assert!(slices[2].contains("\"name\":\"WriteReq\""));
-        assert!(slices[3].contains("\"ph\":\"e\",\"cat\":\"mem\",\"id\":\"0:1\""));
-        assert!(slices[3].contains("\"tid\":0"));
+        assert!(slices[3].contains("\"ph\":\"e\",\"cat\":\"mem\",\"id2\":{\"local\":\"0:1\"}"));
+        assert!(slices[3].contains("\"pid\":1,\"tid\":1,"));
     }
 
     #[test]

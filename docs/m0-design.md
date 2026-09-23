@@ -484,8 +484,8 @@ TraceHeader + TraceRecords
   **Any change to this layout, the header, the record encoding, value tags, or the `runtime.dispatch` fields bumps `format_version`** and requires a golden re-bless.
 - **Two exporters in M0:**
   - **JSONL:** the first line is the header and each later line is one record. Ticks and integers are written as exact JSON integers, and bytes as lowercase hex strings. It is derived from the records and is not digested. JSON numbers above 2^53 need a 64-bit integer reader.
-  - **Perfetto:** Chrome JSON Trace Event format. There is one track (`tid`) per component, and every record becomes an instant event with its fields as `args`. Each `mem.v0` transaction becomes an async slice keyed by `(initiator, txn)`, from the request's dispatch to the response's dispatch.
-  - **Perfetto timestamps** are in µs with exactly nine decimal places: `floor(tick × 10^15 / ticks_per_second)` femtoseconds, then split into µs and the remainder. This is integer arithmetic and exact at the default 1 ps resolution. It is for display only and never feeds back into records or digests.
+  - **Perfetto:** Chrome JSON Trace Event format. Each component is its own process and thread, both with `pid = tid = ComponentId + 1` and named by `component_path`; id 0 is avoided because Perfetto treats it specially. Every record becomes an instant event on its component's thread, with its fields as `args`. Each `mem.v0` transaction becomes a process-scoped async slice (`id2.local = "initiator:txn"`) in the initiator's process, from the request's dispatch to the response's dispatch. Global async ids are not used, because Perfetto groups them apart from any component.
+  - **Perfetto timestamps** are in µs with exactly nine decimal places: `floor(tick × 10^15 / ticks_per_second)` femtoseconds, then split into µs and the remainder. This is integer arithmetic and exact at the default 1 ps resolution. It is for display only and never feeds back into records or digests. The Perfetto UI itself keeps nanoseconds, so sub-nanosecond detail is only visible in the text.
 
 ### 8.2 Observer
 

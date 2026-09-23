@@ -8,7 +8,7 @@ use serde_json::Value as Json;
 use systemscope_contracts::time::{Duration, Frequency, Rounding, SimulationClock, Tick};
 use systemscope_contracts::topology::LinkLatency;
 use systemscope_contracts::trace::{DISPATCH_KIND, TraceAt, TraceOrigin, TraceRecord, Value};
-use systemscope_runtime::export::{perfetto_ts, to_jsonl, to_perfetto};
+use systemscope_runtime::export::{perfetto_track, perfetto_ts, to_jsonl, to_perfetto};
 use systemscope_runtime::runtime::{Dispatched, Runtime, SessionConfig};
 use systemscope_runtime::topology::TopologyBuilder;
 use systemscope_runtime::trace::Trace;
@@ -226,18 +226,21 @@ fn perfetto_represents_the_same_records_and_transactions() {
         assert!(line.contains(&ts), "{line} lacks {ts}");
     }
 
-    // One named track per component.
-    let threads: Vec<(u64, &str)> = events
-        .iter()
-        .filter(|e| e["ph"] == "M" && e["name"] == "thread_name")
-        .map(|e| {
-            (
-                e["tid"].as_u64().unwrap(),
-                e["args"]["name"].as_str().unwrap(),
-            )
-        })
-        .collect();
-    assert_eq!(threads, [(0, "soc.cpu0"), (1, "soc.mem")]);
+    // One named process and thread per component, never id 0.
+    for kind in ["process_name", "thread_name"] {
+        let tracks: Vec<(u64, u64, &str)> = events
+            .iter()
+            .filter(|e| e["ph"] == "M" && e["name"] == kind)
+            .map(|e| {
+                (
+                    e["pid"].as_u64().unwrap(),
+                    e["tid"].as_u64().unwrap(),
+                    e["args"]["name"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(tracks, [(1, 1, "soc.cpu0"), (2, 2, "soc.mem")], "{kind}");
+    }
 
     // Every record is one instant event, in order, with the same fields.
     let instants: Vec<&Json> = events.iter().filter(|e| e["ph"] == "i").collect();
@@ -245,7 +248,9 @@ fn perfetto_represents_the_same_records_and_transactions() {
     for (i, (e, r)) in instants.iter().zip(&trace.records).enumerate() {
         assert_eq!(e["args"]["record"].as_u64(), Some(i as u64));
         assert_eq!(e["name"].as_str(), Some(r.kind));
-        assert_eq!(e["tid"].as_u64(), Some(u64::from(r.component.0)));
+        let track = perfetto_track(r.component.0);
+        assert_eq!(e["pid"].as_u64(), Some(track));
+        assert_eq!(e["tid"].as_u64(), Some(track));
         let tick = match r.at {
             TraceAt::Init => 0,
             TraceAt::Event(k) => k.tick.0,
@@ -270,13 +275,16 @@ fn perfetto_represents_the_same_records_and_transactions() {
         .count();
     let mut slices: BTreeMap<String, Vec<(&str, f64, u64)>> = BTreeMap::new();
     for e in events.iter().filter(|e| e["ph"] == "b" || e["ph"] == "e") {
+        // Process-scoped ids; a global `id` would group slices apart from any component.
+        assert!(e.get("id").is_none());
+        assert_eq!(e["pid"], e["tid"]);
         slices
-            .entry(e["id"].as_str().unwrap().to_owned())
+            .entry(e["id2"]["local"].as_str().unwrap().to_owned())
             .or_default()
             .push((
                 e["ph"].as_str().unwrap(),
                 e["ts"].as_f64().unwrap(),
-                e["tid"].as_u64().unwrap(),
+                e["pid"].as_u64().unwrap(),
             ));
     }
     assert_eq!(slices.len(), requests);
@@ -286,6 +294,6 @@ fn perfetto_represents_the_same_records_and_transactions() {
         let (b, e) = (pair[0], pair[1]);
         assert_eq!((b.0, e.0), ("b", "e"), "slice {id}");
         assert!(b.1 < e.1, "slice {id} must end after it begins");
-        assert_eq!((b.2, e.2), (0, 0), "slices live on the CPU track");
+        assert_eq!((b.2, e.2), (1, 1), "slices live in the CPU's process");
     }
 }
