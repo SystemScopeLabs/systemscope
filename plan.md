@@ -1,652 +1,289 @@
-1\. 프로젝트 정의
+# SystemScope
 
-하드웨어부터 OS, 런타임, 네트워크, GPU까지 컴퓨터 시스템 전체를 모듈 단위로 연결하고, 실행 상태와 이벤트를 실시간 추적·시각화하는 인터랙티브 시스템 플랫폼.
+> Interactive Computer Systems Simulation & Observability Platform
 
-핵심은 설명이 아니라:
+SystemScope is not a program that *explains* computers. It builds a computer system itself as a **modular execution model** and makes that model **observable**.
 
-실행 / 상태 / 이벤트 / 추적 / 교체 가능한 구현체
+It connects the whole system, from hardware through OS, runtime, network, and GPU, as components. It then records, replays, and visualizes their state and events deterministically. The focus is on five things:
 
-2\. 최종 형태
+**execution · state · events · tracing · replaceable implementations**
 
+---
+
+## 1. Design Principles
+
+Every design decision is judged against these principles. An implementation that violates one is not accepted.
+
+1. **Contract-first, but validated by execution.**
+   Contracts are defined first, then refined against the executable M0 runtime. A contract is not frozen until running code has exercised it.
+2. **Time is integer and deterministic; observation never perturbs execution.**
+   Global time is an integer tick. The same inputs and seed always produce bit-identical results. Tracing, breakpoints, and stepping never change the outcome.
+3. **Same-tick event ordering is explicitly defined.**
+   The order of events at the same tick is decided by runtime-defined phases and runtime-assigned sequence numbers. Components cannot choose arbitrary priorities.
+4. **Fidelity may differ per component, but components connect only through explicit time/protocol contracts.**
+   Components never reference each other directly.
+5. **Software semantics may be abstracted; architectural boundaries remain specification-accurate.**
+   An implementation may simplify internals. Wherever it touches real hardware, it must follow the specification exactly. That includes the ISA, traps, CSRs, page tables, the register ABI, and bus protocols.
+6. **Every backend is replaceable behind the same contract.**
+
+---
+
+## 2. Target Shape
+
+```text
 System
+├─ Platform   Motherboard · PCIe · Firmware · Power/Clock
+├─ Compute    CPU · GPU · Accelerator
+├─ Memory     Cache · RAM · VRAM · Virtual Memory
+├─ Storage    NVMe SSD · HDD · Partition · Filesystem
+├─ I/O        USB · Keyboard · Display · Interrupt/DMA
+├─ Network    NIC · Ethernet · IP · TCP/UDP · Socket
+└─ Software   Boot · Kernel · Process/Thread · Scheduler · Driver · Runtime · Application
+```
 
-├─ Platform
+Users can drill into any layer, for example `Computer → CPU → Core → Pipeline → ALU`.
+
+### Core Features
+
+| Feature | Description |
+|---|---|
+| **System Explorer** | Navigate the full system topology hierarchically. |
+| **Execution Trace** | Follow every system-wide event caused by running a program: `PROCESS_CREATE`, `PAGE_FAULT`, `NVME_READ`, `TLB_MISS`, `L1_MISS`, `DRAM_READ`, `SYSCALL_ENTER`, `INTERRUPT`, `DMA_COMPLETE`, `PACKET_TX`, `GPU_DISPATCH`, … |
+| **State Inspector** | Inspect real state at any point in time. CPU: PC, registers, pipeline, ROB, cache, TLB. Process: PID, threads, address space, page table, FDs. SSD: queues, LBA, namespaces, controller, NAND mapping. |
+| **Timeline** | Play · Pause · Step · Step Back · Seek · Breakpoint · Filter. In effect, a debugger for the entire system. |
+
+---
+
+## 3. Architecture
+
+The core of the project is neither the UI nor the CPU. It is the **Simulation Runtime**, which binds every component into one execution model.
+
+```text
+                 Runtime
+   (time · event queue · snapshot · trace)
+                    │
+      ┌─────────────┼─────────────┐
+      ▼             ▼             ▼
+     CPU  ◀─port─▶ Memory ◀─port─▶ Storage
+      │             │             │
+      └──── Events / Protocol ────┘
+```
 
-│  ├─ Motherboard
+The runtime owns:
 
-│  ├─ PCIe
+- global time and clock domains
+- event ordering
+- component lifecycle
+- topology elaboration
+- snapshot and restore
+- deterministic replay
+- breakpoints
+- trace recording
 
-│  ├─ Firmware
+### Skeleton (frozen in M0)
 
-│  └─ Power / Clock
+```text
+Tick → Event → EventQueue → Component → Port/Protocol → State → Trace
+```
+
+| Area | Contract elements |
+|---|---|
+| Time | `Tick`, `Duration`, `SimulationClock`, `ClockDomain` |
+| Event | `Event`, `EventKey`, `Phase`, `EventQueue` |
+| Structure | `Component`, `Port`, `Protocol`, `Link`, `Topology` |
+| State | `Snapshot`, `restore`, `snapshot_schema_version` |
+| Observation | `Trace`, `Observer` |
+
+The detailed design is in [docs/m0-design.md](docs/m0-design.md).
+
+---
+
+## 4. Time and Event Model (Summary)
+
+- **Tick is a `u64`.** The resolution (`ticks_per_second`) is fixed when a session starts. The default is 1 tick = 1 ps. The resolution is never hard-coded.
+- **No floating point anywhere in time computation.**
+- **A ClockDomain expresses frequency as a rational number (`num/den` Hz).** The tick of edge *n* is computed absolutely, never accumulated. This means no drift, even when a period such as 3 GHz's is not a whole number of picoseconds.
+- **Components express latency in cycles or in physical `Duration`.** Only the runtime projects those onto ticks.
+- **Events are ordered by `EventKey = (tick, phase, sequence)`.** Phases run in a fixed order: `REQUEST → TRANSFER → COMPLETE → COMMIT → OBSERVE`. The runtime assigns sequence numbers in scheduling order.
+- **Phases are monotonic within a tick.** Scheduling an event at the current tick into an earlier phase is a runtime error. Such work must move to `tick + 1` or later.
+- **`OBSERVE` cannot mutate state.**
+
+Example of two fidelities meeting:
+
+```text
+t = 120 ns       CPU (F3, 3 GHz) issues READ         → StorageRequest  @ REQUEST
+t = 100 120 ns   SSD (F1, fixed 100 µs latency) done → StorageComplete @ COMPLETE
+```
+
+---
+
+## 5. Fidelity
+
+Levels describe **simulation fidelity**, not educational difficulty.
+
+| Level | Name | Models |
+|---|---|---|
+| F0 | Structural | structure and connectivity only |
+| F1 | Functional | correct input/output behavior |
+| F2 | Architectural | ISA, memory, and OS semantics |
+| F3 | Microarchitectural | pipeline, cache, ROB, scheduler |
+| F4 | RTL | SystemVerilog level |
+| F5 | Logic | gates, registers, muxes |
+| F6 | Physical | standard cells, transistors, timing |
+
+Components do not need to share a level. A system such as `CPU F3 · RAM F2 · SSD F1 · OS F2 · GPU F1 · Network F2` is valid. Different fidelities meet only through Port/Protocol and the time contract (Principle 4).
+
+---
+
+## 6. Backends
+
+Concepts (contracts) are separated from implementations.
+
+```text
+CPU Contract                  Memory Contract
+├─ Rust RV32I model (F2)      ├─ Simple RAM
+├─ Rust pipeline model (F3)   ├─ DDR model
+├─ SystemVerilog CPU (F4)     ├─ NUMA model
+├─ QEMU adapter               └─ Trace-backed model
+└─ Real trace adapter
 
-│
+OS Contract
+├─ Modeled OS Backend        process / scheduler / syscall / VM state machines in Rust
+├─ Native Guest OS Backend   real C/Assembly kernel running on the simulated CPU
+└─ Trace Backend             Linux / QEMU / real-system traces
+```
+
+**A modeled OS is not hard-coding.**
+- Hard-coding scripts a scenario, for example `printf called → emit SYSCALL event`.
+- A model implements general rules, for example `ecall → trap → syscall dispatch → process state change`.
+
+Under Principle 5, the Modeled OS still follows RISC-V conventions everywhere it touches the CPU:
+- `satp` and Sv32 PTEs are written into simulated RAM, and the MMU performs real page walks.
+- `ecall`, `mcause`/`scause`, `sepc`, and the register ABI follow the specification.
 
-├─ Compute
+That is why swapping in the native kernel at M6 requires no CPU changes.
 
-│  ├─ CPU
+---
 
-│  ├─ GPU
+## 7. Simulation vs. Real Traces
 
-│  └─ Accelerator
+Real-trace backends come later: QEMU, Linux perf, eBPF, ETW, SystemVerilog simulators, PCIe traces, GPU profilers, and network captures. Each is converted into the common contract and shown on the same timeline.
 
-│
+The two worlds **unify at the Event/Trace level only**.
+- Real traces are sampled and incomplete, so full `State` and `Snapshot` exist only for simulation backends.
+- Each backend declares what it provides as capabilities, such as `events`, `state`, `snapshot`, and `step_back`.
+- The UI enables features based on the declared capabilities.
 
-├─ Memory
+---
 
-│  ├─ Cache
+## 8. Verification Strategy
 
-│  ├─ RAM
+```text
+             RISC-V Specification
+                      │
+           ┌──────────┴──────────┐
+           ▼                     ▼
+       Sail model              Spike
+  spec reference, ACT      functional cross-check
+  signatures               (commit-log lockstep)
+           │                     │
+           └──────────┬──────────┘
+                      ▼
+               Rust CPU (M1+)
+                      ▼  lockstep
+            SystemVerilog CPU (M5+)
+```
 
-│  ├─ VRAM
+- **riscv-tests** serve as processor unit tests.
+- **ACT (riscv-arch-test)** is the reference for architectural conformance. The Sail model generates its expected results. ACT does not replace full processor verification.
+- **Spike lockstep** runs from M1. At every instruction retirement it compares `PC`, `x0..x31`, CSRs, memory writes, and trap state.
+- **Rust ↔ SystemVerilog lockstep** runs from M5, via Verilator co-simulation. It also demonstrates concretely that backends are replaceable.
+- **Determinism acceptance tests** enforce Principle 2 in CI from M0 onward. They are specified in [docs/m0-design.md §9](docs/m0-design.md#9-deterministic-ci-acceptance-tests).
 
-│  └─ Virtual Memory
+---
 
-│
+## 9. Languages
 
-├─ Storage
+Each layer uses the language that fits its nature, and **each language is introduced only when needed**.
 
-│  ├─ NVMe SSD
+| Language | Purpose | Introduced |
+|---|---|---|
+| Rust | runtime, contracts, core models | M0 |
+| (Perfetto UI) | early timeline visualization, no custom code | M0 |
+| RISC-V Assembly / C | bare-metal test programs | M1 |
+| Python | analysis, verification scripts, tooling | as needed |
+| TypeScript | SystemScope Visualizer | M4 |
+| SystemVerilog | RTL implementations (via Verilator) | M5 |
+| C / Assembly | native guest kernel | M6 |
+| Schema / Protobuf | language-neutral contracts and trace format | once two or more languages share contracts |
 
-│  ├─ HDD
+---
 
-│  ├─ Partition
+## 10. Repository Layout
 
-│  └─ Filesystem
+Start with **two repositories**. This keeps contracts independent while avoiding coordination overhead while they are still changing rapidly.
 
-│
+```text
+SystemScope (GitHub org)
+├─ contracts     Time · Event · Component · Protocol · Trace · Capability
+└─ systemscope   this repository
+   ├─ runtime/
+   ├─ components/   cpu/ · memory/ · storage/ · os/ …
+   ├─ visualizer/   (M4+)
+   ├─ tests/        acceptance tests
+   └─ docs/
+```
 
-├─ I/O
+- `systemscope` depends on `contracts` as a **git dependency pinned to a revision**. During local development, a Cargo `[patch]` overrides it with a path.
+- A contract change lands in `contracts` first. `systemscope` then bumps the pinned revision.
+- Once contracts stabilize, components split out into their own repositories: `cpu`, `storage`, `network`, …
+- Because the org is already named SystemScope, repositories do not repeat a `systemscope-` prefix.
+- Future repositories: `linux`, `windows`, `riscv`, `x86`, `cuda`, `rocm`.
 
-│  ├─ USB
+---
 
-│  ├─ Keyboard
+## 11. Roadmap
 
-│  ├─ Display
+The final goal is not reduced. Instead, we cut out the **first complete system slice**. No milestone may hard-code a scenario. Everything must run through the component + event + state model.
 
-│  └─ Interrupt / DMA
+| Milestone | Scope | Exit criteria |
+|---|---|---|
+| **M0** | Time, event queue, component contract, deterministic DES, Perfetto trace | All criteria in [m0-design.md §10](docs/m0-design.md#10-m0-exit-criteria), including the three determinism acceptance tests passing in CI on Linux and Windows |
+| **M1** | RV32I CPU + RAM, bare-metal ELF execution, UART output | All `riscv-tests` rv32ui tests pass, Spike commit-log lockstep matches, ACT RV32I passes |
+| **M2** | Interrupts, DMA, block storage (abstract SSD model) | A bare-metal program completes a block read via a DMA-completion interrupt, and the acceptance tests still pass |
+| **M3** | Modeled OS Backend: process, syscalls, Sv32 virtual memory | The full path from executable to output runs through models, with page tables living in simulated RAM |
+| **M4** | SystemScope Visualizer: topology, timeline, state, step, step back | The M3 scenario can be explored with step and step back in the UI |
+| **M5** | SystemVerilog CPU backend via Verilator | Matches the Rust CPU in lockstep and passes the same suites |
+| **M6** | Native Guest OS Backend: C/Assembly tiny kernel | Runs the M3 scenario with no changes to CPU code |
 
-│
+The M3 first-slice scenario: `Executable → Storage → RAM → Process → CPU → Memory → Syscall → Kernel → Output`.
 
-├─ Network
+After that, GPU and NIC plug into the same runtime.
 
-│  ├─ NIC
+---
 
-│  ├─ Ethernet
+## 12. Prior Art
 
-│  ├─ IP
+We do not invent our own rules first. We study projects that have worked on these problems for years.
 
-│  ├─ TCP/UDP
+- **SystemC TLM-2.0**: loosely-timed and approximately-timed models, and interoperability across timing fidelities
+- **gem5**: integer ticks (1 ps by default), clock domains, atomic/timing/functional memory access, SE/FS modes
+- **SST (Structural Simulation Toolkit)**: `Component ↔ Link ↔ Event` structure
+- **Perfetto**: trace format and timeline UI
 
-│  └─ Socket
+---
 
-│
+## 13. Open Questions
 
-└─ Software
+- Target users and priority: education, systems research, or performance debugging?
+- Explicit non-goals.
+- Snapshot serialization format, decided in M0 ([m0-design.md §12](docs/m0-design.md#12-open-questions)).
+- When to introduce host-parallel simulation (PDES), and how to keep it deterministic.
 
-&#x20;  ├─ Boot
+---
 
-&#x20;  ├─ Kernel
+## 14. Name and Identity
 
-&#x20;  ├─ Process / Thread
-
-&#x20;  ├─ Scheduler
-
-&#x20;  ├─ Driver
-
-&#x20;  ├─ Runtime
-
-&#x20;  └─ Application
-
-사용자는 어느 계층이든 클릭해서 내부로 내려감.
-
-3\. 핵심 기능
-
-System Explorer
-
-컴퓨터 전체 topology를 탐색.
-
-Computer → CPU → Core → Pipeline → ALU
-
-처럼 계속 내려감.
-
-Execution Trace
-
-프로그램 하나를 실행하면 시스템 전체에서 발생하는 사건을 추적.
-
-PROCESS\_CREATE
-
-PAGE\_FAULT
-
-NVME\_READ
-
-PAGE\_LOAD
-
-CPU\_FETCH
-
-TLB\_MISS
-
-L1\_MISS
-
-DRAM\_READ
-
-SYSCALL\_ENTER
-
-INTERRUPT
-
-DMA\_COMPLETE
-
-PACKET\_TX
-
-GPU\_DISPATCH
-
-State Inspector
-
-특정 시점의 실제 상태를 봄.
-
-CPU:
-
-PC
-
-Registers
-
-Pipeline
-
-ROB
-
-Cache
-
-TLB
-
-Process:
-
-PID
-
-Thread
-
-Virtual Address Space
-
-Page Table
-
-FD
-
-State
-
-SSD:
-
-Queue
-
-LBA
-
-Namespace
-
-Controller
-
-NAND mapping
-
-Timeline
-
-Play
-
-Pause
-
-Step
-
-Step Back
-
-Seek
-
-Breakpoint
-
-Filter
-
-결국 시스템 전체용 debugger처럼 동작하는 거야.
-
-4\. 프로젝트의 중심
-
-본체는 UI도 CPU도 아님.
-
-Simulation Runtime
-
-모든 컴포넌트를 하나의 실행 모델로 묶음.
-
-&#x20;                   Runtime
-
-&#x20;                      │
-
-&#x20;       ┌──────────────┼─────────────┐
-
-&#x20;       ▼              ▼             ▼
-
-&#x20;      CPU            Memory        Storage
-
-&#x20;       │              │             │
-
-&#x20;       ├────── Events / State ──────┤
-
-&#x20;       │              │             │
-
-&#x20;       ▼              ▼             ▼
-
-&#x20;       OS            GPU          Network
-
-Runtime이 담당:
-
-global time
-
-event ordering
-
-component lifecycle
-
-concurrency
-
-scheduling
-
-state snapshots
-
-deterministic replay
-
-breakpoint
-
-trace recording
-
-여기가 사실 가장 중요한 엔진.
-
-5\. Contracts
-
-별도 레포 유지.
-
-systemscope-contracts
-
-여기서 정의:
-
-Component
-
-State
-
-Event
-
-Command
-
-Trace
-
-Capability
-
-Topology
-
-Time
-
-Protocol
-
-예:
-
-MemoryReadRequested
-
-MemoryReadCompleted
-
-InstructionFetched
-
-InstructionRetired
-
-InterruptRaised
-
-DmaStarted
-
-DmaCompleted
-
-PacketReceived
-
-KernelEntered
-
-GpuKernelDispatched
-
-중요한 건 특정 CPU나 특정 OS에 종속되지 않는 것.
-
-6\. 구현체와 플랫폼 분리
-
-예를 들어 CPU라는 개념과 CPU 구현은 분리.
-
-CPU Contract
-
-&#x20;   │
-
-&#x20;   ├─ Simple CPU Model
-
-&#x20;   ├─ Rust CPU Simulator
-
-&#x20;   ├─ SystemVerilog CPU
-
-&#x20;   ├─ QEMU Adapter
-
-&#x20;   └─ Real Trace Adapter
-
-Memory도:
-
-Memory Contract
-
-&#x20;   │
-
-&#x20;   ├─ Simple RAM
-
-&#x20;   ├─ DDR Model
-
-&#x20;   ├─ NUMA Model
-
-&#x20;   └─ Trace-backed Model
-
-이 구조여야 나중에 실제 구현을 계속 붙일 수 있음.
-
-7\. Fidelity
-
-여기서 중요한 수정.
-
-교육용 level이 아니라 simulation fidelity level로 둬.
-
-F0 Structural
-
-구조와 연결만 표현
-
-
-
-F1 Functional
-
-입출력 동작 정확
-
-
-
-F2 Architectural
-
-ISA / memory / OS semantics 반영
-
-
-
-F3 Microarchitectural
-
-pipeline / cache / ROB / scheduler 반영
-
-
-
-F4 RTL
-
-SystemVerilog 수준
-
-
-
-F5 Logic
-
-gate / register / mux 수준
-
-
-
-F6 Physical
-
-standard cell / transistor / timing 수준
-
-그리고 모든 컴포넌트가 같은 fidelity일 필요도 없음.
-
-예:
-
-CPU      F3
-
-RAM      F2
-
-SSD      F1
-
-OS       F2
-
-GPU      F1
-
-Network  F2
-
-이런 식으로 조합 가능.
-
-이게 훨씬 강력해.
-
-8\. 실제 데이터도 받을 수 있게
-
-나중에는 simulation만 하지 않고 real trace backend를 붙임.
-
-QEMU
-
-Linux perf
-
-eBPF
-
-ETW
-
-SystemVerilog simulator
-
-PCIe trace
-
-GPU profiler
-
-Network capture
-
-↓
-
-공통 contract로 변환
-
-↓
-
-SystemScope Timeline
-
-그러면 같은 UI에서
-
-시뮬레이션 결과와 실제 시스템 trace를 둘 다 볼 수 있음.
-
-이게 프로젝트를 단순 simulator보다 훨씬 크게 만들어.
-
-9\. 언어
-
-Rust
-
-→ simulation runtime / core engines
-
-
-
-TypeScript
-
-→ visualizer / desktop-web UI
-
-
-
-SystemVerilog
-
-→ RTL hardware implementations
-
-
-
-C / C++
-
-→ kernel / driver / runtime / native adapter
-
-
-
-Assembly
-
-→ boot / interrupt / context switch / ISA-level code
-
-
-
-Python
-
-→ reference model / analysis / verification / tooling
-
-
-
-Schema / Protobuf
-
-→ language-neutral contracts
-
-언어를 여러 개 쓰는 이유도 명확함.
-
-각 시스템 계층의 실제 성격에 맞는 언어를 사용한다.
-
-10\. 멀티레포
-
-systemscope-contracts
-
-systemscope-runtime
-
-systemscope-visualizer
-
-
-
-systemscope-cpu
-
-systemscope-memory
-
-systemscope-storage
-
-systemscope-os
-
-systemscope-network
-
-systemscope-gpu
-
-systemscope-platform
-
-
-
-systemscope-hardware
-
-systemscope-trace
-
-systemscope-integration
-
-나중에:
-
-systemscope-windows
-
-systemscope-linux
-
-systemscope-cuda
-
-systemscope-rocm
-
-systemscope-riscv
-
-systemscope-x86
-
-같이 확장.
-
-11\. 첫 구현
-
-최종 목표를 축소하는 게 아니라 첫 번째 완전한 시스템 slice만 자름.
-
-CPU
-
-RAM
-
-NVMe SSD
-
-Process
-
-Minimal OS model
-
-프로그램 하나 실행:
-
-Executable
-
-→ Storage
-
-→ RAM
-
-→ Process
-
-→ CPU
-
-→ Memory
-
-→ Syscall
-
-→ Kernel
-
-→ Output
-
-단, 이걸 특정 시나리오 하드코딩으로 만들지 않고 모든 단계가 실제 component + event + state 모델로 동작하게 함.
-
-그다음 같은 runtime에 GPU나 NIC를 꽂는 것.
-
-12\. 최종 정체성
-
-이제 이름도 이렇게 봐야 함.
-
-Interactive Computer Systems Simulation \& Observability Platform
-
-또는 더 강하게:
-
-Full-Stack Computer Systems Digital Twin Framework
-
-다만 Digital Twin은 실제 장비와 지속적으로 동기화하는 단계까지 가야 정확하니까 초기에는 Systems Simulation Platform이 제일 적절해.
-
-핵심은 이거야.
-
-컴퓨터를 설명하는 프로그램이 아니라, 컴퓨터 시스템 자체를 모듈화된 실행 모델로 구성하고 관측하는 플랫폼.
-
-이 방향이면 CUDA/ROCm, Windows boot, 네트워크, 실제 trace, SystemVerilog까지 전부 한 기획 안에 자연스럽게 들어온다.
-
-
-
-지금 기획이면 SystemScope가 제일 잘 맞아. 이미 의미도 정확해.
-
-시스템 전체를 scope해서 구조·상태·이벤트를 본다.
-
-멀티레포는 이렇게 가면 깔끔함.
-
-systemscope-contracts
-
-systemscope-runtime
-
-systemscope-visualizer
-
-systemscope-platform
-
-systemscope-cpu
-
-systemscope-memory
-
-systemscope-storage
-
-systemscope-os
-
-systemscope-network
-
-systemscope-gpu
-
-systemscope-trace
-
-systemscope-integration
-
-나중에 확장:
-
-systemscope-linux
-
-systemscope-windows
-
-systemscope-riscv
-
-systemscope-cuda
-
-systemscope-rocm
-
-GitHub Organization까지 만든다면:
-
-SystemScope/
-
-├─ contracts
-
-├─ runtime
-
-├─ visualizer
-
-├─ cpu
-
-├─ memory
-
-...
-
-처럼 조직명이 이미 SystemScope면 각 레포에 systemscope- prefix를 굳이 반복하지 않는 방식도 더 예쁨.
-
-내 선택은 프로젝트명 SystemScope + GitHub org SystemScope + repo는 contracts, runtime, cpu... 이 조합.
-
+- Project name: **SystemScope**, meaning scoping the whole system to see its structure, state, and events.
+- Category: **Systems Simulation & Observability Platform**.
+- "Digital twin" is reserved for when the platform synchronizes continuously with real hardware.
