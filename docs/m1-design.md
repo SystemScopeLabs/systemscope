@@ -141,7 +141,7 @@ pub enum MemFault     { AccessFault }
 
 **`runtime.dispatch` fields for `mem.v1`** follow the M0 rule: the message's fields in declaration order. A nested outcome is flattened: `outcome` as Str (the variant name, `Data`, `Done`, or `Fault`), then that variant's fields (`data` as Bytes, `fault` as Str). This adds rows for a new protocol; no existing record's encoding changes, so the trace `format_version` stays 2.
 
-**Perfetto:** a `mem.v1` transaction becomes a slice exactly like a `mem.v0` one. A faulted response ends the slice and carries `outcome` and `fault` as args.
+**Perfetto:** the exporter is unchanged. Every `runtime.dispatch` record, including a `mem.v1` one, becomes an instant event with its flattened fields as args, so a fault response shows `outcome` and `fault` on its own dispatch event. Transaction slices are paired only by the `msg` and `txn` fields, so a `mem.v1` request and its response, faulted or not, are paired the same way as `mem.v0`; the slice itself carries no outcome. M1 adds no fault-specific slice semantics.
 
 ### 4.4 M0 Is Frozen
 
