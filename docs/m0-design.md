@@ -46,7 +46,8 @@ contracts/                        (repo: SystemScope/contracts)
    ├─ protocol/      ProtocolId, closed Message enum
    │  └─ mem.rs      mem.v0 messages
    ├─ snapshot.rs    SnapshotWriter/Reader, schema versioning
-   └─ trace.rs       TraceRecord, Value, Observer, WorldView
+   ├─ canonical.rs   Encoder: §4.5 primitive rules
+   └─ trace.rs       TraceRecord, Value, TraceHeader, stream encoding (Observer, WorldView later)
 
 systemscope/                      (repo: SystemScope/systemscope, this repository)
 ├─ runtime/                       systemscope-runtime: scheduler, TopologyBuilder and elaboration, lifecycle, snapshots, sinks
@@ -214,7 +215,7 @@ loop:
 
 | Type | Encoding |
 |---|---|
-| unsigned/signed integers | fixed width, little-endian (`u8`, `u16`, `u32`, `u64`, `i64`) |
+| unsigned/signed integers | fixed width, little-endian (`u8`, `u16`, `u32`, `u64`, `u128`, `i64`) |
 | `bool` | `u8`: `0` or `1` |
 | byte strings, `Vec<u8>` | `u32` length, then the bytes |
 | strings | UTF-8 bytes, encoded as a byte string |
@@ -409,12 +410,30 @@ pub struct RuntimeSnapshot {
 ### 8.1 Trace
 
 ```rust
-pub struct TraceRecord { key: EventKey, component: ComponentId, kind: &'static str, fields: Vec<(&'static str, Value)> }
+// contracts
 pub enum Value { U64(u64), I64(i64), Bool(bool), Str(String), Bytes(Vec<u8>) }   // no floats
+pub enum TraceAt { Init, Event(EventKey) }        // what was running when the record was made
+pub enum TraceOrigin { Component, Runtime }
+pub struct TraceRecord {
+    at: TraceAt,
+    origin: TraceOrigin,
+    component: ComponentId,                        // the emitter; for runtime records, the target
+    kind: &'static str,
+    fields: Vec<(&'static str, Value)>,
+}
+// on InitContext and SimContext:
+fn trace(&mut self, kind: &'static str, fields: Vec<(&'static str, Value)>);
 ```
 
-- **Emission is write-only.** `ctx.trace()` returns `()`, and there is no API to ask whether tracing is on. Components therefore cannot branch on it.
-- **The trace header carries** the format version, `ticks_per_second`, clock domains, topology, seed, and contracts version.
+- **Emission is write-only.** `ctx.trace()` returns `()`, and there is no API to ask whether tracing is on. Components therefore cannot branch on it. When tracing is off the record is dropped; nothing else changes.
+- **Two origins.** Component records come from `ctx.trace()`. The runtime also emits one `runtime.dispatch` record per dispatched event, before the records its handler emits. Its `component` is the target, and its fields describe the source and the delivery. Perfetto transaction slices are built from these records, so they exist whether or not components trace. Fields, in order:
+
+  | Delivery | Fields |
+  |---|---|
+  | message | `source` U64 · `port` U64 · `protocol` Str · `version` U64 · `msg` Str (variant name), then the message's fields in declaration order (`txn`, `addr`, `len` as U64; `data` as Bytes) |
+  | wake | `source` U64 · `token` U64 |
+- **Tracing starts before `init`.** Only then does the trace hold the header and every record from the first event on. It cannot be started later in M0.
+- **Trace state is not simulation state.** The recorder lives outside the scheduler, the RNGs, and the components. It is never snapshotted and never read by the simulation.
 - **The source of truth is the canonical binary encoding**, not any text format:
 
 ```text
@@ -425,20 +444,48 @@ TraceHeader + TraceRecords
         └─ Perfetto exporter ▶ timeline view
 ```
 
-  Canonical encoding of a record, by the primitive rules of §4.5:
+  **Stream layout**, by the primitive rules of §4.5:
 
   ```text
-  tick u64 · phase u8 · sequence u64      the EventKey of the event being handled
-  component u32
+  magic           8 bytes  "SSTRACE" followed by 0x00
+  format_version  u32      currently 1
+  header
+  record*         each: u8 0x01 marker, then the record
+  end             u8 0x00, then record count as u64
+  ```
+
+  **Header:**
+
+  ```text
+  ticks_per_second  u64
+  seed              u64
+  contracts_version string
+  clock domains     sequence of (id u32 · freq num u64 · freq den u64 · offset u64 · rounding u8: 0 Floor, 1 Ceil)
+  components        sequence of (path string · type_name string · ports: sequence of (name string · protocol name string · protocol version u16 · role u8: 0 Initiator, 1 Target))
+  links             sequence of (a component u32 · a port u16 · b component u32 · b port u16 · latency), in declaration order
+  latency           u8 tag: 0 none · 1 After, then femtoseconds u128 · 2 Cycles, then domain u32 · k u64
+  ```
+
+  **Record:**
+
+  ```text
+  at         u8 tag: 0 Init · 1 Event, then tick u64 · phase u8 · sequence u64
+  origin     u8: 0 Component · 1 Runtime
+  component  u32
   kind       string
-  fields     sequence of (name string, value)
+  fields     sequence of (name string · value)
   value      u8 tag, then payload: 0 U64 u64 · 1 I64 i64 · 2 Bool u8 · 3 Str string · 4 Bytes bytes
   ```
 
-  `TraceDigest` is BLAKE3 over the encoded header followed by every encoded record in emission order. JSON escaping, whitespace, field order, and serializer versions therefore never affect a digest. Exporters are views: two exporters may format the same trace differently, and the digest stays the same.
+  Every element is either fixed-width or length-prefixed, and every record starts with a marker, so the stream decodes in exactly one way. Two different record sequences can never encode to the same bytes, and the trailer's count makes a truncated stream detectable.
+
+  `TraceDigest` is BLAKE3 over the whole stream. JSON escaping, whitespace, field order, and serializer versions therefore never affect a digest. Exporters are views: two exporters may format the same trace differently, and the digest stays the same.
+
+  **Any change to this layout, the header, the record encoding, value tags, or the `runtime.dispatch` fields bumps `format_version`** and requires a golden re-bless.
 - **Two exporters in M0:**
-  - **JSONL** writes one object per record with exact integer ticks. It is derived from the records and is not digested.
-  - **Perfetto** uses the Chrome JSON Trace Event format in M0. It has one track per component. Each `mem.v0` transaction is an async slice from request to response. Timestamps are converted from ticks to microseconds with exact decimal formatting. This conversion is for display only.
+  - **JSONL:** the first line is the header and each later line is one record. Ticks and integers are written as exact JSON integers, and bytes as lowercase hex strings. It is derived from the records and is not digested. JSON numbers above 2^53 need a 64-bit integer reader.
+  - **Perfetto:** Chrome JSON Trace Event format. There is one track (`tid`) per component, and every record becomes an instant event with its fields as `args`. Each `mem.v0` transaction becomes an async slice keyed by `(initiator, txn)`, from the request's dispatch to the response's dispatch.
+  - **Perfetto timestamps** are in µs with exactly nine decimal places: `floor(tick × 10^15 / ticks_per_second)` femtoseconds, then split into µs and the remainder. This is integer arithmetic and exact at the default 1 ps resolution. It is for display only and never feeds back into records or digests.
 
 ### 8.2 Observer
 
