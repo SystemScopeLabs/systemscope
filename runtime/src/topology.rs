@@ -13,8 +13,7 @@ use systemscope_contracts::time::{
 };
 use systemscope_contracts::topology::LinkLatency;
 
-use crate::runtime::{Peer, Runtime, Slot};
-use crate::scheduler::SchedulerConfig;
+use crate::runtime::{Peer, Runtime, SessionConfig, Slot};
 
 /// Why a topology could not be elaborated.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -145,7 +144,7 @@ impl TopologyBuilder {
     }
 
     /// Validates the topology and builds a runtime in the `Elaborated` state.
-    pub fn elaborate(self, config: SchedulerConfig) -> Result<Runtime, ElaborationError> {
+    pub fn elaborate(self, config: SessionConfig) -> Result<Runtime, ElaborationError> {
         let mut paths = BTreeMap::new();
         let mut slots = Vec::with_capacity(self.components.len());
         for declared in self.components {

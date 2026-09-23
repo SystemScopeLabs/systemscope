@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+blake3 = "1"
 systemscope-contracts.workspace = true
 
 [lints]
@@ -13,3 +14,5 @@ workspace = true
 
 [dev-dependencies]
 proptest = "1"
+rand_core = "0.10.1"
+rand_xoshiro = "0.8.1"

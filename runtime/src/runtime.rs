@@ -14,10 +14,21 @@ use systemscope_contracts::component::{
 use systemscope_contracts::error::SimError;
 use systemscope_contracts::event::{EventKey, Phase, ScheduleWhen};
 use systemscope_contracts::protocol::Message;
+use systemscope_contracts::rng::SimRng;
 use systemscope_contracts::time::{ClockDomain, SimulationClock, Tick};
 use systemscope_contracts::topology::LinkLatency;
 
+use crate::rng::Xoshiro256StarStar;
 use crate::scheduler::{Scheduler, SchedulerConfig};
+
+/// Settings fixed for the lifetime of a session.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SessionConfig {
+    /// Seeds every component's random stream (§5.2).
+    pub seed: u64,
+    /// Scheduler limits.
+    pub scheduler: SchedulerConfig,
+}
 
 /// Where a session is in its lifecycle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,6 +109,8 @@ pub struct Runtime {
     clock: SimulationClock,
     domains: Vec<ClockDomain>,
     components: Vec<Box<dyn Component>>,
+    /// One random stream per component, owned here so snapshots can capture them.
+    rngs: Vec<Xoshiro256StarStar>,
     slots: Vec<SlotInfo>,
     /// `peers[component][port]` is the other end of that port's link.
     peers: Vec<Vec<Peer>>,
@@ -112,8 +125,12 @@ impl Runtime {
         domains: Vec<ClockDomain>,
         slots: Vec<Slot>,
         peers: Vec<Vec<Peer>>,
-        config: SchedulerConfig,
+        config: SessionConfig,
     ) -> Runtime {
+        let rngs = slots
+            .iter()
+            .map(|s| Xoshiro256StarStar::for_component(config.seed, &s.path))
+            .collect();
         let (slots, components) = slots
             .into_iter()
             .map(|s| {
@@ -128,9 +145,10 @@ impl Runtime {
             clock,
             domains,
             components,
+            rngs,
             slots,
             peers,
-            scheduler: Scheduler::new(config),
+            scheduler: Scheduler::new(config.scheduler),
             lifecycle: Lifecycle::Elaborated,
             fault: None,
         }
@@ -245,6 +263,7 @@ impl Runtime {
             ports: &self.slots[index].ports,
             peers: &self.peers[index],
             scheduler: &mut self.scheduler,
+            rng: &mut self.rngs[index],
             error: None,
         };
         (self.components[index].as_mut(), ctx)
@@ -293,6 +312,7 @@ struct Ctx<'a> {
     ports: &'a [PortSpec],
     peers: &'a [Peer],
     scheduler: &'a mut Scheduler<Pending>,
+    rng: &'a mut Xoshiro256StarStar,
     /// First error returned to the component. Sticky: the runtime faults on it.
     error: Option<SimError>,
 }
@@ -375,6 +395,10 @@ impl InitContext for Ctx<'_> {
         }
         let result = self.try_wake(when, phase, token);
         self.record(result)
+    }
+
+    fn rng(&mut self) -> &mut dyn SimRng {
+        self.rng
     }
 }
 

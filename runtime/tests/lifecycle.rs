@@ -14,7 +14,7 @@ use systemscope_contracts::time::{
     ClockDomainId, Duration, Frequency, Rounding, SimulationClock, Tick,
 };
 use systemscope_contracts::topology::LinkLatency;
-use systemscope_runtime::runtime::{Dispatched, Lifecycle, Runtime, RuntimeError};
+use systemscope_runtime::runtime::{Dispatched, Lifecycle, Runtime, RuntimeError, SessionConfig};
 use systemscope_runtime::scheduler::SchedulerConfig;
 use systemscope_runtime::topology::{ElaborationError, TopologyBuilder};
 
@@ -156,7 +156,7 @@ fn ping_echo(latency: Option<LinkLatency>) -> (Runtime, Log) {
     let p = t.add_component("soc.pinger", Box::new(Pinger { log: log.clone() }));
     let e = t.add_component("soc.echo", Box::new(Echo { log: log.clone() }));
     t.connect((p, "mem"), (e, "mem"), latency);
-    let rt = t.elaborate(SchedulerConfig::default()).unwrap();
+    let rt = t.elaborate(SessionConfig::default()).unwrap();
     (rt, log)
 }
 
@@ -254,7 +254,7 @@ fn zero_latency_delivery_is_a_separate_later_event() {
         }),
     );
     t.connect((a, "mem"), (b, "mem"), None);
-    let mut rt = t.elaborate(SchedulerConfig::default()).unwrap();
+    let mut rt = t.elaborate(SessionConfig::default()).unwrap();
     rt.init().unwrap();
     let trace = run_all(&mut rt);
 
@@ -283,7 +283,7 @@ fn init_runs_in_component_id_order() {
                 ),
             );
         }
-        let mut rt = t.elaborate(SchedulerConfig::default()).unwrap();
+        let mut rt = t.elaborate(SessionConfig::default()).unwrap();
         rt.init().unwrap();
         let targets: Vec<_> = run_all(&mut rt)
             .iter()
@@ -315,7 +315,7 @@ fn init_may_schedule_any_phase_but_observe_at_tick_zero() {
             |_, _| Ok(()),
         ),
     );
-    let mut rt = t.elaborate(SchedulerConfig::default()).unwrap();
+    let mut rt = t.elaborate(SessionConfig::default()).unwrap();
     rt.init().unwrap();
     let phases: Vec<_> = run_all(&mut rt).iter().map(|d| d.key.phase).collect();
     assert_eq!(phases, [Phase::Request, Phase::Commit]);
@@ -328,7 +328,7 @@ fn init_may_schedule_any_phase_but_observe_at_tick_zero() {
             |_, _| Ok(()),
         ),
     );
-    let mut rt = t.elaborate(SchedulerConfig::default()).unwrap();
+    let mut rt = t.elaborate(SessionConfig::default()).unwrap();
     assert!(matches!(
         rt.init(),
         Err(RuntimeError::Faulted(SimError::PhaseViolation { .. }))
@@ -353,7 +353,7 @@ fn swallowed_context_error_still_faults() {
             },
         ),
     );
-    let mut rt = t.elaborate(SchedulerConfig::default()).unwrap();
+    let mut rt = t.elaborate(SessionConfig::default()).unwrap();
     rt.init().unwrap();
     let err = rt.step().unwrap_err();
     assert!(matches!(
@@ -379,7 +379,7 @@ fn faulted_is_terminal() {
             |_, _| Err(SimError::ComponentFault("boom")),
         ),
     );
-    let mut rt = t.elaborate(SchedulerConfig::default()).unwrap();
+    let mut rt = t.elaborate(SessionConfig::default()).unwrap();
     rt.init().unwrap();
     let fault = RuntimeError::Faulted(SimError::ComponentFault("boom"));
     assert_eq!(rt.step(), Err(fault));
@@ -402,8 +402,11 @@ fn livelock_faults_and_cannot_be_bypassed() {
         ),
     );
     let mut rt = t
-        .elaborate(SchedulerConfig {
-            max_events_per_phase: 10,
+        .elaborate(SessionConfig {
+            scheduler: SchedulerConfig {
+                max_events_per_phase: 10,
+            },
+            ..SessionConfig::default()
         })
         .unwrap();
     rt.init().unwrap();
@@ -438,7 +441,7 @@ fn init_failure_faults_whole_session() {
             ),
         );
     }
-    let mut rt = t.elaborate(SchedulerConfig::default()).unwrap();
+    let mut rt = t.elaborate(SessionConfig::default()).unwrap();
     let fault = RuntimeError::Faulted(SimError::ComponentFault("init"));
     assert_eq!(rt.init(), Err(fault));
     // Components after the failure are not initialized.
@@ -472,7 +475,7 @@ fn unknown_port_faults() {
             |_, _| Ok(()),
         ),
     );
-    let mut rt = t.elaborate(SchedulerConfig::default()).unwrap();
+    let mut rt = t.elaborate(SessionConfig::default()).unwrap();
     assert_eq!(
         rt.init(),
         Err(RuntimeError::Faulted(SimError::UnknownPort(PortId(3))))
@@ -493,7 +496,7 @@ fn unknown_clock_domain_in_schedule_faults() {
             |_, _| Ok(()),
         ),
     );
-    let mut rt = t.elaborate(SchedulerConfig::default()).unwrap();
+    let mut rt = t.elaborate(SessionConfig::default()).unwrap();
     assert_eq!(
         rt.init(),
         Err(RuntimeError::Faulted(SimError::UnknownClockDomain(
@@ -505,7 +508,7 @@ fn unknown_clock_domain_in_schedule_faults() {
 fn elaborate_err(build: impl FnOnce(&mut TopologyBuilder)) -> ElaborationError {
     let mut t = TopologyBuilder::new(SimulationClock::default());
     build(&mut t);
-    match t.elaborate(SchedulerConfig::default()) {
+    match t.elaborate(SessionConfig::default()) {
         Ok(_) => panic!("elaboration unexpectedly succeeded"),
         Err(e) => e,
     }
@@ -623,7 +626,7 @@ fn message_protocol_must_match_sending_port() {
     let a = t.add_component("a", a);
     let b = t.add_component("b", b);
     t.connect((a, "mem"), (b, "mem"), None);
-    let mut rt = t.elaborate(SchedulerConfig::default()).unwrap();
+    let mut rt = t.elaborate(SessionConfig::default()).unwrap();
     assert_eq!(
         rt.init(),
         Err(RuntimeError::Faulted(SimError::ProtocolMismatch {
