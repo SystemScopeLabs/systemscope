@@ -241,6 +241,13 @@ impl Component for ToyBus {
                 port: MEM_PORT,
                 msg: Message::Mem(msg),
             } => self.route(msg, ctx)?,
+            // Sends are protocol-checked, so only mem.v0 arrives on these ports.
+            Delivered::Message {
+                msg: Message::MemV1(_),
+                ..
+            } => {
+                return Err(SimError::ComponentFault("toy bus: mem.v1 message"));
+            }
             Delivered::Message {
                 port,
                 msg: Message::Mem(msg),

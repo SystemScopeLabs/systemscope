@@ -279,6 +279,13 @@ impl Component for ToyCpu {
                     self.schedule_issue(ctx)?;
                 }
             }
+            // Sends are protocol-checked, so only mem.v0 arrives on this port.
+            Delivered::Message {
+                msg: Message::MemV1(_),
+                ..
+            } => {
+                return Err(SimError::ComponentFault("toy cpu: mem.v1 message"));
+            }
             Delivered::Message {
                 msg: Message::Mem(msg),
                 ..
