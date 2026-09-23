@@ -415,9 +415,30 @@ pub enum Value { U64(u64), I64(i64), Bool(bool), Str(String), Bytes(Vec<u8>) }  
 
 - **Emission is write-only.** `ctx.trace()` returns `()`, and there is no API to ask whether tracing is on. Components therefore cannot branch on it.
 - **The trace header carries** the format version, `ticks_per_second`, clock domains, topology, seed, and contracts version.
-- **Two sinks:**
-  - **Canonical JSONL** holds exact integer ticks. It is used for digests and replay tooling.
-  - **Perfetto** uses the Chrome JSON Trace Event format in M0. It has one track per component. Each `mem.v0` transaction is an async slice from request to response. Timestamps are converted from ticks to microseconds with exact decimal formatting. This conversion is for display only; the canonical sink remains the source of truth.
+- **The source of truth is the canonical binary encoding**, not any text format:
+
+```text
+TraceHeader + TraceRecords
+        │ canonical binary encoding (§4.5)
+        ├─ BLAKE3 ─────────▶ TraceDigest
+        ├─ JSONL exporter ─▶ human-readable view, replay tooling
+        └─ Perfetto exporter ▶ timeline view
+```
+
+  Canonical encoding of a record, by the primitive rules of §4.5:
+
+  ```text
+  tick u64 · phase u8 · sequence u64      the EventKey of the event being handled
+  component u32
+  kind       string
+  fields     sequence of (name string, value)
+  value      u8 tag, then payload: 0 U64 u64 · 1 I64 i64 · 2 Bool u8 · 3 Str string · 4 Bytes bytes
+  ```
+
+  `TraceDigest` is BLAKE3 over the encoded header followed by every encoded record in emission order. JSON escaping, whitespace, field order, and serializer versions therefore never affect a digest. Exporters are views: two exporters may format the same trace differently, and the digest stays the same.
+- **Two exporters in M0:**
+  - **JSONL** writes one object per record with exact integer ticks. It is derived from the records and is not digested.
+  - **Perfetto** uses the Chrome JSON Trace Event format in M0. It has one track per component. Each `mem.v0` transaction is an async slice from request to response. Timestamps are converted from ticks to microseconds with exact decimal formatting. This conversion is for display only.
 
 ### 8.2 Observer
 
@@ -479,7 +500,7 @@ The clock mix is chosen on purpose. 3 GHz has a period that is not a whole numbe
 |---|---|
 | `StateDigest` | BLAKE3 of the encoded final `RuntimeSnapshot` |
 | `ExecutionDigest` | chained BLAKE3 over every dispatched event (§4.4) |
-| `TraceDigest` | BLAKE3 of the canonical JSONL trace, when tracing is on |
+| `TraceDigest` | BLAKE3 of the canonical binary trace (header, then records in emission order), when tracing is on (§8.1) |
 
 ### AT-1: Reproducibility
 
@@ -525,7 +546,7 @@ Golden files change only through `cargo xtask bless`. The commit that does so mu
 | Config | Observation |
 |---|---|
 | O0 | no observers, no sinks |
-| O1 | canonical JSONL sink and Perfetto sink |
+| O1 | canonical trace recorder with JSONL and Perfetto exporters |
 | O2 | breakpoint observer pausing on every `ReadResp`; the driver resumes immediately |
 | O3 | single-step, one event per `run` call, until the end |
 | O4 | `Observe` probe every 1,000 ticks, calling `inspect()` on every component |
@@ -566,7 +587,7 @@ These are not acceptance gates, but they are required for M0 exit.
 2. `Phase`, `EventKey`, the queue, and scheduling rules S1–S6.
 3. `Component`, `SimContext`, `PortSpec`, `Link`, and elaboration.
 4. The `mem.v0` protocol, `ToyMemory`, and one `ToyCpu`, reaching the first end-to-end run.
-5. Trace sinks: canonical JSONL, then Perfetto.
+5. Trace: canonical binary records and TraceDigest, then JSONL and Perfetto exporters.
 6. Snapshot/restore, `RuntimeSnapshot`, and the three digests.
 7. `ToyDma` and `ToyBus`, completing the full reference scenario.
 8. AT-1 to AT-3, the CI workflow, and the determinism lints.
