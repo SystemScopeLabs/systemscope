@@ -1,6 +1,7 @@
 //! Trace recording in the runtime (`docs/m0-design.md` §8.1): record placement, the
 //! header, dispatch-record fields, lifecycle rules, and exact JSONL integers.
 
+use systemscope_contracts::canonical::Decoder;
 use systemscope_contracts::component::{
     Component, ComponentId, Delivered, InitContext, PortId, PortSpec, Role, SimContext,
 };
@@ -100,13 +101,17 @@ impl Component for Responder {
 }
 
 fn build() -> Runtime {
+    build_with_latency(1)
+}
+
+fn build_with_latency(ns: u64) -> Runtime {
     let mut t = TopologyBuilder::new(SimulationClock::default());
     let r = t.add_component("req", Box::new(Requester));
     let s = t.add_component("resp", Box::new(Responder));
     t.connect(
         (r, "mem"),
         (s, "mem"),
-        Some(LinkLatency::After(Duration::from_ns(1))),
+        Some(LinkLatency::After(Duration::from_ns(ns))),
     );
     let config = SessionConfig {
         seed: 77,
@@ -116,7 +121,10 @@ fn build() -> Runtime {
 }
 
 fn traced_run() -> Trace {
-    let mut rt = build();
+    traced_run_of(build())
+}
+
+fn traced_run_of(mut rt: Runtime) -> Trace {
     rt.start_trace().unwrap();
     rt.init().unwrap();
     while rt.step().unwrap().is_some() {}
@@ -285,4 +293,38 @@ fn jsonl_keeps_64_bit_integers_exact() {
     assert_eq!(last["fields"][1][1]["i64"].as_i64(), Some(i64::MIN));
     // Written as integer literals, not floats or strings.
     assert!(jsonl.contains("\"tick\":18446744073709551615,"));
+}
+
+/// The `topology_hash` stored in a canonical trace stream: after the magic, the format
+/// version, `ticks_per_second`, the seed, and the contracts version.
+fn binary_topology_hash(bytes: &[u8]) -> [u8; 32] {
+    let mut d = Decoder::new(bytes);
+    d.raw(8 + 4 + 8 + 8).unwrap();
+    d.str().unwrap();
+    d.array().unwrap()
+}
+
+fn jsonl_topology_hash(trace: &Trace) -> String {
+    let jsonl = to_jsonl(trace);
+    let header: serde_json::Value = serde_json::from_str(jsonl.lines().next().unwrap()).unwrap();
+    header["topology_hash"].as_str().unwrap().to_owned()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[test]
+fn jsonl_and_binary_headers_name_the_same_topology() {
+    let trace = traced_run();
+    let binary = binary_topology_hash(&trace.canonical_bytes());
+    assert_eq!(binary, build().topology_hash());
+    assert_eq!(jsonl_topology_hash(&trace), hex(&binary));
+
+    // A different link latency is a different topology, and both views follow it.
+    let other = traced_run_of(build_with_latency(2));
+    let other_binary = binary_topology_hash(&other.canonical_bytes());
+    assert_ne!(other_binary, binary);
+    assert_eq!(other_binary, build_with_latency(2).topology_hash());
+    assert_eq!(jsonl_topology_hash(&other), hex(&other_binary));
 }

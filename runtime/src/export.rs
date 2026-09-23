@@ -103,7 +103,11 @@ pub fn to_jsonl(trace: &Trace) -> String {
         h.ticks_per_second, h.seed
     );
     json_str(&mut out, &h.contracts_version);
-    out.push_str(",\"clock_domains\":[");
+    let _ = write!(
+        out,
+        ",\"topology_hash\":\"{}\",\"clock_domains\":[",
+        hex(&h.topology_hash)
+    );
     for (i, d) in h.clock_domains.iter().enumerate() {
         if i > 0 {
             out.push(',');
