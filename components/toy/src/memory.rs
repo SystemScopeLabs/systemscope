@@ -1,4 +1,17 @@
 //! `ToyMemory`: an F1 byte-addressable memory with fixed read and write latency.
+//!
+//! # Ordering semantics
+//!
+//! | Point | When |
+//! |---|---|
+//! | request accepted | when the request event is dispatched, in `(tick, phase, sequence)` order |
+//! | write visible | at acceptance: every event dispatched afterwards sees it |
+//! | read sampled | at acceptance |
+//! | response emitted | acceptance + fixed latency, in `COMPLETE` |
+//!
+//! Memory order is therefore request dispatch order. When a response arrives has no
+//! effect on visibility: a read accepted after a write returns the written bytes even if
+//! its response is delivered before the write's.
 
 use systemscope_contracts::component::{
     Component, Delivered, InitContext, PortId, PortSpec, Role, SimContext,

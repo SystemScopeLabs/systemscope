@@ -8,6 +8,13 @@
 //!
 //! Every choice (operation, address, data, think time) comes from `ctx.rng()`. A read that
 //! disagrees with the shadow copy faults the session.
+//!
+//! # Shadow-copy correctness
+//!
+//! The shadow copy is updated when a write's response commits, not when it is issued. That
+//! is exact only because the CPU never has two operations to the same slot in flight: any
+//! read to a slot is issued after the previous write to it committed, so the memory
+//! accepted that write first (see `memory` ordering semantics).
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;

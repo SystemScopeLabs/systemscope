@@ -463,7 +463,8 @@ ToyDma  (clock "io",  1.5 GHz = 3_000_000_000/2) ──mem.v0──┘
 - **ToyCpu** issues a seeded stream of reads and writes, with at most 4 outstanding and random think-time in cycles. It checks read data against a shadow copy and folds the results into a checksum register in `Commit`.
 - **ToyDma** issues seeded write bursts.
 - **ToyBus** arbitrates its two initiator ports in `Transfer`. It is designed to hit same-tick collisions, so it exercises the phase and sequence ordering rules.
-- **ToyMemory** has fixed latencies, `After(50 ns)` for reads and `After(30 ns)` for writes, and responds in `Complete`.
+- **ToyMemory** has fixed latencies, `After(50 ns)` for reads and `After(30 ns)` for writes, and responds in `Complete`. Memory order is request dispatch order: a request is accepted when it is dispatched, writes become visible and reads are sampled at acceptance, and the response is emitted after the fixed latency. Response timing never affects visibility.
+- **ToyCpu's shadow check** updates the shadow copy when a write's response commits. This is exact because the CPU never has two operations to the same slot in flight.
 
 The clock mix is chosen on purpose. 3 GHz has a period that is not a whole number of ticks. 1.5 GHz exercises `freq_den ≠ 1`. `Duration`-based latency exercises cross-fidelity conversion.
 
