@@ -1,0 +1,17 @@
+[package]
+name = "systemscope-reference"
+description = "The SystemScope M0 reference scenario m0-reference"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+systemscope-contracts.workspace = true
+systemscope-runtime.workspace = true
+systemscope-toy.workspace = true
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true
