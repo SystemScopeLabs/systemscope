@@ -5,8 +5,21 @@
 
 use systemscope_contracts::rng::SimRng;
 
-/// BLAKE3 `derive_key` context for seeding. Changing it changes every stream.
+/// BLAKE3 `derive_key` context for seeding. Part of the contract: changing it changes
+/// every stream. Follows BLAKE3's recommended `[application] [date] [purpose]` form.
 pub const SEED_CONTEXT: &str = "SystemScope 2026-09 SimRng v1";
+
+/// The exact bytes fed to `derive_key`: `session_seed` as `u64` LE, then
+/// `component_path` as a `u32` LE byte length followed by its UTF-8 bytes.
+pub fn seed_material(session_seed: u64, component_path: &str) -> Vec<u8> {
+    let path = component_path.as_bytes();
+    let len = u32::try_from(path.len()).expect("component path shorter than 4 GiB");
+    let mut input = Vec::with_capacity(12 + path.len());
+    input.extend_from_slice(&session_seed.to_le_bytes());
+    input.extend_from_slice(&len.to_le_bytes());
+    input.extend_from_slice(path);
+    input
+}
 
 /// xoshiro256** (Blackman and Vigna), with a 256-bit state that is never all zero.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -20,13 +33,8 @@ impl Xoshiro256StarStar {
     /// Input to `derive_key` is `session_seed` as `u64` LE followed by `component_path`
     /// as a `u32` LE byte length and its UTF-8 bytes (canonical encoding, §4.5).
     pub fn for_component(session_seed: u64, component_path: &str) -> Xoshiro256StarStar {
-        let path = component_path.as_bytes();
-        let len = u32::try_from(path.len()).expect("component path shorter than 4 GiB");
-        let mut input = Vec::with_capacity(12 + path.len());
-        input.extend_from_slice(&session_seed.to_le_bytes());
-        input.extend_from_slice(&len.to_le_bytes());
-        input.extend_from_slice(path);
-        Xoshiro256StarStar::from_seed_bytes(blake3::derive_key(SEED_CONTEXT, &input))
+        let material = seed_material(session_seed, component_path);
+        Xoshiro256StarStar::from_seed_bytes(blake3::derive_key(SEED_CONTEXT, &material))
     }
 
     /// Builds a generator from 32 seed bytes read as four little-endian `u64`s.
@@ -119,6 +127,27 @@ mod tests {
             assert_eq!(a.next_u64(), b.next_u64());
         }
     }
+
+    #[test]
+    fn seed_context_and_material_are_pinned() {
+        assert_eq!(SEED_CONTEXT, "SystemScope 2026-09 SimRng v1");
+        let material = seed_material(0x0102_0304_0506_0708, "soc.cpu0");
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // session_seed, u64 LE
+            0x08, 0x00, 0x00, 0x00,                         // path length, u32 LE
+            b's', b'o', b'c', b'.', b'c', b'p', b'u', b'0', // path, UTF-8
+        ];
+        assert_eq!(material, expected);
+        let key = blake3::derive_key(SEED_CONTEXT, &material);
+        assert_eq!(key, GOLDEN_KEY);
+    }
+
+    const GOLDEN_KEY: [u8; 32] = [
+        0x02, 0x14, 0x57, 0x28, 0x3a, 0x60, 0x31, 0x89, 0xef, 0xf9, 0x73, 0xcf, 0x59, 0xa2, 0x02,
+        0x62, 0xf3, 0xf3, 0x07, 0xf1, 0x14, 0x6d, 0xa9, 0x6f, 0xf4, 0x79, 0x2e, 0x3a, 0xc3, 0xc4,
+        0xd8, 0x5a,
+    ];
 
     #[test]
     fn seed_derivation_is_pinned() {

@@ -325,13 +325,14 @@ fn rng(&mut self) -> &mut dyn SimRng;
 | Generator | xoshiro256\*\* (Blackman and Vigna), 256-bit state `s[0..4]`, output `rotl(s[1] × 5, 7) × 9` |
 | Seed derivation | `blake3::derive_key("SystemScope 2026-09 SimRng v1", session_seed as u64 LE ‖ component_path as u32 length + UTF-8)`; the 32 bytes become `s[0..4]` as little-endian `u64`s. Rust's `Hash`/`DefaultHasher` is never used. |
 | All-zero state | Invalid for xoshiro. A derived all-zero key is replaced by `s = [1, 0, 0, 0]`; a snapshot holding an all-zero state is rejected. |
-| `below(n)` | Rejection sampling: `t = n.wrapping_neg() % n`; draw `x` until `x ≥ t`; return `x % n`. Exactly as written, so the number of draws consumed is part of the contract. |
+| `below(n)` | Rejection sampling: `t = n.wrapping_neg() % n`; draw `x` until `x ≥ t`; return `x % n`. Exactly as written, so the number of draws consumed is part of the contract. `n = 0` is unrepresentable (`NonZeroU64`); `n = 1` returns 0 and consumes one draw; `n = u64::MAX` rejects only the draw `0`. |
+| `chance(num, den)` | `below(den) < num`. Consumes exactly the draws of `below(den)` even when the result is certain (`num = 0` or `num ≥ den`). |
 | Ownership | The runtime stores one state per `ComponentId`. Components never store or copy RNG state. |
 | Independence | Each component has its own stream. Draws by one component never change another component's values. |
 | Availability | `InitContext` and `SimContext` only. Observers get no RNG. |
 | Snapshot | The runtime snapshot contains every component's 256-bit state. After restore, the next draw of every component equals the draw the uninterrupted run would have made. |
 
-Changing any rule in this table changes every digest and requires a new context string and a golden re-bless.
+The context string is part of the contract; it follows BLAKE3's recommended `[application] [date] [purpose]` form. Golden tests pin the context string, the exact seed-material bytes, the derived key, and the first draws. Changing any rule in this table changes every digest and requires a new context string and a golden re-bless.
 
 ---
 
