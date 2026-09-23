@@ -45,8 +45,8 @@ contracts/                        (repo: SystemScope/contracts)
    ├─ topology.rs    LinkLatency
    ├─ protocol/      ProtocolId, closed Message enum
    │  └─ mem.rs      mem.v0 messages
-   ├─ snapshot.rs    SnapshotWriter/Reader, schema versioning
-   ├─ canonical.rs   Encoder: §4.5 primitive rules
+   ├─ snapshot.rs    SnapshotWriter/Reader, RestoreError
+   ├─ canonical.rs   Encoder/Decoder (§4.5 primitive rules), canonical(ev)
    └─ trace.rs       TraceRecord, Value, TraceHeader, stream encoding (Observer, WorldView later)
 
 systemscope/                      (repo: SystemScope/systemscope, this repository)
@@ -205,7 +205,7 @@ loop:
         run observers' on_observe (read-only)
 ```
 
-`H` is BLAKE3. The 32-byte `execution_digest` is simulation state and is included in snapshots. `canonical(ev)` is defined in §4.5.
+`H` is BLAKE3. The 32-byte `execution_digest` starts as 32 zero bytes and absorbs each event before its handler runs. It is simulation state and is included in snapshots. `canonical(ev)` is defined in §4.5.
 
 ### 4.5 Canonical Encoding
 
@@ -222,6 +222,8 @@ loop:
 | enums | `u8` variant tag in declaration order, then the variant's fields |
 | structs | fields in declaration order, with no padding and no field names |
 | sequences | `u32` element count, then each element |
+| `Option<T>` | `u8` tag: `0` none, or `1` then `T` |
+| fixed-size arrays (`[u8; 32]` digests) | the elements, with no count |
 
 **`canonical(ev)`** is the concatenation of:
 
@@ -238,6 +240,8 @@ Wake:     token u64
 
 For example, `MemMsg::ReadReq { txn, addr, len }` encodes as tag `0`, then `txn` as `u64`, `addr` as `u64`, and `len` as `u32`.
 
+**Decoding is strict.** A decoder accepts exactly the bytes an encoder can produce: it rejects truncated input, trailing bytes, unknown enum tags and phases, `bool`s other than `0`/`1`, invalid UTF-8, and unknown protocol names or versions. Every encoded value therefore has exactly one decoding.
+
 Any change to this encoding, or to a protocol message's field layout, changes every digest. It therefore requires a bump of the protocol version or of `format_version`, and a golden re-bless.
 
 ---
@@ -252,10 +256,10 @@ pub trait Component {
     fn handle_event(&mut self, ev: &Delivered, ctx: &mut dyn SimContext) -> Result<(), SimError>;
 
     fn snapshot_schema_version(&self) -> u32;
-    fn snapshot(&self, w: &mut SnapshotWriter) -> Result<(), SimError>;
+    fn snapshot(&self, w: &mut SnapshotWriter);
     fn restore(&mut self, r: &mut SnapshotReader, schema_version: u32) -> Result<(), RestoreError>;
 
-    fn inspect(&self) -> StateView;   // read-only view for observers and the State Inspector
+    fn inspect(&self) -> StateView;   // read-only view for observers and the State Inspector (with observers)
 }
 
 pub enum Delivered {
@@ -293,14 +297,15 @@ Restored session: build topology → elaborate → restore                  → 
 Any error (elaboration, init, handler, scheduler)                        → Faulted
 ```
 
-| State | `init` | `run` / `step` | `snapshot` | `inspect` |
+| State | `init` / `restore` | `run` / `step` | `snapshot` | `inspect` |
 |---|---|---|---|---|
-| `Elaborated` | once | no | no | yes |
+| `Elaborated` | once, either one | no | no | yes |
 | `Ready` | no | yes | yes | yes |
 | `Faulted` | no | no | no | yes |
 
 - **Initialization order is fixed.** Components are initialized in `ComponentId` order, one at a time. Initial events therefore receive deterministic sequence numbers.
 - **Restore never calls `init`.** Initial events already live in the restored queue. Calling `init` again would duplicate them and shift every later sequence number, breaking replay.
+- **A failed restore faults the session.** Components may already hold part of the snapshot, so the runtime is not reused; build a new one.
 - **`Faulted` is terminal.** It records the error that caused it. `run` and `step` are refused, and `snapshot` is refused because a snapshot must be a resumable checkpoint. `inspect()` stays available for post-mortem diagnosis: it may show partially applied effects, which is why the state is never resumed.
   - An init failure faults the session even though earlier components already initialized. Handler failures work the same way.
   - A post-mortem `fault_dump()` that is explicitly *not* resumable may be added later. It is out of scope for M0.
@@ -350,7 +355,8 @@ A `TopologySpec` is an **ordered** list of component declarations followed by an
 - **Construction must be deterministic.** It must not be built by iterating a `HashMap`/`HashSet`, a directory listing, environment variables, or anything else whose order is not defined by the code or input file itself.
 - **Declaration order is part of the topology's identity.** Reordering components or links produces a different `topology_hash`, even if the resulting graph is the same.
 - `component_path`s must be unique. A duplicate is an elaboration error.
-- `topology_hash` is BLAKE3 over the canonical encoding (§4.5) of the ordered spec: each component's `component_path`, `type_name`, and ports, then each link.
+- `topology_hash` is BLAKE3 over the canonical encoding (§4.5) of the ordered spec: the `components` sequence, then the `links` sequence, byte for byte as they appear in the trace header (§8.1).
+- **`topology_hash` identifies structure only:** components, ports, and links. Clock domains, the tick resolution, the seed, and scheduler limits are session settings; restore checks them one by one through `SessionInfo` (§7). Component parameters, such as a CPU's operation count, are in neither; a component that depends on them writes them into its own snapshot and rejects a mismatch.
 
 Elaboration runs once before `init` and validates the topology:
 
@@ -373,7 +379,7 @@ pub enum MemMsg {
 }
 ```
 
-Each initiator allocates `TxnId`s from its own counter, so they are deterministic and part of its snapshot.
+Each initiator allocates `TxnId`s from its own counter, so they are deterministic and part of its snapshot. `TxnId`s are unique per initiator only. An interconnect that merges several initiators onto one port must allocate its own downstream `TxnId`s and map each back to `(upstream port, original TxnId)` to route the response; that map is part of the interconnect's snapshot (ToyBus, §9.1).
 
 ---
 
@@ -382,7 +388,7 @@ Each initiator allocates `TxnId`s from its own counter, so they are deterministi
 ```rust
 pub struct RuntimeSnapshot {
     format_version: u32,
-    session: SessionInfo,          // seed, ticks_per_second, clock domains, topology_hash, contracts version
+    session: SessionInfo,          // seed, ticks_per_second, max_events_per_phase, contracts version, clock domains, topology_hash
     last_dispatched: Option<EventKey>,    // now and current phase derive from it
     dispatched_in_phase: u64,             // S5 count within last_dispatched's (tick, phase)
     next_sequence: u64,
@@ -396,11 +402,33 @@ pub struct RuntimeSnapshot {
 - **Snapshots may be taken at any event boundary**, including mid-tick between phases. `last_dispatched` and `dispatched_in_phase` record exactly where the run was, including S5 progress.
 - **The queue is exported sorted by key and may be restored in any order.** Keys are unique, so dispatch order never depends on queue internals.
 - **Restore rejects scheduler states no valid run could produce:** duplicate sequences, sequences not below `next_sequence`, pending events at or before `last_dispatched`, pending `Observe` events, or a `dispatched_in_phase` inconsistent with `last_dispatched` or the S5 limit.
-- **`max_events_per_phase` is session configuration**, not snapshot state.
+- **`max_events_per_phase` is session configuration**, not execution state. It is recorded in `SessionInfo` only so that restore can check the resuming session uses the same limit.
 - **Encoding is canonical and follows the primitive rules of §4.5.** The same logical state always produces the same bytes. That rules out `HashMap` iteration, floats, and pointer-dependent ordering. Maps are `BTreeMap` or sorted `Vec`s.
-- **Restore requires the same `topology_hash` and, for every component, the same `snapshot_schema_version`.** Otherwise it fails with `RestoreError::TopologyMismatch` or `RestoreError::SchemaVersion`. Migrations are out of scope for M0.
+
+  ```text
+  magic                8 bytes  "SSSNAP" followed by two 0x00
+  format_version       u32      currently 1
+  session              seed u64 · ticks_per_second u64 · max_events_per_phase u64 · contracts_version string
+                       · clock domains (as in the trace header) · topology_hash [u8; 32]
+  last_dispatched      Option<tick u64 · phase u8 · sequence u64>
+  dispatched_in_phase  u64
+  next_sequence        u64
+  execution_digest     [u8; 32]
+  queue                sequence of canonical(ev) (§4.5), sorted by key
+  rng_states           sequence of 4 × u64
+  components           sequence of (id u32 · schema_version u32 · bytes), in ComponentId order
+  ```
+
+- **Restore validates before it resumes**, in this order, and fails with the first error:
+  1. The bytes decode strictly (§4.5), with the expected magic and `format_version`.
+  2. **Every `SessionInfo` field matches the new session:** seed, `ticks_per_second`, `max_events_per_phase`, contracts version, and every clock domain's id, frequency, offset, and rounding. Otherwise `RestoreError::SessionMismatch(field)`.
+  3. `topology_hash` matches. Otherwise `RestoreError::TopologyMismatch`.
+  4. Every component's `snapshot_schema_version` matches. Otherwise `RestoreError::SchemaVersion`. Migrations are out of scope for M0.
+  5. The state is one a valid run could produce: one RNG state and one component entry per component, in id order, with no all-zero RNG state; queued events name existing components and ports, speak the port's protocol, and wake only their own source; and the scheduler checks above hold. Otherwise `RestoreError::InvalidState`.
+  6. Each component restores from its own bytes and must consume all of them.
 - **Observer state and pending observe points are not simulation state.** They are never included in snapshots or digests.
 - **`StateDigest = BLAKE3(encode(RuntimeSnapshot))`.**
+- **Snapshots never contain trace state.** A traced and an untraced run produce identical snapshot bytes at the same event boundary. A trace continues across a restore from outside the snapshot (§8.1).
 - **Round-trip law:** `encode(restore(decode(encode(s)))) == encode(s)`.
 
 ---
@@ -432,7 +460,22 @@ fn trace(&mut self, kind: &'static str, fields: Vec<(&'static str, Value)>);
   |---|---|
   | message | `source` U64 · `port` U64 · `protocol` Str · `version` U64 · `msg` Str (variant name), then the message's fields in declaration order (`txn`, `addr`, `len` as U64; `data` as Bytes) |
   | wake | `source` U64 · `token` U64 |
-- **Tracing starts before `init`.** Only then does the trace hold the header and every record from the first event on. It cannot be started later in M0.
+- **Tracing starts before `init`, or resumes right after `restore`.** Either way the trace holds the header and every record from the start of the session. It cannot be started at any other time in M0.
+- **A trace continues across a restore by carrying its prefix outside the snapshot:**
+
+  ```text
+  old runtime:  snapshot() → bytes        take_trace() → prefix (header + records, no trailer)
+                drop the old runtime
+  new runtime:  elaborate → restore(bytes) → resume_trace(prefix) → run → take_trace()
+  result:       one header, the prefix records, then the new records, one trailer
+  ```
+
+  A BLAKE3 digest cannot be extended from its output, so the prefix is kept as records, not as a digest. It is a `Trace` value, never encoded bytes, so no trailer is ever carried over. `resume_trace` is accepted only on a freshly restored runtime, before its first step, and only if the prefix belongs to the snapshot:
+  - its header equals the new session's header;
+  - its records are well formed: `Init` records come before the first `runtime.dispatch`, and every other component record carries the key of the dispatch before it;
+  - **replaying `canonical(ev)` of its `runtime.dispatch` records from 32 zero bytes reproduces the snapshot's `execution_digest`**, and its last dispatch key equals `last_dispatched`. A snapshot taken before the first event requires a prefix with no dispatch records.
+
+  Two runs can share a header and still differ, for example when a component is configured differently. The digest check binds the prefix to the exact event history the snapshot came from, so M0 needs no separate checkpoint manifest.
 - **Trace state is not simulation state.** The recorder lives outside the scheduler, the RNGs, and the components. It is never snapshotted and never read by the simulation.
 - **The source of truth is the canonical binary encoding**, not any text format:
 
@@ -448,7 +491,7 @@ TraceHeader + TraceRecords
 
   ```text
   magic           8 bytes  "SSTRACE" followed by 0x00
-  format_version  u32      currently 1
+  format_version  u32      currently 2
   header
   record*         each: u8 0x01 marker, then the record
   end             u8 0x00, then record count as u64
@@ -460,6 +503,7 @@ TraceHeader + TraceRecords
   ticks_per_second  u64
   seed              u64
   contracts_version string
+  topology_hash     [u8; 32] (§6)
   clock domains     sequence of (id u32 · freq num u64 · freq den u64 · offset u64 · rounding u8: 0 Floor, 1 Ceil)
   components        sequence of (path string · type_name string · ports: sequence of (name string · protocol name string · protocol version u16 · role u8: 0 Initiator, 1 Target))
   links             sequence of (a component u32 · a port u16 · b component u32 · b port u16 · latency), in declaration order
@@ -481,7 +525,7 @@ TraceHeader + TraceRecords
 
   `TraceDigest` is BLAKE3 over the whole stream. JSON escaping, whitespace, field order, and serializer versions therefore never affect a digest. Exporters are views: two exporters may format the same trace differently, and the digest stays the same.
 
-  **Any change to this layout, the header, the record encoding, value tags, or the `runtime.dispatch` fields bumps `format_version`** and requires a golden re-bless.
+  **Any change to this layout, the header, the record encoding, value tags, or the `runtime.dispatch` fields bumps `format_version`** and requires a golden re-bless. Version 2 added `topology_hash` to the header.
 - **Two exporters in M0:**
   - **JSONL:** the first line is the header and each later line is one record. Ticks and integers are written as exact JSON integers, and bytes as lowercase hex strings. It is derived from the records and is not digested. JSON numbers above 2^53 need a 64-bit integer reader.
   - **Perfetto:** Chrome JSON Trace Event format. Each component is its own process and thread, both with `pid = tid = ComponentId + 1` and named by `component_path`; id 0 is avoided because Perfetto treats it specially. Every record becomes an instant event on its component's thread, with its fields as `args`. Each `mem.v0` transaction becomes a process-scoped async slice (`id2.local = "initiator:txn"`) in the initiator's process, from the request's dispatch to the response's dispatch. Global async ids are not used, because Perfetto groups them apart from any component.
@@ -565,6 +609,7 @@ Golden files change only through `cargo xtask bless`. The commit that does so mu
 
 1. **Reference run.** Run uninterrupted to the end and record the digests as `D`.
 2. **Checkpoint runs.** The checkpoints are:
+   - right after `init`, before the first event
    - the first event
    - a tick boundary
    - **mid-tick between `Complete` and `Commit`**
@@ -581,10 +626,10 @@ Golden files change only through `cargo xtask bless`. The commit that does so mu
    5. Decode and restore the snapshot.
    6. Run to the end.
 
-   `StateDigest` and `ExecutionDigest` must equal `D`. The trace prefix plus the resumed suffix must equal the reference `TraceDigest`.
+   `StateDigest` and `ExecutionDigest` must equal `D`. The trace prefix, taken from the dropped runtime and resumed on the new one (§8.1), together with the resumed suffix must equal the reference `TraceDigest`.
 3. **Round-trip law.** At every checkpoint, check that `encode(restore(decode(bytes))) == bytes`.
 4. **Portability.** `tests/golden/m0-reference.mid.snap` is a committed snapshot. Restoring it and running to the end must match the golden digests on both CI operating systems.
-5. **Negative cases.** A changed `snapshot_schema_version` must fail with `RestoreError::SchemaVersion`. A changed topology must fail with `RestoreError::TopologyMismatch`.
+5. **Negative cases.** A changed `snapshot_schema_version` must fail with `RestoreError::SchemaVersion`. A changed topology must fail with `RestoreError::TopologyMismatch`. Each changed `SessionInfo` field must fail with `RestoreError::SessionMismatch` naming it. `resume_trace` must reject a prefix from a differently configured run, a truncated or extended prefix, and any call after the first step.
 
 ### AT-3: Observation Invariance
 
