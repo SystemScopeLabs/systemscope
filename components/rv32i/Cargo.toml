@@ -5,9 +5,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
-# Decode and the register file are pure: they depend on nothing in the simulation.
-# The CPU component will depend only on contracts (docs/m1-design.md §3).
+# Decode, the register file, and execution are pure: they use contracts only for the
+# mem.v1 response types. The CPU component will depend only on contracts
+# (docs/m1-design.md §3).
 [dependencies]
+systemscope-contracts.workspace = true
 
 [dev-dependencies]
 proptest = "1"

@@ -6,6 +6,8 @@
 //! instruction retires.
 //!
 //! Each instruction family has its own function: [`execute_alu`] and [`execute_control`].
+//! Loads and stores need a memory response in between, so their semantics are split in
+//! two halves in [`memory`](crate::memory).
 
 use crate::instr::{BranchOp, ImmOp, Instr, Reg, RegOp, ShiftOp};
 
@@ -51,6 +53,19 @@ pub enum TrapCause {
     /// A taken branch, `JAL`, or `JALR` whose target is not 4-byte aligned. `tval` is the
     /// target.
     InstructionAddressMisaligned,
+    /// A halfword or word load whose effective address is not naturally aligned. Raised
+    /// before any request is sent. `tval` is the effective address.
+    LoadAddressMisaligned,
+    /// A load the memory system answered with `AccessFault`. `tval` is the effective
+    /// address.
+    LoadAccessFault,
+    /// A halfword or word store whose effective address is not naturally aligned. Raised
+    /// before any request is sent, so memory is never written. `tval` is the effective
+    /// address.
+    StoreAddressMisaligned,
+    /// A store the memory system answered with `AccessFault`. `tval` is the effective
+    /// address.
+    StoreAccessFault,
 }
 
 /// The result of executing an instruction that may trap.

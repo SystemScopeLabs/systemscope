@@ -476,6 +476,7 @@ name = "systemscope-rv32i"
 version = "0.0.0"
 dependencies = [
  "proptest",
+ "systemscope-contracts",
 ]
 
 [[package]]
