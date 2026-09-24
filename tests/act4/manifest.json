@@ -35,7 +35,7 @@
   ],
   "ram": { "base": "0x80000000", "size": "0x01000000" },
   "inputs": [
-    { "path": "tests/act4/build-act4.sh", "blake3": "28659a254c83e116dff69898e6e548102ac47be6b17d9b6f02b6e0c0135feed4" },
+    { "path": "tests/act4/build-act4.sh", "blake3": "fdb73de5cec8c32a3b1d4af2eeed9f359a9a102c4b644ab34bbafafa5afe956b" },
     { "path": "tests/act4/config/systemscope-rv32i/link.ld", "blake3": "3615d26d98e3a4fffc23c64a34fc0f15894044a3a37890fb289a23d7bdbc46d2" },
     { "path": "tests/act4/config/systemscope-rv32i/rvmodel_macros.h", "blake3": "6112702b44df83e91979899996b81b5f9edd56fecb0483b5d674927cbad56f45" },
     { "path": "tests/act4/config/systemscope-rv32i/sail.json", "blake3": "b89fcddba18b2cc4930110df0171886bc2d4b1b671ff7033b3490c2803520ed7" },

@@ -161,6 +161,11 @@ cd "$CANON/act4"
 # Only the tools ACT4 runs: Ruby with Bundler for UDB, and uv for the Python framework.
 mise install ruby uv gem:bundler >"$CANON/mise-install.log" 2>&1 ||
     { tail -n 30 "$CANON/mise-install.log"; die "mise install failed"; }
+# ACT4's .mise.toml auto-installs the locked gems ([deps.bundler]) on the first `mise
+# exec`, which prints to stdout; run it here, into a log, so the version lines below are
+# the tools' own.
+mise exec -- true >"$CANON/mise-deps.log" 2>&1 ||
+    { tail -n 30 "$CANON/mise-deps.log"; die "mise dependency install failed"; }
 ruby_version=$(first_line mise exec -- ruby --version)
 case "$ruby_version" in "$RUBY_VERSION_PREFIX"*) ;; *) die "ruby says $ruby_version" ;; esac
 uv_version=$(first_line mise exec -- uv --version)
