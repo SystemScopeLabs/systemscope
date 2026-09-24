@@ -287,6 +287,12 @@ impl Component for ToyCpu {
                 return Err(SimError::ComponentFault("toy cpu: mem.v1 message"));
             }
             Delivered::Message {
+                msg: Message::Irq(_) | Message::Block(_),
+                ..
+            } => {
+                return Err(SimError::ComponentFault("toy cpu: non-mem message"));
+            }
+            Delivered::Message {
                 msg: Message::Mem(msg),
                 ..
             } => {

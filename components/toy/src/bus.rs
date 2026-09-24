@@ -249,6 +249,12 @@ impl Component for ToyBus {
                 return Err(SimError::ComponentFault("toy bus: mem.v1 message"));
             }
             Delivered::Message {
+                msg: Message::Irq(_) | Message::Block(_),
+                ..
+            } => {
+                return Err(SimError::ComponentFault("toy bus: non-mem message"));
+            }
+            Delivered::Message {
                 port,
                 msg: Message::Mem(msg),
             } => {

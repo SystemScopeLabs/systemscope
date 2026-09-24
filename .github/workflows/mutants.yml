@@ -29,7 +29,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: SystemScopeLabs/contracts
-          ref: 4d6e912a7ccffb676d0f95ff523c553fe3048c47
+          ref: 90900a128d51f6b42e86dc789447882c90c52ef4
           path: contracts
       - name: Install pinned toolchain
         run: rustup toolchain install

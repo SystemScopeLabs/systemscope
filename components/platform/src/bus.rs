@@ -366,6 +366,10 @@ impl Component for AddressBus {
                 msg: Message::Mem(_),
                 ..
             } => Err(SimError::ComponentFault("address bus: mem.v0 message")),
+            Delivered::Message {
+                msg: Message::Irq(_) | Message::Block(_),
+                ..
+            } => Err(SimError::ComponentFault("address bus: non-mem message")),
             Delivered::Wake { .. } => Err(SimError::ComponentFault("address bus: unexpected wake")),
         }
     }

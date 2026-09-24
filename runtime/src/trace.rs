@@ -9,9 +9,13 @@ use std::fmt;
 use systemscope_contracts::canonical::CanonicalEvent;
 use systemscope_contracts::component::{ComponentId, Delivered, PortId};
 use systemscope_contracts::event::EventKey;
-use systemscope_contracts::protocol::Message;
+use systemscope_contracts::protocol::block_v0::{
+    self, BlockMsg, BlockReadOutcome, BlockWriteOutcome, MediaError,
+};
+use systemscope_contracts::protocol::irq_v0::{self, IrqMsg};
 use systemscope_contracts::protocol::mem::{MemMsg, TxnId};
 use systemscope_contracts::protocol::mem_v1::{self, MemFault, ReadOutcome, WriteOutcome};
+use systemscope_contracts::protocol::{Message, ProtocolId};
 use systemscope_contracts::trace::{
     DISPATCH_KIND, TraceAt, TraceHeader, TraceOrigin, TraceRecord, Value, encode_stream,
 };
@@ -71,6 +75,8 @@ fn message_fields(msg: &Message, fields: &mut Vec<(&'static str, Value)>) {
     let mem = match msg {
         Message::Mem(mem) => mem,
         Message::MemV1(mem) => return mem_v1_fields(mem, fields),
+        Message::Irq(irq) => return irq_v0_fields(irq, fields),
+        Message::Block(block) => return block_v0_fields(block, fields),
     };
     let txn = |t: &systemscope_contracts::protocol::mem::TxnId| Value::U64(t.0);
     match mem {
@@ -141,6 +147,63 @@ fn mem_v1_fields(msg: &mem_v1::MemMsg, fields: &mut Vec<(&'static str, Value)>) 
     }
 }
 
+/// The `irq.v0` fields (`docs/m2-design.md` §7.1).
+fn irq_v0_fields(msg: &IrqMsg, fields: &mut Vec<(&'static str, Value)>) {
+    match msg {
+        IrqMsg::Level { asserted } => fields.extend([
+            ("msg", Value::Str("Level".into())),
+            ("asserted", Value::Bool(*asserted)),
+        ]),
+    }
+}
+
+/// The `block.v0` fields, with an outcome flattened into `outcome` (its variant name)
+/// followed by that variant's field, as for `mem.v1`.
+fn block_v0_fields(msg: &BlockMsg, fields: &mut Vec<(&'static str, Value)>) {
+    let name = |s: &str| Value::Str(s.into());
+    let error = |e: &MediaError| {
+        let e = match e {
+            MediaError::OutOfRange => "OutOfRange",
+            MediaError::BadBlock => "BadBlock",
+        };
+        ("error", name(e))
+    };
+    match msg {
+        BlockMsg::ReadBlock { txn, lba } => fields.extend([
+            ("msg", name("ReadBlock")),
+            ("txn", Value::U64(txn.0)),
+            ("lba", Value::U64(*lba)),
+        ]),
+        BlockMsg::WriteBlock { txn, lba, data } => fields.extend([
+            ("msg", name("WriteBlock")),
+            ("txn", Value::U64(txn.0)),
+            ("lba", Value::U64(*lba)),
+            ("data", Value::Bytes(data.clone())),
+        ]),
+        BlockMsg::ReadResult { txn, outcome } => {
+            fields.extend([("msg", name("ReadResult")), ("txn", Value::U64(txn.0))]);
+            match outcome {
+                BlockReadOutcome::Data { data } => fields.extend([
+                    ("outcome", name("Data")),
+                    ("data", Value::Bytes(data.clone())),
+                ]),
+                BlockReadOutcome::Error { error: e } => {
+                    fields.extend([("outcome", name("Error")), error(e)])
+                }
+            }
+        }
+        BlockMsg::WriteResult { txn, outcome } => {
+            fields.extend([("msg", name("WriteResult")), ("txn", Value::U64(txn.0))]);
+            match outcome {
+                BlockWriteOutcome::Done => fields.push(("outcome", name("Done"))),
+                BlockWriteOutcome::Error { error: e } => {
+                    fields.extend([("outcome", name("Error")), error(e)])
+                }
+            }
+        }
+    }
+}
+
 /// Why a trace prefix was not accepted by `resume_trace` (§8.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResumeError {
@@ -202,68 +265,116 @@ pub(crate) fn dispatched_event(r: &TraceRecord) -> Option<CanonicalEvent> {
         let Some(Value::Str(msg)) = get(4, "msg") else {
             return None;
         };
-        let txn = TxnId(int(5, "txn")?);
         let str_at = |i, name| match get(i, name) {
             Some(Value::Str(v)) => Some(v.as_str()),
             _ => None,
         };
-        let msg = match int(3, "version")? {
-            0 => Message::Mem(match msg.as_str() {
-                "ReadReq" => MemMsg::ReadReq {
-                    txn,
-                    addr: int(6, "addr")?,
-                    len: u32::try_from(int(7, "len")?).ok()?,
+        let (name, version) = (str_at(2, "protocol")?, int(3, "version")?);
+        let is = |p: ProtocolId| name == p.name && version == u64::from(p.version);
+        let msg = if is(irq_v0::PROTOCOL) {
+            Message::Irq(match (msg.as_str(), get(5, "asserted")?) {
+                ("Level", Value::Bool(asserted)) => IrqMsg::Level {
+                    asserted: *asserted,
                 },
-                "ReadResp" => MemMsg::ReadResp {
+                _ => return None,
+            })
+        } else if is(block_v0::PROTOCOL) {
+            let txn = TxnId(int(5, "txn")?);
+            let error = || match str_at(7, "error")? {
+                "OutOfRange" => Some(MediaError::OutOfRange),
+                "BadBlock" => Some(MediaError::BadBlock),
+                _ => None,
+            };
+            Message::Block(match msg.as_str() {
+                "ReadBlock" => BlockMsg::ReadBlock {
                     txn,
-                    data: bytes(6, "data")?,
+                    lba: int(6, "lba")?,
                 },
-                "WriteReq" => MemMsg::WriteReq {
+                "WriteBlock" => BlockMsg::WriteBlock {
                     txn,
-                    addr: int(6, "addr")?,
+                    lba: int(6, "lba")?,
                     data: bytes(7, "data")?,
                 },
-                "WriteResp" => MemMsg::WriteResp { txn },
+                "ReadResult" => BlockMsg::ReadResult {
+                    txn,
+                    outcome: match str_at(6, "outcome")? {
+                        "Data" => BlockReadOutcome::Data {
+                            data: bytes(7, "data")?,
+                        },
+                        "Error" => BlockReadOutcome::Error { error: error()? },
+                        _ => return None,
+                    },
+                },
+                "WriteResult" => BlockMsg::WriteResult {
+                    txn,
+                    outcome: match str_at(6, "outcome")? {
+                        "Done" => BlockWriteOutcome::Done,
+                        "Error" => BlockWriteOutcome::Error { error: error()? },
+                        _ => return None,
+                    },
+                },
                 _ => return None,
-            }),
-            1 => {
-                let fault = || match str_at(7, "fault")? {
-                    "AccessFault" => Some(MemFault::AccessFault),
-                    _ => None,
-                };
-                Message::MemV1(match msg.as_str() {
-                    "ReadReq" => mem_v1::MemMsg::ReadReq {
+            })
+        } else {
+            let txn = TxnId(int(5, "txn")?);
+            match version {
+                0 => Message::Mem(match msg.as_str() {
+                    "ReadReq" => MemMsg::ReadReq {
                         txn,
                         addr: int(6, "addr")?,
                         len: u32::try_from(int(7, "len")?).ok()?,
                     },
-                    "ReadResp" => mem_v1::MemMsg::ReadResp {
+                    "ReadResp" => MemMsg::ReadResp {
                         txn,
-                        outcome: match str_at(6, "outcome")? {
-                            "Data" => ReadOutcome::Data {
-                                data: bytes(7, "data")?,
-                            },
-                            "Fault" => ReadOutcome::Fault { fault: fault()? },
-                            _ => return None,
-                        },
+                        data: bytes(6, "data")?,
                     },
-                    "WriteReq" => mem_v1::MemMsg::WriteReq {
+                    "WriteReq" => MemMsg::WriteReq {
                         txn,
                         addr: int(6, "addr")?,
                         data: bytes(7, "data")?,
                     },
-                    "WriteResp" => mem_v1::MemMsg::WriteResp {
-                        txn,
-                        outcome: match str_at(6, "outcome")? {
-                            "Done" => WriteOutcome::Done,
-                            "Fault" => WriteOutcome::Fault { fault: fault()? },
-                            _ => return None,
-                        },
-                    },
+                    "WriteResp" => MemMsg::WriteResp { txn },
                     _ => return None,
-                })
+                }),
+                1 => {
+                    let fault = || match str_at(7, "fault")? {
+                        "AccessFault" => Some(MemFault::AccessFault),
+                        _ => None,
+                    };
+                    Message::MemV1(match msg.as_str() {
+                        "ReadReq" => mem_v1::MemMsg::ReadReq {
+                            txn,
+                            addr: int(6, "addr")?,
+                            len: u32::try_from(int(7, "len")?).ok()?,
+                        },
+                        "ReadResp" => mem_v1::MemMsg::ReadResp {
+                            txn,
+                            outcome: match str_at(6, "outcome")? {
+                                "Data" => ReadOutcome::Data {
+                                    data: bytes(7, "data")?,
+                                },
+                                "Fault" => ReadOutcome::Fault { fault: fault()? },
+                                _ => return None,
+                            },
+                        },
+                        "WriteReq" => mem_v1::MemMsg::WriteReq {
+                            txn,
+                            addr: int(6, "addr")?,
+                            data: bytes(7, "data")?,
+                        },
+                        "WriteResp" => mem_v1::MemMsg::WriteResp {
+                            txn,
+                            outcome: match str_at(6, "outcome")? {
+                                "Done" => WriteOutcome::Done,
+                                "Fault" => WriteOutcome::Fault { fault: fault()? },
+                                _ => return None,
+                            },
+                        },
+                        _ => return None,
+                    })
+                }
+                _ => return None,
             }
-            _ => return None,
         };
         Delivered::Message { port, msg }
     };
@@ -490,5 +601,167 @@ mod tests {
         );
         assert!(dispatched_event(&v0).is_some());
         assert_eq!(replace(&v0, 3, Value::U64(1)), None);
+    }
+
+    fn m2_record(msg: Message) -> TraceRecord {
+        let delivery = Delivered::Message {
+            port: PortId(2),
+            msg,
+        };
+        dispatch_record(at(), ComponentId(1), ComponentId(0), &delivery)
+    }
+
+    /// Every `irq.v0` and `block.v0` variant, outcome, and error, with the fields its
+    /// dispatch record carries after `source` and `port`.
+    fn m2_cases() -> Vec<(Message, Vec<(&'static str, Value)>)> {
+        let irq = |asserted| {
+            (
+                Message::Irq(IrqMsg::Level { asserted }),
+                vec![
+                    ("protocol", s("irq")),
+                    ("version", Value::U64(0)),
+                    ("msg", s("Level")),
+                    ("asserted", Value::Bool(asserted)),
+                ],
+            )
+        };
+        let block = |msg, tail: Vec<(&'static str, Value)>| {
+            let mut fields = vec![("protocol", s("block")), ("version", Value::U64(0))];
+            fields.extend(tail);
+            (Message::Block(msg), fields)
+        };
+        let read_error = |error, name| {
+            block(
+                BlockMsg::ReadResult {
+                    txn: TxnId(5),
+                    outcome: BlockReadOutcome::Error { error },
+                },
+                vec![
+                    ("msg", s("ReadResult")),
+                    ("txn", Value::U64(5)),
+                    ("outcome", s("Error")),
+                    ("error", s(name)),
+                ],
+            )
+        };
+        let write_error = |error, name| {
+            block(
+                BlockMsg::WriteResult {
+                    txn: TxnId(6),
+                    outcome: BlockWriteOutcome::Error { error },
+                },
+                vec![
+                    ("msg", s("WriteResult")),
+                    ("txn", Value::U64(6)),
+                    ("outcome", s("Error")),
+                    ("error", s(name)),
+                ],
+            )
+        };
+        vec![
+            irq(false),
+            irq(true),
+            block(
+                BlockMsg::ReadBlock {
+                    txn: TxnId(u64::MAX),
+                    lba: u64::MAX,
+                },
+                vec![
+                    ("msg", s("ReadBlock")),
+                    ("txn", Value::U64(u64::MAX)),
+                    ("lba", Value::U64(u64::MAX)),
+                ],
+            ),
+            block(
+                BlockMsg::WriteBlock {
+                    txn: TxnId(0),
+                    lba: 3,
+                    data: vec![0xCA, 0xFE],
+                },
+                vec![
+                    ("msg", s("WriteBlock")),
+                    ("txn", Value::U64(0)),
+                    ("lba", Value::U64(3)),
+                    ("data", Value::Bytes(vec![0xCA, 0xFE])),
+                ],
+            ),
+            block(
+                BlockMsg::ReadResult {
+                    txn: TxnId(5),
+                    outcome: BlockReadOutcome::Data { data: vec![0xDE] },
+                },
+                vec![
+                    ("msg", s("ReadResult")),
+                    ("txn", Value::U64(5)),
+                    ("outcome", s("Data")),
+                    ("data", Value::Bytes(vec![0xDE])),
+                ],
+            ),
+            read_error(MediaError::OutOfRange, "OutOfRange"),
+            read_error(MediaError::BadBlock, "BadBlock"),
+            block(
+                BlockMsg::WriteResult {
+                    txn: TxnId(6),
+                    outcome: BlockWriteOutcome::Done,
+                },
+                vec![
+                    ("msg", s("WriteResult")),
+                    ("txn", Value::U64(6)),
+                    ("outcome", s("Done")),
+                ],
+            ),
+            write_error(MediaError::OutOfRange, "OutOfRange"),
+            write_error(MediaError::BadBlock, "BadBlock"),
+        ]
+    }
+
+    #[test]
+    fn irq_and_block_dispatch_fields_flatten_the_outcome() {
+        for (msg, tail) in m2_cases() {
+            let mut fields = vec![("source", Value::U64(1)), ("port", Value::U64(2))];
+            fields.extend(tail);
+            assert_eq!(m2_record(msg.clone()).fields, fields, "{msg:?}");
+        }
+    }
+
+    #[test]
+    fn irq_and_block_dispatch_records_parse_back_to_their_event() {
+        for (msg, _) in m2_cases() {
+            let ev = dispatched_event(&m2_record(msg.clone())).expect("parses");
+            assert_eq!(
+                ev.delivery,
+                Delivered::Message {
+                    port: PortId(2),
+                    msg
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn altered_irq_and_block_dispatch_records_are_rejected() {
+        let replace = |r: &TraceRecord, i: usize, v: Value| {
+            let mut r = r.clone();
+            r.fields[i].1 = v;
+            dispatched_event(&r)
+        };
+        let level = m2_record(m2_cases()[1].0.clone());
+        assert_eq!(replace(&level, 5, Value::U64(1)), None);
+        assert_eq!(replace(&level, 4, s("Assert")), None);
+        assert_eq!(replace(&level, 3, Value::U64(1)), None);
+        assert_eq!(replace(&level, 2, s("mem")), None);
+        let bad_block = m2_record(m2_cases()[6].0.clone());
+        assert_eq!(replace(&bad_block, 7, s("Timeout")), None);
+        assert_eq!(replace(&bad_block, 6, s("Fault")), None);
+        assert_eq!(replace(&bad_block, 3, Value::U64(1)), None);
+        assert_eq!(replace(&bad_block, 2, s("mem")), None);
+        let done = m2_record(m2_cases()[7].0.clone());
+        let mut extra = done.clone();
+        extra.fields.push(("error", s("BadBlock")));
+        assert_eq!(dispatched_event(&extra), None);
+        // A mem.v1 record relabelled as block.v0 or irq.v0 is neither.
+        let v0 = record(cases()[0].0.clone());
+        assert_eq!(replace(&v0, 2, s("block")), None);
+        assert_eq!(replace(&v0, 2, s("irq")), None);
     }
 }

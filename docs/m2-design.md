@@ -157,7 +157,7 @@ Any CSR instruction whose `csr` field is not one of the eight whitelisted addres
 
 This includes CSRs that real Sm implementations, and Spike, provide: `misa`, `mhartid`, `mvendorid`, `marchid`, `mimpid`, `mconfigptr`, `mstatush`, `medeleg`, `mideleg`, `mcounteren`, `mcycle`, `minstret`, `cycle`, `time`, `instret`, `satp`, every `pmpcfg*`/`pmpaddr*`, and every custom CSR.
 
-**This deliberately diverges from Spike.** The pinned Spike (Appendix A) implements `misa`, `mhartid`, `mvendorid`, `marchid`, `mimpid`, `mconfigptr`, `mstatush`, `mcycle`, `minstret`, and the PMP CSRs even with `--priv=m`, and traps only on `medeleg`, `mideleg`, `mcounteren`, `satp`, the unprivileged counters, custom CSRs, and writes to read-only CSRs. The M2.1a Spike differential (§15.2) therefore compares unsupported-CSR traps only on CSRs that Spike also rejects. The rest are SystemScope-only tests whose expected values come from this section.
+**This deliberately diverges from Spike.** The pinned Spike (Appendix A) implements `misa`, `mhartid`, `mvendorid`, `marchid`, `mimpid`, `mconfigptr`, `mstatush`, `mcycle`, `minstret`, and the PMP CSRs even with `--priv=m`, and traps only on `medeleg`, `mideleg`, `mcounteren`, `satp`, the unprivileged counters, custom CSRs, and writes to read-only CSRs. The M2.2a Spike differential (§15.2) therefore compares unsupported-CSR traps only on CSRs that Spike also rejects. The rest are SystemScope-only tests whose expected values come from this section.
 
 ### 4.6 Per-CSR Rules
 
@@ -244,20 +244,20 @@ Taking the MEI is not an instruction and does not retire:
 - `mstatus.MPP` ← `0b11` (the least-privileged supported mode is M, so MPP stays `0b11`);
 - `instret` += 1; no register is written.
 
-Spike agrees on all four fields (Appendix A.1): `mstatus` `0x1880` → `0x1888`, `0x1808` → `0x1880`, and `0x1888` → `0x1888`. The M2.1a differential compares them (§15.2).
+Spike agrees on all four fields (Appendix A.1): `mstatus` `0x1880` → `0x1888`, `0x1808` → `0x1880`, and `0x1888` → `0x1888`. The M2.2a differential compares them (§15.2).
 
 ### 5.4 Re-entry After `MRET`
 
 `MRET` retires, so the §5.1 check runs right after it, with MIE already restored. **If MEIP is still asserted and MEIE is set, the MEI is taken again immediately**: no instruction at `mepc` executes, and the new `mepc` is the same address. This is the architecturally expected result of a level-sensitive line that software did not clear before `MRET`.
 
 - Handlers must clear the source (acknowledge the device, §9.3) before `MRET`. `block_irq.elf` does, and tolerates a spurious entry anyway (§12.3).
-- **Required test (M2.1b):** a directed program with MEIP held asserted executes `MRET` and must re-enter the handler with `mepc` unchanged and `instret` incremented by exactly the `MRET`.
+- **Required test (M2.2b):** a directed program with MEIP held asserted executes `MRET` and must re-enter the handler with `mepc` unchanged and `instret` incremented by exactly the `MRET`.
 
 ### 5.5 Enabling by CSR Write
 
 If a CSR instruction sets `mstatus.MIE` (or `mie.MEIE`) while the other two conditions already hold, the interrupt is taken **at that instruction's own retirement boundary**: `mepc` is the CSR instruction's `next_pc`, and no further instruction retires first.
 
-- **Required test (M2.1b):** with MEIE = 1 and MEIP asserted, `csrsi mstatus, 8` must be followed directly by entry, with `mepc = pc + 4` of the `csrsi` and the next instruction not retired.
+- **Required test (M2.2b):** with MEIE = 1 and MEIP asserted, `csrsi mstatus, 8` must be followed directly by entry, with `mepc = pc + 4` of the `csrsi` and the next instruction not retired.
 - Clearing MIE by a CSR write takes effect at the same boundary: the check sees MIE = 0 and no interrupt is taken.
 
 ### 5.6 Synchronous Traps
@@ -276,7 +276,7 @@ M2 does not implement `WFI` (it stays `IllegalInstruction`). Reasons:
 
 ### 5.8 Pure Oracle
 
-M2.1b validates interrupt entry against a pure function written from this section, in the test crate, sharing no code with the CPU:
+M2.2b validates interrupt entry against a pure function written from this section, in the test crate, sharing no code with the CPU:
 
 ```rust
 struct MeiResult {
@@ -779,7 +779,7 @@ Checkpoint-and-resume must give identical results (final state, output, `StateDi
 ### 13.3 Sizes
 
 - The M1 portable snapshot `tests/golden/m1-reference.mid.snap` is **8,942 bytes** (measured at M2.0; `m0-reference.mid.snap` is 3,979).
-- M2.8 records the size of `m2-reference.mid.snap` next to these numbers in this section. Expected new contributors: the media block map (512 bytes per non-zero block), the controller's 512-byte buffer, the bus FIFOs, and the CPU CSRs. No compaction is planned for M2 (§16).
+- M2.9 records the size of `m2-reference.mid.snap` next to these numbers in this section. Expected new contributors: the media block map (512 bytes per non-zero block), the controller's 512-byte buffer, the bus FIFOs, and the CPU CSRs. No compaction is planned for M2 (§16).
 
 ### 13.4 Observation Invariance
 
@@ -793,7 +793,7 @@ O0–O5 (m0-design, m1-design) apply unchanged to `m2-reference`: observers neve
 - **Protocol names:** `irq.v0` = `("irq", 0)` and `block.v0` = `("block", 0)`. `Message` gains `Irq(irq_v0::IrqMsg)` and `Block(block_v0::BlockMsg)`; the strict decoder dispatches on `(name, version)` and rejects anything else. The `Message` variant tag is not encoded, so no existing encoding changes (as for `mem.v1`, m1-design §4.3).
 - **`mem.v0` and `mem.v1` are frozen.** M2 adds no `mem.v1` variant.
 - **Component schemas:** `AddressBus` schema 1, `Ram`, `SimpleUart`, and the CPU's schema 1 (M1 profile) are unchanged. New: CPU schema 2 (M2 profile), `MultiMasterBus`, `SimpleIrqController`, `SimpleBlockMedia`, `DmaBlockController`, each schema 1.
-- **M2.0a (contracts):** `irq_v0.rs` and `block_v0.rs` with rustdoc, `Message` variants, canonical encoding, golden encoding vectors, and strict-decoding tests, in `contracts`; then `systemscope` bumps its `contracts` pin. `contracts` is tagged `v0.3.0-m2` at release, on the commit `systemscope` pins.
+- **M2.1 (contracts):** `irq_v0.rs` and `block_v0.rs` with rustdoc, `Message` variants, canonical encoding, golden encoding vectors, and strict-decoding tests, in `contracts`; then `systemscope` bumps its `contracts` pin. `contracts` is tagged `v0.3.0-m2` at release, on the commit `systemscope` pins.
 
 ---
 
@@ -803,23 +803,23 @@ O0–O5 (m0-design, m1-design) apply unchanged to `m2-reference`: observers neve
 
 | Area | Oracle | Tests | Step |
 |---|---|---|---|
-| `irq.v0`, `block.v0` encoding | hand-written golden bytes | every variant, strict decode, round-trip | M2.0a |
-| Zicsr, CSR WARL, `MRET` | pinned Spike (directed), and this document's tables for divergences | §15.2 | M2.1a |
-| Unsupported CSRs | Spike for CSRs it also rejects; §4.5 otherwise | trap cause and `tval`, halt | M2.1a |
-| MEI entry and boundary | the pure oracle `take_mei` (§5.8) | property tests over CSR values and levels; directed re-entry (§5.4) and CSR-enable (§5.5) programs; no entry in non-boundary states | M2.1b |
-| M2 CPU on RV32I | M1 oracles | 40 `rv32ui`, 39 ACT4 on the M2 profile | M2.1a |
-| `SimpleIrqController` | the formula `(pending & enable) != 0` | unit tests, property test over level/enable sequences, MMIO map | M2.2 |
-| `MultiMasterBus` | an independent arbitration model written from §10 | scripted test masters; contention, fairness, identity, `AccessFault`, session faults; every-event snapshot; permuting same-phase arrival order across different masters does not change the granted master sequence | M2.3 |
-| `SimpleBlockMedia` | a `BTreeMap` model | canonical storage, `image_hash` identity, restore rejection, errors | M2.4 |
-| Controller registers and lifecycle | §9.2–§9.4 tables | every register and access width, `REJECTED` rules, validation order, IRQ line | M2.5 |
-| DMA engine | a reference transfer model | READ/WRITE multi-block, partial READ and WRITE failures (§9.7), contention with a CPU load loop | M2.6 |
-| End-to-end | §12.4 | `block_irq.elf` on `m2-reference` | M2.7 |
-| Snapshot/restore | resume equivalence | every event, the §13.1 stress points, the portable mid-DMA snapshot | M2.8 |
-| Observation invariance | M0 O0–O5 | on `m2-reference` | M2.8 |
-| Golden | `tests/golden/m2-reference.json` | Linux and Windows, cross-OS | M2.8 |
+| `irq.v0`, `block.v0` encoding | hand-written golden bytes | every variant, strict decode, round-trip | M2.1 |
+| Zicsr, CSR WARL, `MRET` | pinned Spike (directed), and this document's tables for divergences | §15.2 | M2.2a |
+| Unsupported CSRs | Spike for CSRs it also rejects; §4.5 otherwise | trap cause and `tval`, halt | M2.2a |
+| MEI entry and boundary | the pure oracle `take_mei` (§5.8) | property tests over CSR values and levels; directed re-entry (§5.4) and CSR-enable (§5.5) programs; no entry in non-boundary states | M2.2b |
+| M2 CPU on RV32I | M1 oracles | 40 `rv32ui`, 39 ACT4 on the M2 profile | M2.2a |
+| `SimpleIrqController` | the formula `(pending & enable) != 0` | unit tests, property test over level/enable sequences, MMIO map | M2.3 |
+| `MultiMasterBus` | an independent arbitration model written from §10 | scripted test masters; contention, fairness, identity, `AccessFault`, session faults; every-event snapshot; permuting same-phase arrival order across different masters does not change the granted master sequence | M2.4 |
+| `SimpleBlockMedia` | a `BTreeMap` model | canonical storage, `image_hash` identity, restore rejection, errors | M2.5 |
+| Controller registers and lifecycle | §9.2–§9.4 tables | every register and access width, `REJECTED` rules, validation order, IRQ line | M2.6 |
+| DMA engine | a reference transfer model | READ/WRITE multi-block, partial READ and WRITE failures (§9.7), contention with a CPU load loop | M2.7 |
+| End-to-end | §12.4 | `block_irq.elf` on `m2-reference` | M2.8 |
+| Snapshot/restore | resume equivalence | every event, the §13.1 stress points, the portable mid-DMA snapshot | M2.9 |
+| Observation invariance | M0 O0–O5 | on `m2-reference` | M2.9 |
+| Golden | `tests/golden/m2-reference.json` | Linux and Windows, cross-OS | M2.9 |
 | M1 regressions | §15.4 | every step | all |
 
-### 15.2 M2.1a Spike-Directed Tests
+### 15.2 M2.2a Spike-Directed Tests
 
 Directed programs run on the pinned Spike (`19609434`) with `--isa=rv32i_zicsr --priv=m`, compared per retirement (`pc`, register writes, CSR writes of whitelisted CSRs) up to the first trap, reusing the M1-A3 judges. Each is kept to the behaviors where §4 and Spike agree:
 
@@ -838,9 +838,9 @@ Spike logs `mstatush` and `tcontrol` writes on `MRET`; the comparison ignores CS
 Two observations from the M2.0 measurements for the harness:
 
 - The pinned Spike accepts Zicsr with `--isa=rv32i` too (it reports `rv32i2p1_zicsr2p0`). M1-A3 is unaffected: its programs contain no CSR instructions.
-- With `--instructions=N`, the observed Spike run ended at the first trap taken into a handler; without it, execution continued through the handler. The M2.1a harness stops at the first trap anyway, as M1-A3 does; any test that runs past a trap in Spike must not rely on `--instructions`.
+- With `--instructions=N`, the observed Spike run ended at the first trap taken into a handler; without it, execution continued through the handler. The M2.2a harness stops at the first trap anyway, as M1-A3 does; any test that runs past a trap in Spike must not rely on `--instructions`.
 
-MEI entry itself is not compared with Spike: triggering MEIP in Spike needs its PLIC and an external source, which the differential does not model. M2.1b uses the pure oracle instead.
+MEI entry itself is not compared with Spike: triggering MEIP in Spike needs its PLIC and an external source, which the differential does not model. M2.2b uses the pure oracle instead.
 
 ### 15.3 ACT4
 
@@ -863,7 +863,7 @@ Every M2 step must keep all of these passing, unchanged:
 
 ## 16. Architecture Risks
 
-1. **Global sequence versus arbitration.** Events in one `(tick, phase)` run in global-sequence order, which depends on unrelated scheduling history. Any decision that depends on that order would make behavior fragile. Mitigation: requests are enqueued in `Request` into per-master FIFOs and arbitrated in `Transfer`; IRQ levels land in `Complete` and are sampled in `Commit`; CSR reads happen in `Commit` (§6.3). M2.3 tests that permuting same-phase arrival order across different masters does not change the granted master sequence.
+1. **Global sequence versus arbitration.** Events in one `(tick, phase)` run in global-sequence order, which depends on unrelated scheduling history. Any decision that depends on that order would make behavior fragile. Mitigation: requests are enqueued in `Request` into per-master FIFOs and arbitrated in `Transfer`; IRQ levels land in `Complete` and are sampled in `Commit`; CSR reads happen in `Commit` (§6.3). M2.4 tests that permuting same-phase arrival order across different masters does not change the granted master sequence.
 2. **Five-phase expressiveness.** `Request`/`Transfer`/`Complete`/`Commit`/`Observe` must carry request, arbitration, target acceptance, responses and level changes, and architectural commit. M2 fits because every hop has at least one cycle of link latency. A future zero-latency chain (a level that must propagate through several components in one tick) would need either same-phase chains (allowed by S2 but order-sensitive) or more phases. Record any such pressure before adding workarounds.
 3. **Snapshot scaling.** Media contents are stored whole in every snapshot (§13.3). A realistic disk would dominate snapshot size. M2 keeps capacity small; content-addressed or delta snapshots are a later decision, not an M2 change.
 4. **Partial Sm abstraction.** Real firmware may touch CSRs M2 rejects (`misa`, `mhartid`) and will halt with `IllegalInstruction`, and synchronous exceptions halt instead of trapping to `mtvec`. The wording of §4.1 must stay precise, and M3 must extend the same CSR file rather than replacing it.
@@ -876,17 +876,17 @@ Every M2 step must keep all of these passing, unchanged:
 | Step | Content | Merge unit |
 |---|---|---|
 | **M2.0** | This design freeze | docs only |
-| **M2.0a** | `contracts`: `irq.v0`, `block.v0` (§14); pin bump | contracts + pin |
-| **M2.1a** | CPU `M2` profile: Zicsr subset, CSR file, `MRET`; Spike-directed tests (§15.2) | CPU |
-| **M2.1b** | MEI: `irq` port, boundary sampling, entry; pure oracle and property tests; re-entry and CSR-enable tests | CPU |
-| **M2.2** | `SimpleIrqController` | platform |
-| **M2.3** | `MultiMasterBus`: identity, round-robin, timing, snapshot; scripted test masters | platform |
-| **M2.4** | `SimpleBlockMedia`: sparse storage, `image_hash`, snapshot | platform |
-| **M2.5** | `DmaBlockController` MMIO: registers, lifecycle, `REJECTED`, validation, IRQ line | platform |
-| **M2.6** | DMA engine: beats, READ/WRITE, failure semantics, contention | platform |
-| **M2.7** | `m2-reference`, `block_irq.elf` and the disk fixture with manifests, end-to-end acceptance | tests |
-| **M2.8** | Snapshot stress, observation invariance, `m2-reference.json` and `m2-reference.mid.snap` golden files, cross-OS, CI | tests + CI |
-| **M2.9** | Release documentation, exit criteria evidence; tag `v0.3.0-m2` | docs |
+| **M2.1** | `contracts`: `irq.v0`, `block.v0` (§14); pin bump | contracts + pin |
+| **M2.2a** | CPU `M2` profile: Zicsr subset, CSR file, `MRET`; Spike-directed tests (§15.2) | CPU |
+| **M2.2b** | MEI: `irq` port, boundary sampling, entry; pure oracle and property tests; re-entry and CSR-enable tests | CPU |
+| **M2.3** | `SimpleIrqController` | platform |
+| **M2.4** | `MultiMasterBus`: identity, round-robin, timing, snapshot; scripted test masters | platform |
+| **M2.5** | `SimpleBlockMedia`: sparse storage, `image_hash`, snapshot | platform |
+| **M2.6** | `DmaBlockController` MMIO: registers, lifecycle, `REJECTED`, validation, IRQ line | platform |
+| **M2.7** | DMA engine: beats, READ/WRITE, failure semantics, contention | platform |
+| **M2.8** | `m2-reference`, `block_irq.elf` and the disk fixture with manifests, end-to-end acceptance | tests |
+| **M2.9** | Snapshot stress, observation invariance, `m2-reference.json` and `m2-reference.mid.snap` golden files, cross-OS, CI | tests + CI |
+| **M2.10** | Release documentation, exit criteria evidence; tag `v0.3.0-m2` | docs |
 
 Each step follows the M1 discipline: a feature branch, the full local gate, one push, a draft PR, CI, then a fast-forward merge.
 
@@ -926,7 +926,7 @@ spike --isa=rv32i_zicsr --priv=m --pcs=0:0x80000000 -m0x80000000:0x1000000 \
       --disable-dtb -l --log-commits <program>.elf
 ```
 
-The programs were RV32I + Zicsr assembly, built with the pinned rv32 toolchain (`-march=rv32i_zicsr -mabi=ilp32`), each probe writing a CSR and reading it back, with `mtvec` pointing at a handler that records `mcause`/`mtval` and skips the trapping instruction. Values are from the commit log. The programs are not committed; M2.1a turns them into directed tests.
+The programs were RV32I + Zicsr assembly, built with the pinned rv32 toolchain (`-march=rv32i_zicsr -mabi=ilp32`), each probe writing a CSR and reading it back, with `mtvec` pointing at a handler that records `mcause`/`mtval` and skips the trapping instruction. Values are from the commit log. The programs are not committed; M2.2a turns them into directed tests.
 
 ### A.1 Writes
 
