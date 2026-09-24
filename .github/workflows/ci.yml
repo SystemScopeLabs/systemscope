@@ -208,8 +208,9 @@ jobs:
           git diff --exit-code -- tests/rv32
           test -z "$(git status --porcelain -- tests/rv32)"
 
-  # docs/m1-design.md §10.3, M1-A3: every selected rv32ui fixture on SystemScope against
-  # the pinned Spike, retirement by retirement. The only job that builds or runs Spike.
+  # docs/m1-design.md §10.3, M1-A3: every selected rv32ui fixture, the generated programs
+  # for the fixed seeds, and the misaligned-access programs on SystemScope against the
+  # pinned Spike, retirement by retirement. The only job that builds or runs Spike.
   # A cached build is used only after `spike verify` checks it against the pin.
   spike:
     name: M1-A3 Spike differential (Linux)
@@ -247,7 +248,7 @@ jobs:
         run: cargo xtask spike verify ~/spike
       - name: rv32ui fixtures match their manifest
         run: cargo xtask rv32-fixtures verify
-      - name: M1-A3 retirement differential (40 selected tests)
+      - name: M1-A3 retirement differential (40 rv32ui, 64 generated, 9 misaligned)
         run: cargo xtask spike diff ~/spike
       - name: Keep Spike's logs
         if: failure()

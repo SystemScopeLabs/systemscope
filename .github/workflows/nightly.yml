@@ -3,6 +3,9 @@ name: Nightly
 # One random seed per night, printed so a failure can be reproduced with
 # `M0_SEED=<seed> cargo nextest run -p systemscope-acceptance --run-ignored only`.
 # It has no golden digests and is never compared with tests/golden (docs/m0-design.md §9.1).
+# The same seed, as M1_PROGEN_SEED, picks the night's generated RV32I program
+# (docs/m1-design.md §10.3): `M1_PROGEN_SEED=<seed> cargo nextest run -p systemscope-rv32
+# --run-ignored only` on both operating systems, and `cargo xtask spike random` on Linux.
 on:
   schedule:
     - cron: "0 17 * * *"
@@ -39,6 +42,7 @@ jobs:
           seed="${INPUT_SEED:-0x$(od -An -N8 -tx8 /dev/urandom | tr -d ' \n')}"
           echo "seed=$seed" >> "$GITHUB_OUTPUT"
           echo "M0_SEED=$seed" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "M1_PROGEN_SEED=$seed" | tee -a "$GITHUB_STEP_SUMMARY"
 
   acceptance:
     name: AT-1..AT-3, random seed (${{ matrix.os }})
@@ -50,6 +54,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       M0_SEED: ${{ needs.seed.outputs.seed }}
+      M1_PROGEN_SEED: ${{ needs.seed.outputs.seed }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -71,14 +76,66 @@ jobs:
           tool: cargo-nextest
       - name: Seed
         shell: bash
-        run: echo "M0_SEED=$M0_SEED"
+        run: echo "M0_SEED=$M0_SEED M1_PROGEN_SEED=$M1_PROGEN_SEED"
       # AT-1 step 1 (two processes), AT-2, and AT-3 for the random seed.
       - name: Random-seed acceptance
         run: cargo nextest run -p systemscope-acceptance --locked --profile ci --no-fail-fast --run-ignored only
+      # The generated program for the same seed passes, deterministically.
+      - name: Random-seed generated program
+        run: cargo nextest run -p systemscope-rv32 --locked --profile ci --no-fail-fast --run-ignored only
       - name: Report the failing seed
         if: failure()
         shell: bash
-        run: echo "::error::nightly acceptance failed for M0_SEED=$M0_SEED"
+        run: echo "::error::nightly acceptance failed for M0_SEED=$M0_SEED M1_PROGEN_SEED=$M1_PROGEN_SEED"
+
+  # docs/m1-design.md §10.3, M1-A3: the night's generated program against the pinned
+  # Spike, built and cached as in ci.yml's spike job and verified before use.
+  spike:
+    name: M1-A3 Spike differential, random seed (Linux)
+    needs: seed
+    runs-on: ubuntu-24.04
+    env:
+      M1_PROGEN_SEED: ${{ needs.seed.outputs.seed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: systemscope
+      - uses: actions/checkout@v4
+        with:
+          repository: SystemScopeLabs/contracts
+          ref: 4d6e912a7ccffb676d0f95ff523c553fe3048c47
+          path: contracts
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: systemscope
+      # Spike's configure requires dtc; the differential runs Spike with --disable-dtb.
+      - name: Install dtc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends device-tree-compiler=1.7.0-2build1
+      - uses: actions/cache@v4
+        id: spike-cache
+        with:
+          path: ~/spike
+          key: spike-${{ runner.os }}-${{ hashFiles('systemscope/tests/rv32/build-spike.sh') }}
+      - name: Build the pinned Spike
+        if: steps.spike-cache.outputs.cache-hit != 'true'
+        run: cargo xtask spike build ~/spike
+      # Verifies Spike first, then runs the one program.
+      - name: Random-seed retirement differential
+        run: cargo xtask spike random ~/spike
+      - name: Report the failing seed
+        if: failure()
+        run: echo "::error::nightly Spike differential failed for M1_PROGEN_SEED=$M1_PROGEN_SEED"
+      - name: Keep Spike's logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spike-logs
+          path: systemscope/target/spike-logs
+          if-no-files-found: ignore
 
   coverage:
     name: coverage (report only)
