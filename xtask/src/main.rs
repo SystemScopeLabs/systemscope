@@ -3,6 +3,15 @@
 //! - `bless`: runs `m0-reference` for every fixed seed and rewrites the golden files in
 //!   `tests/golden/`, printing what changed. Tests never write golden files; this is the
 //!   only way they change, and the commit that changes them must say why in its body.
+//! - `m1-golden bless`: runs every committed program on `m1-reference` and rewrites
+//!   `tests/golden/m1-reference.json` and `tests/golden/m1-reference.mid.snap`, printing
+//!   what changed. As with `bless`, this is the only way they change.
+//! - `m1-golden verify`: reruns everything and requires the committed M1 golden files back
+//!   byte for byte, then checks the portable snapshot. Writes nothing.
+//! - `m1-golden emit <dir>`: writes this machine's M1 golden file and portable snapshot
+//!   into `<dir>`, for another machine to `check`.
+//! - `m1-golden check <dir>`: requires another machine's emitted files to equal the
+//!   committed ones and this machine's, and restores and runs its snapshot here.
 //! - `rv32-fixtures build`: Linux only, with the pinned toolchain on `PATH`. Rebuilds the
 //!   40 `rv32ui` fixtures from the pinned `riscv-tests` with `tests/rv32/build-fixtures.sh`
 //!   (the only step that uses the network) and `hello.elf` with
@@ -20,12 +29,16 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use systemscope_acceptance::golden::{GOLDEN_PATH, Golden, MID_SNAPSHOT_PATH, describe_changes};
+use systemscope_acceptance::m1::golden as m1;
 use systemscope_rv32::hello::{self, HELLO_DIR, HELLO_MANIFEST, HELLO_SCRIPT, HelloManifest};
 use systemscope_rv32::manifest::{Manifest, verify};
 use systemscope_rv32::{BUILD_SCRIPT, FIXTURE_DIR, MANIFEST_PATH, SELECTED, upstream};
 
 const USAGE: &str = "usage: cargo xtask bless\n       \
+                     cargo xtask m1-golden bless | verify | emit <dir> | check <dir>\n       \
                      cargo xtask rv32-fixtures build | manifest [<cache-dir>] | verify";
+/// The golden file's name in an `m1-golden emit` directory.
+const M1_RESULT: &str = "m1-reference.json";
 /// Where `rv32-fixtures build` fetches and builds, relative to the workspace root.
 const RV32_CACHE: &str = "target/rv32-fixtures";
 
@@ -34,6 +47,10 @@ fn main() -> ExitCode {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     match args.as_slice() {
         ["bless"] => bless(),
+        ["m1-golden", "bless"] => m1_bless(),
+        ["m1-golden", "verify"] => m1_verify(),
+        ["m1-golden", "emit", dir] => m1_emit(Path::new(dir)),
+        ["m1-golden", "check", dir] => m1_check(Path::new(dir)),
         ["rv32-fixtures", "build"] => rv32_build(),
         ["rv32-fixtures", "manifest"] => rv32_manifest(&root().join(RV32_CACHE)),
         ["rv32-fixtures", "manifest", cache] => rv32_manifest(Path::new(cache)),
@@ -95,6 +112,137 @@ fn bless() -> ExitCode {
          (see CONTRIBUTING.md)."
     );
     ExitCode::SUCCESS
+}
+
+fn m1_bless() -> ExitCode {
+    let root = root();
+    let json_path = root.join(m1::GOLDEN_PATH);
+    let snap_path = root.join(m1::MID_SNAPSHOT_PATH);
+    let old_json = fs::read_to_string(&json_path).ok();
+    let old = old_json.as_deref().and_then(|s| m1::Golden::parse(s).ok());
+    let old_snap = fs::read(&snap_path).ok();
+
+    eprintln!("running every committed program on m1-reference...");
+    let (new, snapshot) = match m1::Golden::generate(&root) {
+        Ok(generated) => generated,
+        Err(e) => {
+            eprintln!("not blessed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let json = new.render();
+
+    let mut changes = m1::describe_changes(old.as_ref(), &new);
+    if old.is_some() && changes.is_empty() && old_json.as_deref() != Some(json.as_str()) {
+        changes.push(format!("~ {}: formatting only", m1::GOLDEN_PATH));
+    }
+    if old_snap.as_deref() != Some(snapshot.as_slice()) && old.is_some_and(|o| o.mid == new.mid) {
+        changes.push(format!(
+            "~ {}: bytes differ from the recorded hash",
+            m1::MID_SNAPSHOT_PATH
+        ));
+    }
+    if changes.is_empty() {
+        println!("M1 golden files are up to date");
+        return ExitCode::SUCCESS;
+    }
+    if let Err(e) = fs::create_dir_all(json_path.parent().expect("has a parent"))
+        .and_then(|()| fs::write(&json_path, json))
+        .and_then(|()| fs::write(&snap_path, &snapshot))
+    {
+        eprintln!("cannot write the M1 golden files: {e}");
+        return ExitCode::FAILURE;
+    }
+    println!("M1 golden files changed:");
+    for change in &changes {
+        println!("  {change}");
+    }
+    println!("wrote {} and {}", m1::GOLDEN_PATH, m1::MID_SNAPSHOT_PATH);
+    println!(
+        "Commit them on their own and explain in the commit body why the digests changed \
+         (see CONTRIBUTING.md)."
+    );
+    ExitCode::SUCCESS
+}
+
+/// The committed M1 golden file and portable snapshot.
+fn m1_committed(root: &Path) -> Result<(String, Vec<u8>), String> {
+    let json = fs::read_to_string(root.join(m1::GOLDEN_PATH))
+        .map_err(|e| format!("{}: {e}", m1::GOLDEN_PATH))?;
+    let snap = fs::read(root.join(m1::MID_SNAPSHOT_PATH))
+        .map_err(|e| format!("{}: {e}", m1::MID_SNAPSHOT_PATH))?;
+    Ok((json, snap))
+}
+
+fn report(result: Result<(), Vec<String>>, ok: &str) -> ExitCode {
+    match result {
+        Ok(()) => {
+            println!("{ok}");
+            ExitCode::SUCCESS
+        }
+        Err(errors) => {
+            for e in errors {
+                eprintln!("{e}");
+            }
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn m1_verify() -> ExitCode {
+    let root = root();
+    let result = m1_committed(&root)
+        .map_err(|e| vec![e])
+        .and_then(|(json, snap)| m1::Golden::verify(&root, &json, &snap));
+    report(
+        result,
+        &format!(
+            "every committed program matches {}, and {} restores to it",
+            m1::GOLDEN_PATH,
+            m1::MID_SNAPSHOT_PATH
+        ),
+    )
+}
+
+fn m1_emit(dir: &Path) -> ExitCode {
+    let (golden, snapshot) = match m1::Golden::generate(&root()) {
+        Ok(generated) => generated,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = fs::create_dir_all(dir)
+        .and_then(|()| fs::write(dir.join(M1_RESULT), golden.render()))
+        .and_then(|()| fs::write(dir.join(m1::MID_FILE), &snapshot))
+    {
+        eprintln!("cannot write into {}: {e}", dir.display());
+        return ExitCode::FAILURE;
+    }
+    println!(
+        "wrote this machine's M1 result: {M1_RESULT} and {} ({} bytes, BLAKE3 {})",
+        m1::MID_FILE,
+        golden.mid.size,
+        systemscope_rv32::hex(&golden.mid.blake3)
+    );
+    ExitCode::SUCCESS
+}
+
+fn m1_check(dir: &Path) -> ExitCode {
+    let root = root();
+    let result = m1_committed(&root)
+        .map_err(|e| vec![e])
+        .and_then(|(json, snap)| {
+            let read_error = |e: std::io::Error| vec![format!("{}: {e}", dir.display())];
+            let foreign_json = fs::read_to_string(dir.join(M1_RESULT)).map_err(read_error)?;
+            let foreign_snap = fs::read(dir.join(m1::MID_FILE)).map_err(read_error)?;
+            m1::Golden::check_foreign(&root, (&json, &snap), (&foreign_json, &foreign_snap))
+        });
+    report(
+        result,
+        "the foreign M1 result equals the committed golden files and this machine's run, \
+         and its snapshot restores here to the golden end",
+    )
 }
 
 fn rv32_build() -> ExitCode {

@@ -431,8 +431,10 @@ dependencies = [
  "blake3",
  "serde_json",
  "systemscope-contracts",
+ "systemscope-elf",
  "systemscope-reference",
  "systemscope-runtime",
+ "systemscope-rv32",
  "trybuild",
 ]
 

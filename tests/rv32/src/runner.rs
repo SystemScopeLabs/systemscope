@@ -50,6 +50,9 @@ pub const PASS_A0: u32 = 0;
 /// The trap cause `RVTEST_PASS` and `RVTEST_FAIL` end with.
 pub const PASS_CAUSE: &str = "EnvironmentCall";
 
+/// The session seed of `m1-reference` (§9).
+pub const SEED: u64 = 0;
+
 /// `soc.cpu0`.
 pub const CPU: ComponentId = ComponentId(0);
 /// `soc.bus`.
@@ -148,8 +151,16 @@ impl Observer for Probe {
 }
 
 /// `m1-reference` (§9) for `image`, elaborated, with the UART if `uart`. The components
-/// are [`CPU`], [`BUS`], [`RAM`], and [`UART`], in that order.
+/// are [`CPU`], [`BUS`], [`RAM`], and [`UART`], in that order. The session seed is
+/// [`SEED`].
 pub fn platform(image: &LoadImage, uart: bool) -> Runtime {
+    platform_with_seed(image, uart, SEED)
+}
+
+/// [`platform`] with another session seed. Nothing in `m1-reference` draws from the
+/// random streams, so the seed reaches only the session information, and with it the
+/// snapshot and the trace header.
+pub fn platform_with_seed(image: &LoadImage, uart: bool, seed: u64) -> Runtime {
     let mut t = TopologyBuilder::new(SimulationClock::default());
     let cpu_clock = t
         .add_clock(
@@ -207,8 +218,11 @@ pub fn platform(image: &LoadImage, uart: bool) -> Runtime {
         let device = t.add_component("soc.uart", Box::new(device));
         t.connect((bus, "uart"), (device, "mem"), Some(link));
     }
-    t.elaborate(SessionConfig::default())
-        .expect("the platform elaborates")
+    t.elaborate(SessionConfig {
+        seed,
+        ..SessionConfig::default()
+    })
+    .expect("the platform elaborates")
 }
 
 /// The load image as the RAM's initial image: the same offsets, bytes, and hash.

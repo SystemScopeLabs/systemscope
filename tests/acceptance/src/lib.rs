@@ -1,5 +1,9 @@
-//! M0 acceptance harness (`docs/m0-design.md` §9): AT-1, AT-2, and AT-3 on the full
-//! `m0-reference`, and the golden files that `cargo xtask bless` writes.
+//! Acceptance harnesses.
+//!
+//! - M0 (`docs/m0-design.md` §9): AT-1, AT-2, and AT-3 on the full `m0-reference`, and
+//!   the golden files that `cargo xtask bless` writes.
+//! - [`m1`] (`docs/m1-design.md` §10.1): M1-A6, M1-A7, and M1-A8 on `m1-reference`, and
+//!   the golden files that `cargo xtask m1-golden bless` writes.
 //!
 //! Every check returns a `Result` instead of asserting, so the tests can also feed it
 //! doctored inputs and prove that it notices them.
@@ -8,6 +12,7 @@ pub mod checkpoint;
 pub mod digests;
 pub mod golden;
 pub mod layout;
+pub mod m1;
 pub mod observation;
 pub mod process;
 
