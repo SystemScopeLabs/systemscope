@@ -6,7 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 # Decode, the register file, and execution are pure: they use contracts only for the
-# mem.v1 response types. The CPU component will depend only on contracts
+# mem.v1 response types. The CPU component depends only on contracts too
 # (docs/m1-design.md §3).
 [dependencies]
 systemscope-contracts.workspace = true

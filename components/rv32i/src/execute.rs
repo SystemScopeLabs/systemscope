@@ -5,7 +5,8 @@
 //! and changes no state: the CPU applies the effect in `Commit`, and only if the
 //! instruction retires.
 //!
-//! Each instruction family has its own function: [`execute_alu`] and [`execute_control`].
+//! Each instruction family has its own function: [`execute_alu`], [`execute_control`], and
+//! [`execute_system`] for `FENCE`, `ECALL`, and `EBREAK`.
 //! Loads and stores need a memory response in between, so their semantics are split in
 //! two halves in [`memory`](crate::memory).
 
@@ -46,8 +47,9 @@ pub struct PendingTrap {
 
 /// The cause of a trap.
 ///
-/// Only the causes pure execution raises so far are listed; the others in §6 are added
-/// with the parts of the CPU that raise them.
+/// Every cause of `docs/m1-design.md` §6. Pure execution raises most of them; the CPU
+/// raises `InstructionAccessFault` on a faulting fetch and `IllegalInstruction` when
+/// decoding fails.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TrapCause {
     /// A taken branch, `JAL`, or `JALR` whose target is not 4-byte aligned. `tval` is the
@@ -66,6 +68,32 @@ pub enum TrapCause {
     /// A store the memory system answered with `AccessFault`. `tval` is the effective
     /// address.
     StoreAccessFault,
+    /// A fetch the memory system answered with `AccessFault`. `tval` is the `pc` of the
+    /// instruction that could not be fetched.
+    InstructionAccessFault,
+    /// A word that does not decode to an RV32I instruction (§5.2). `tval` is the word.
+    IllegalInstruction,
+    /// `EBREAK`. `tval` is its `pc`.
+    Breakpoint,
+    /// `ECALL`, the normal way an M1 program ends. `tval` is 0.
+    EnvironmentCall,
+}
+
+impl TrapCause {
+    /// The cause's name, as the `rv32.trap` trace record shows it.
+    pub const fn name(self) -> &'static str {
+        match self {
+            TrapCause::InstructionAddressMisaligned => "InstructionAddressMisaligned",
+            TrapCause::LoadAddressMisaligned => "LoadAddressMisaligned",
+            TrapCause::LoadAccessFault => "LoadAccessFault",
+            TrapCause::StoreAddressMisaligned => "StoreAddressMisaligned",
+            TrapCause::StoreAccessFault => "StoreAccessFault",
+            TrapCause::InstructionAccessFault => "InstructionAccessFault",
+            TrapCause::IllegalInstruction => "IllegalInstruction",
+            TrapCause::Breakpoint => "Breakpoint",
+            TrapCause::EnvironmentCall => "EnvironmentCall",
+        }
+    }
 }
 
 /// The result of executing an instruction that may trap.
@@ -231,5 +259,44 @@ fn shift(op: ShiftOp, value: u32, amount: u32) -> u32 {
         ShiftOp::Sll => value << amount,
         ShiftOp::Srl => value >> amount,
         ShiftOp::Sra => ((value as i32) >> amount) as u32,
+    }
+}
+
+/// The instruction is not `FENCE`, `ECALL`, or `EBREAK`. [`execute_system`] does not
+/// execute it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NotSystem;
+
+/// Executes `FENCE`, `ECALL`, or `EBREAK` at `pc`.
+///
+/// - `FENCE` retires as a no-op with `next_pc = pc + 4` and no register write. In M1 every
+///   access completes before the next fetch, so every ordering a fence could ask for
+///   already holds (`docs/m1-design.md` §5.2).
+/// - `ECALL` traps with [`TrapCause::EnvironmentCall`] and `tval` 0.
+/// - `EBREAK` traps with [`TrapCause::Breakpoint`] and `tval = pc`.
+pub fn execute_system(instr: &Instr, pc: u32) -> Result<ExecOutcome, NotSystem> {
+    match *instr {
+        Instr::Fence => Ok(ExecOutcome::Effect(PendingEffect {
+            reg_write: None,
+            next_pc: pc.wrapping_add(4),
+        })),
+        Instr::Ecall => Ok(ExecOutcome::Trap(PendingTrap {
+            cause: TrapCause::EnvironmentCall,
+            tval: 0,
+        })),
+        Instr::Ebreak => Ok(ExecOutcome::Trap(PendingTrap {
+            cause: TrapCause::Breakpoint,
+            tval: pc,
+        })),
+        Instr::Lui { .. }
+        | Instr::Auipc { .. }
+        | Instr::Jal { .. }
+        | Instr::Jalr { .. }
+        | Instr::Branch { .. }
+        | Instr::Load { .. }
+        | Instr::Store { .. }
+        | Instr::OpImm { .. }
+        | Instr::ShiftImm { .. }
+        | Instr::Op { .. } => Err(NotSystem),
     }
 }
