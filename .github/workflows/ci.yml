@@ -88,15 +88,18 @@ jobs:
         run: cargo nextest run -p systemscope-acceptance --locked --profile ci --no-fail-fast --test at2
       - name: AT-3 observation invariance (O0-O5, compile-fail)
         run: cargo nextest run -p systemscope-acceptance --locked --profile ci --no-fail-fast --test at3 --test compile_fail
-      # docs/m1-design.md §10.2, §10.6: the committed rv32ui ELFs, run from the same bytes
-      # on both operating systems. Neither step builds anything or uses the network.
-      - name: rv32ui fixtures match the manifest
+      # docs/m1-design.md §10.2, §10.6: the committed rv32ui ELFs and hello.elf, run from
+      # the same bytes on both operating systems. No step builds anything or uses the
+      # network.
+      - name: rv32ui fixtures and hello.elf match their manifests
         run: cargo xtask rv32-fixtures verify
       - name: M1-A2 rv32ui (40 selected tests)
-        run: cargo nextest run -p systemscope-rv32 --locked --profile ci --no-fail-fast
-      - name: rv32ui fixtures unchanged
+        run: cargo nextest run -p systemscope-rv32 --locked --profile ci --no-fail-fast --lib --test rv32ui --test fixtures
+      - name: M1-A5 hello.elf through the CPU and SimpleUart (output, checkpoints)
+        run: cargo nextest run -p systemscope-rv32 --locked --profile ci --no-fail-fast --test hello
+      - name: rv32ui fixtures and hello.elf unchanged
         shell: bash
-        run: git diff --exit-code -- tests/rv32/fixtures
+        run: git diff --exit-code -- tests/rv32/fixtures tests/rv32/hello
       # Only `cargo xtask bless` writes golden files; a test that wrote one would show here.
       - name: Golden files unchanged
         shell: bash
@@ -104,9 +107,9 @@ jobs:
           git diff --exit-code
           test -z "$(git status --porcelain)"
 
-  # docs/m1-design.md §10.6: rebuilds the rv32ui fixtures from the pinned riscv-tests with
-  # the pinned toolchain on a clean machine, and requires the committed bytes and manifest
-  # back. The only job that installs a RISC-V toolchain or fetches riscv-tests.
+  # docs/m1-design.md §10.6: rebuilds the rv32ui fixtures from the pinned riscv-tests, and
+  # hello.elf from tests/rv32/hello, with the pinned toolchain on a clean machine, and
+  # requires the committed bytes and manifests back. The only job that installs a RISC-V toolchain or fetches riscv-tests.
   rv32-fixtures:
     name: rv32ui fixtures rebuild (Linux)
     runs-on: ubuntu-24.04

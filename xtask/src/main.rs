@@ -5,19 +5,22 @@
 //!   only way they change, and the commit that changes them must say why in its body.
 //! - `rv32-fixtures build`: Linux only, with the pinned toolchain on `PATH`. Rebuilds the
 //!   40 `rv32ui` fixtures from the pinned `riscv-tests` with `tests/rv32/build-fixtures.sh`
-//!   (the only step that uses the network), then runs the `manifest` step. Tests never
-//!   rebuild fixtures; the commit that changes them must say why in its body.
+//!   (the only step that uses the network) and `hello.elf` with
+//!   `tests/rv32/hello/build-hello.sh`, then runs the `manifest` step. Tests never rebuild
+//!   fixtures; the commit that changes them must say why in its body.
 //! - `rv32-fixtures manifest [<cache-dir>]`: the second half of `build`, for a build run
 //!   by hand. Checks the upstream checkout in the cache (default `target/rv32-fixtures`),
-//!   rewrites `tests/rv32/fixtures/manifest.json`, and verifies.
-//! - `rv32-fixtures verify`: checks the committed fixtures against the manifest, with no
-//!   network and no compiler.
+//!   rewrites `tests/rv32/fixtures/manifest.json` and `tests/rv32/hello/manifest.json`, and
+//!   verifies.
+//! - `rv32-fixtures verify`: checks the committed fixtures and `hello.elf` against their
+//!   manifests, with no network and no compiler.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use systemscope_acceptance::golden::{GOLDEN_PATH, Golden, MID_SNAPSHOT_PATH, describe_changes};
+use systemscope_rv32::hello::{self, HELLO_DIR, HELLO_MANIFEST, HELLO_SCRIPT, HelloManifest};
 use systemscope_rv32::manifest::{Manifest, verify};
 use systemscope_rv32::{BUILD_SCRIPT, FIXTURE_DIR, MANIFEST_PATH, SELECTED, upstream};
 
@@ -100,24 +103,30 @@ fn rv32_build() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let root = root();
-    let status = Command::new("bash")
-        .arg(BUILD_SCRIPT)
-        .arg(RV32_CACHE)
-        .arg(FIXTURE_DIR)
-        .args(SELECTED)
-        .current_dir(&root)
-        .status();
-    match status {
-        Ok(s) if s.success() => rv32_manifest(&root.join(RV32_CACHE)),
-        Ok(s) => {
-            eprintln!("{BUILD_SCRIPT} failed: {s}");
-            ExitCode::FAILURE
-        }
-        Err(e) => {
-            eprintln!("cannot run {BUILD_SCRIPT}: {e}");
-            ExitCode::FAILURE
+    let mut rv32ui = vec![RV32_CACHE, FIXTURE_DIR];
+    rv32ui.extend(SELECTED);
+    for (script, args) in [
+        (BUILD_SCRIPT, rv32ui),
+        (HELLO_SCRIPT, vec![RV32_CACHE, HELLO_DIR]),
+    ] {
+        match Command::new("bash")
+            .arg(script)
+            .args(&args)
+            .current_dir(&root)
+            .status()
+        {
+            Ok(s) if s.success() => {}
+            Ok(s) => {
+                eprintln!("{script} failed: {s}");
+                return ExitCode::FAILURE;
+            }
+            Err(e) => {
+                eprintln!("cannot run {script}: {e}");
+                return ExitCode::FAILURE;
+            }
         }
     }
+    rv32_manifest(&root.join(RV32_CACHE))
 }
 
 fn rv32_manifest(cache: &Path) -> ExitCode {
@@ -141,6 +150,23 @@ fn rv32_manifest(cache: &Path) -> ExitCode {
         eprintln!("cannot write {MANIFEST_PATH}: {e}");
         return ExitCode::FAILURE;
     }
+    let old_hello = HelloManifest::read(&root).ok();
+    let hello = match HelloManifest::generate(&root) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("cannot generate the hello manifest: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = fs::write(root.join(HELLO_MANIFEST), hello.render()) {
+        eprintln!("cannot write {HELLO_MANIFEST}: {e}");
+        return ExitCode::FAILURE;
+    }
+    if old_hello.as_ref() == Some(&hello) {
+        println!("{HELLO_MANIFEST} is up to date");
+    } else {
+        println!("wrote {HELLO_MANIFEST}");
+    }
     match &old {
         None => println!("wrote a new {MANIFEST_PATH}"),
         Some(old) => {
@@ -159,22 +185,40 @@ fn rv32_manifest(cache: &Path) -> ExitCode {
 }
 
 fn rv32_verify() -> ExitCode {
-    match verify(&root()) {
-        Ok(manifest) => {
-            println!(
-                "{} fixtures match {MANIFEST_PATH} (riscv-tests {}, {} excluded)",
-                manifest.selected.len(),
-                manifest.commit,
-                manifest.excluded.len()
-            );
-            ExitCode::SUCCESS
-        }
+    let root = root();
+    let mut ok = true;
+    match verify(&root) {
+        Ok(manifest) => println!(
+            "{} fixtures match {MANIFEST_PATH} (riscv-tests {}, {} excluded)",
+            manifest.selected.len(),
+            manifest.commit,
+            manifest.excluded.len()
+        ),
         Err(errors) => {
+            ok = false;
             eprintln!("the fixtures do not match {MANIFEST_PATH}:");
             for e in errors {
                 eprintln!("  {e}");
             }
-            ExitCode::FAILURE
         }
+    }
+    match hello::verify(&root) {
+        Ok(manifest) => println!(
+            "{} matches {HELLO_MANIFEST} (BLAKE3 {})",
+            manifest.elf,
+            systemscope_rv32::hex(&manifest.blake3)
+        ),
+        Err(errors) => {
+            ok = false;
+            eprintln!("hello.elf does not match {HELLO_MANIFEST}:");
+            for e in errors {
+                eprintln!("  {e}");
+            }
+        }
+    }
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }

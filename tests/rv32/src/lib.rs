@@ -11,6 +11,8 @@
 //! - [`manifest`] writes and checks `fixtures/manifest.json`, the acceptance contract: the
 //!   selected ELFs, their hashes, and the pins they were built with.
 //! - [`runner`] runs a fixture on the reference platform and applies the pass rule.
+//! - [`hello`] is M1-A5: `hello.elf`, built from `hello/hello.S` with the same toolchain,
+//!   pinned by its own `hello/manifest.json`, and run on `m1-reference` with the UART.
 //!
 //! Tests only read the committed fixtures. `cargo xtask rv32-fixtures build` rebuilds
 //! them on Linux, and `cargo xtask rv32-fixtures verify` checks them without a network or
@@ -18,6 +20,7 @@
 
 use std::path::{Path, PathBuf};
 
+pub mod hello;
 pub mod manifest;
 pub mod runner;
 pub mod upstream;
@@ -79,6 +82,9 @@ pub const FLAGS: [&str; 8] = [
 pub const RAM_BASE: u32 = 0x8000_0000;
 /// 16 MiB.
 pub const RAM_SIZE: u32 = 0x0100_0000;
+/// The base of `m1-reference`'s `SimpleUart` (§9); its window is
+/// [`systemscope_platform::uart::SIZE`] bytes.
+pub const UART_BASE: u32 = 0x1000_0000;
 /// `m1-reference`'s instruction limit (§9). The longest test retires a few thousand
 /// instructions, so reaching it means a test is stuck, and fails it.
 pub const MAX_INSTRUCTIONS: u64 = 10_000_000;

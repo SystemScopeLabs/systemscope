@@ -104,7 +104,7 @@ impl Fixture {
 }
 
 /// Loads a fixture for the `m1-reference` RAM and requires the entry at its base.
-fn load(name: &str, bytes: &[u8]) -> Result<LoadImage, String> {
+pub(crate) fn load(name: &str, bytes: &[u8]) -> Result<LoadImage, String> {
     let image = load_elf32(bytes, RAM_BASE, RAM_SIZE)
         .map_err(|e| format!("{name}: the loader rejects the ELF: {e}"))?;
     if image.entry != RAM_BASE {
@@ -490,9 +490,13 @@ pub fn verify(root: &Path) -> Result<Manifest, Vec<String>> {
 }
 
 fn fixture_dir_entries(root: &Path) -> Result<Vec<String>, String> {
-    let dir = root.join(FIXTURE_DIR);
+    dir_entries(&root.join(FIXTURE_DIR))
+}
+
+/// The file names in `dir`, sorted.
+pub(crate) fn dir_entries(dir: &Path) -> Result<Vec<String>, String> {
     let mut names = Vec::new();
-    for entry in fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))? {
+    for entry in fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))? {
         let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
         names.push(entry.file_name().to_string_lossy().into_owned());
     }
@@ -500,27 +504,27 @@ fn fixture_dir_entries(root: &Path) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-fn q(s: &str) -> String {
+pub(crate) fn q(s: &str) -> String {
     Value::String(s.to_owned()).to_string()
 }
 
-fn s(v: &Value) -> Result<String, String> {
+pub(crate) fn s(v: &Value) -> Result<String, String> {
     v.as_str()
         .map(str::to_owned)
         .ok_or_else(|| format!("{v} is not a string"))
 }
 
-fn array(v: &Value) -> Result<&Vec<Value>, String> {
+pub(crate) fn array(v: &Value) -> Result<&Vec<Value>, String> {
     v.as_array().ok_or_else(|| format!("{v} is not an array"))
 }
 
-fn digest(v: &Value) -> Result<[u8; 32], String> {
+pub(crate) fn digest(v: &Value) -> Result<[u8; 32], String> {
     v.as_str()
         .and_then(unhex32)
         .ok_or_else(|| format!("{v} is not a digest"))
 }
 
-fn addr(v: &Value) -> Result<u32, String> {
+pub(crate) fn addr(v: &Value) -> Result<u32, String> {
     v.as_str()
         .and_then(|s| s.strip_prefix("0x"))
         .filter(|s| s.len() == 8)

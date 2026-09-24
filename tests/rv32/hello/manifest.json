@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "toolchain": {
+    "distro": "Ubuntu 24.04 (noble)",
+    "packages": [
+      {
+        "name": "gcc-riscv64-unknown-elf",
+        "version": "13.2.0-11ubuntu1+12",
+        "deb_sha256": "47d4670801c391c65513e2002a19280c6bbdba158f5a467ac5100bff813de0e3",
+        "version_line": "riscv64-unknown-elf-gcc (13.2.0-11ubuntu1+12) 13.2.0"
+      },
+      {
+        "name": "binutils-riscv64-unknown-elf",
+        "version": "2.42-1ubuntu1+6",
+        "deb_sha256": "d42d42efdaa0563155d0e1263675852255b20864cc525db9265247a5dec2ce30",
+        "version_line": "GNU assembler (2.42-1ubuntu1+6) 2.42"
+      }
+    ]
+  },
+  "flags": [
+    "-march=rv32i",
+    "-mabi=ilp32",
+    "-static",
+    "-mcmodel=medany",
+    "-fvisibility=hidden",
+    "-nostdlib",
+    "-nostartfiles",
+    "-Wl,--build-id=none"
+  ],
+  "ram": { "base": "0x80000000", "size": "0x01000000" },
+  "inputs": [
+    { "path": "tests/rv32/env/linker.ld", "blake3": "1747fc515d091319e0ba703d5800f11d745bf9f722f9a00f88996fcd4d534032" },
+    { "path": "tests/rv32/hello/build-hello.sh", "blake3": "f0f1bd9adec696cbd5b8c1ff951ef64fe113d7dcef41e0bf74c4d72935645774" },
+    { "path": "tests/rv32/hello/hello.S", "blake3": "95e8b6b43201eee8763037c130f5b4e9b779f4d33b0ad049f8048dfb523cee93" }
+  ],
+  "elf": "hello.elf",
+  "blake3": "dc71b5704372a89040d829b665196a8d77e5f6a16c0a93c0ed9f226ba85d1eec",
+  "image_hash": "dc71b5704372a89040d829b665196a8d77e5f6a16c0a93c0ed9f226ba85d1eec",
+  "entry": "0x80000000"
+}

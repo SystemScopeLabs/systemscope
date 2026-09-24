@@ -1,14 +1,17 @@
 //! Runs the `rv32ui` fixtures and applies the pass rule (`docs/m1-design.md` §10.2).
 //!
 //! Every fixture runs alone on the same platform: `m1-reference` (§9) without the UART,
-//! which no `rv32ui` test touches.
+//! which no `rv32ui` test touches. `hello.elf` runs on the whole `m1-reference`, UART
+//! included ([`platform`] with `uart`, as [`crate::hello`] uses it).
 //!
 //! ```text
 //! soc.cpu0  Rv32iCpu (100 MHz, entry = ELF entry, max_instructions 10,000,000)
 //!   │ mem ─▶ cpu          link Cycles { cpu, 1 }
 //! soc.bus   AddressBus
-//!   └─ ram ─▶ mem         link Cycles { cpu, 1 }
+//!   ├─ ram  ─▶ mem        link Cycles { cpu, 1 }
+//!   └─ uart ─▶ mem        link Cycles { cpu, 1 }   (with the UART only)
 //! soc.ram   Ram           base 0x8000_0000, 16 MiB, responds Cycles { cpu, 0 }, the ELF image
+//! soc.uart  SimpleUart    base 0x1000_0000, 8 bytes, responds Cycles { cpu, 0 }
 //! ```
 //!
 //! **Pass rule:** the CPU halts with `Trap(EnvironmentCall)`, `gp == 1`, and `a0 == 0`.
@@ -27,13 +30,16 @@ use systemscope_contracts::time::{Frequency, Rounding, SimulationClock, Tick};
 use systemscope_contracts::topology::LinkLatency;
 use systemscope_contracts::trace::Value;
 use systemscope_elf::LoadImage;
-use systemscope_platform::{AddressBus, Ram, RamConfig, RamImage, Region, Segment};
-use systemscope_runtime::runtime::{Runtime, SessionConfig};
+use systemscope_platform::{
+    AddressBus, Ram, RamConfig, RamImage, Region, Segment, SimpleUart, UartConfig, uart,
+};
+use systemscope_runtime::runtime::{Dispatched, Runtime, SessionConfig};
 use systemscope_runtime::topology::TopologyBuilder;
+use systemscope_runtime::trace::Trace;
 use systemscope_rv32i::{Rv32iConfig, Rv32iCpu};
 
 use crate::manifest::{Fixture, Manifest};
-use crate::{MAX_INSTRUCTIONS, RAM_BASE, RAM_SIZE, hex};
+use crate::{MAX_INSTRUCTIONS, RAM_BASE, RAM_SIZE, UART_BASE, hex};
 
 /// The CPU clock of `m1-reference`.
 pub const CPU_HZ: u64 = 100_000_000;
@@ -43,6 +49,15 @@ pub const PASS_GP: u32 = 1;
 pub const PASS_A0: u32 = 0;
 /// The trap cause `RVTEST_PASS` and `RVTEST_FAIL` end with.
 pub const PASS_CAUSE: &str = "EnvironmentCall";
+
+/// `soc.cpu0`.
+pub const CPU: ComponentId = ComponentId(0);
+/// `soc.bus`.
+pub const BUS: ComponentId = ComponentId(1);
+/// `soc.ram`.
+pub const RAM: ComponentId = ComponentId(2);
+/// `soc.uart`, on a platform with the UART.
+pub const UART: ComponentId = ComponentId(3);
 
 /// How the run ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -117,18 +132,24 @@ pub fn judge(outcome: &Outcome) -> Result<(), String> {
     Ok(())
 }
 
-/// Keeps the CPU's view after every event, and passes the rest on.
-struct Probe(Rc<RefCell<Option<StateView>>>);
+/// Keeps every component's view after every event, and passes the rest on.
+struct Probe(Rc<RefCell<Vec<StateView>>>);
 
 impl Observer for Probe {
     fn on_after_dispatch(&mut self, _: &EventView<'_>, world: &WorldView<'_>) -> Control {
-        *self.0.borrow_mut() = world.inspect(ComponentId(0));
+        *self.0.borrow_mut() = (0..world.component_count())
+            .map(|i| {
+                let id = ComponentId(u32::try_from(i).expect("four components at most"));
+                world.inspect(id).unwrap_or_default()
+            })
+            .collect();
         Control::Continue
     }
 }
 
-/// The platform for `image`, elaborated. The CPU is `ComponentId(0)`.
-fn platform(image: &LoadImage) -> Runtime {
+/// `m1-reference` (§9) for `image`, elaborated, with the UART if `uart`. The components
+/// are [`CPU`], [`BUS`], [`RAM`], and [`UART`], in that order.
+pub fn platform(image: &LoadImage, uart: bool) -> Runtime {
     let mut t = TopologyBuilder::new(SimulationClock::default());
     let cpu_clock = t
         .add_clock(
@@ -144,12 +165,19 @@ fn platform(image: &LoadImage) -> Runtime {
     })
     .expect("the loader guarantees an aligned entry");
     let cpu = t.add_component("soc.cpu0", Box::new(cpu));
-    let bus = AddressBus::new(vec![Region {
+    let mut regions = vec![Region {
         name: "ram",
         base: u64::from(RAM_BASE),
         size: u64::from(RAM_SIZE),
-    }])
-    .expect("one region");
+    }];
+    if uart {
+        regions.push(Region {
+            name: "uart",
+            base: u64::from(UART_BASE),
+            size: uart::SIZE,
+        });
+    }
+    let bus = AddressBus::new(regions).expect("disjoint regions");
     let bus = t.add_component("soc.bus", Box::new(bus));
     let ram = Ram::new(
         RamConfig {
@@ -169,6 +197,16 @@ fn platform(image: &LoadImage) -> Runtime {
     };
     t.connect((cpu, "mem"), (bus, "cpu"), Some(link));
     t.connect((bus, "ram"), (ram, "mem"), Some(link));
+    if uart {
+        let device = SimpleUart::new(UartConfig {
+            latency: LinkLatency::Cycles {
+                domain: cpu_clock,
+                k: 0,
+            },
+        });
+        let device = t.add_component("soc.uart", Box::new(device));
+        t.connect((bus, "uart"), (device, "mem"), Some(link));
+    }
     t.elaborate(SessionConfig::default())
         .expect("the platform elaborates")
 }
@@ -191,20 +229,64 @@ fn ram_image(image: &LoadImage) -> RamImage {
 /// Runs `image` until the runtime has no more events. `traced` records a trace;
 /// `observers` are added after the runner's own, which only reads.
 pub fn run(image: &LoadImage, traced: bool, observers: Vec<Box<dyn Observer>>) -> Outcome {
-    let mut rt = platform(image);
-    let last = Rc::new(RefCell::new(None));
+    execute(platform(image, false), Start::Init { traced }, observers).outcome
+}
+
+/// How [`execute`] starts a session.
+#[derive(Debug)]
+pub enum Start {
+    /// A new session: `init`, recording a trace if `traced`.
+    Init {
+        /// Whether to record a trace.
+        traced: bool,
+    },
+    /// A checkpoint: `restore` the snapshot, then continue the trace `prefix`, if any.
+    Restore {
+        /// A snapshot of the same platform.
+        snapshot: Vec<u8>,
+        /// The trace recorded up to the snapshot.
+        prefix: Option<Trace>,
+    },
+}
+
+/// A session run to its end.
+#[derive(Debug)]
+pub struct Finished {
+    /// How it ended, and its digests.
+    pub outcome: Outcome,
+    /// Every component's view after the last event, by `ComponentId`; empty if no event
+    /// ran.
+    pub views: Vec<StateView>,
+    /// The events dispatched after the start, in order.
+    pub dispatched: Vec<Dispatched>,
+    /// The trace, if one was recorded.
+    pub trace: Option<Trace>,
+}
+
+/// Starts the elaborated `rt` as `start` says and runs it until it has no more events.
+/// `observers` are added after the runner's own, which only reads.
+pub fn execute(mut rt: Runtime, start: Start, observers: Vec<Box<dyn Observer>>) -> Finished {
+    let last = Rc::new(RefCell::new(Vec::new()));
     rt.add_observer(Box::new(Probe(Rc::clone(&last))));
     for observer in observers {
         rt.add_observer(observer);
     }
-    if traced {
-        rt.start_trace().expect("tracing starts before init");
-    }
-    let mut events = 0;
-    let mut fault = rt.init().err().map(|e| e.to_string());
+    let mut fault = match start {
+        Start::Init { traced } => {
+            if traced {
+                rt.start_trace().expect("tracing starts before init");
+            }
+            rt.init().err().map(|e| e.to_string())
+        }
+        Start::Restore { snapshot, prefix } => match rt.restore(&snapshot) {
+            Err(e) => Some(e.to_string()),
+            Ok(()) => prefix.and_then(|p| rt.resume_trace(p).err().map(|e| format!("{e:?}"))),
+        },
+    };
+    let mut dispatched = Vec::new();
     while fault.is_none() {
         match rt.step() {
-            Ok(Some(_)) => events += 1,
+            Ok(Some(ev)) => dispatched.push(ev),
             Ok(None) => break,
             Err(e) => fault = Some(e.to_string()),
         }
@@ -212,7 +294,8 @@ pub fn run(image: &LoadImage, traced: bool, observers: Vec<Box<dyn Observer>>) -
     if let Some(e) = rt.fault() {
         fault = Some(e.to_string());
     }
-    let view = last.take().unwrap_or_default();
+    let views = last.take();
+    let view = views.get(CPU.0 as usize).cloned().unwrap_or_default();
     let reg = |name: &str| match view.get(name) {
         Some(Value::U64(v)) => *v,
         _ => 0,
@@ -231,16 +314,25 @@ pub fn run(image: &LoadImage, traced: bool, observers: Vec<Box<dyn Observer>>) -
         (None, Some(Value::Str(h))) if h == "instruction_limit" => End::InstructionLimit,
         (None, _) => End::NotHalted,
     };
-    Outcome {
-        state: rt.state_digest().ok(),
-        execution: rt.execution_digest(),
-        trace: rt.take_trace().map(|t| t.digest()),
+    let state = rt.state_digest().ok();
+    let execution = rt.execution_digest();
+    let trace = rt.take_trace();
+    let outcome = Outcome {
+        state,
+        execution,
+        trace: trace.as_ref().map(Trace::digest),
         end,
         gp: word("x3"),
         a0: word("x10"),
         pc: word("pc"),
         instret: reg("instret"),
-        events,
+        events: dispatched.len() as u64,
+    };
+    Finished {
+        outcome,
+        views,
+        dispatched,
+        trace,
     }
 }
 
