@@ -79,9 +79,9 @@ systemscope/
 ├─ components/rv32i/      systemscope-rv32i: decode, execute, Rv32iCpu
 ├─ components/platform/   systemscope-platform: AddressBus, Ram, SimpleUart
 ├─ elf/                   systemscope-elf: host-side ELF32 loader (not a component)
-├─ reference/             adds m1-reference (§9) next to m0-reference
-├─ tests/acceptance/      adds the M1 acceptance tests and the m1-run binary
+├─ tests/acceptance/      adds the M1 acceptance tests (src/m1/, tests/m1_a*.rs) and the m1-run binary
 ├─ tests/rv32/
+│  ├─ src/runner.rs       builds the m1-reference platform (§9)
 │  ├─ env/                the SystemScope riscv-tests environment (§10.2)
 │  ├─ fixtures/           committed ELFs and manifest.json (§10.6)
 │  └─ progen/             deterministic random-program generator (§10.3)
@@ -91,6 +91,7 @@ systemscope/
 - **Components depend only on `systemscope-contracts`,** as in M0. `systemscope-rv32i` knows nothing about the memory map, the RAM, or the UART.
 - **`systemscope-elf` depends on nothing in the simulation.** It turns bytes into a checked load image (§8). The reference builder passes that image to `Ram` and the entry point to `Rv32iCpu` as construction parameters.
 - `.gitattributes` marks `*.elf` as binary, as it does `*.snap`.
+- **The `m1-reference` builder lives in the test crate** (`tests/rv32/src/runner.rs`, M1.8), not in `reference/`: it is only ever used to run committed ELFs in tests, and `reference/` keeps only `m0-reference`.
 
 ---
 
@@ -500,7 +501,9 @@ soc.bus   AddressBus
 
 A 100 MHz clock is 10,000 ticks per cycle at the default 1 ps resolution. It is chosen only to keep tick values readable, and carries no performance meaning (§5.4).
 
-**Status (M1.7b):** the test crate builds this topology in `tests/rv32/src/runner.rs` (`runner::platform`), with component ids `soc.cpu0` = 0, `soc.bus` = 1, `soc.ram` = 2, and `soc.uart` = 3. It is a small helper for the test runs, not the reference builder: the `rv32ui` runs leave out the UART region, which none of them touches, and `hello.elf` runs include it. The named reference builder, the golden file, and the portable snapshot are M1.8.
+**Status (M1.8):** `tests/rv32/src/runner.rs` is the `m1-reference` builder (`runner::platform`, and `runner::platform_with_seed` for the seed checks), with component ids `soc.cpu0` = 0, `soc.bus` = 1, `soc.ram` = 2, and `soc.uart` = 3, and the session seed `runner::SEED` = 0. The `rv32ui` runs leave out the UART region, which none of them touches, and `hello.elf` runs include it. The golden file and the portable snapshot are built on it (§10.1).
+
+The seed reaches only the session information: the seed recorded in the snapshot and the trace header, and the components' RNG streams, which nothing draws from. M1-A8 checks this with M0's other fixed seeds (`1`, `0xDEADBEEF`) on `hello` and `ld_st`: the event count, `ExecutionDigest`, every trace record, and every component's state equal seed 0's, while `StateDigest` and `TraceDigest` change with the recorded seed. No check requires that different seeds give different digests.
 
 ---
 
@@ -544,6 +547,16 @@ The trace continues through `resume_trace(prefix)` exactly as in M0 AT-2. The po
 **M1-A7** reuses the M0 configurations O0–O5. The breakpoint in O2 pauses on every CPU `Commit` event, and the probe in O4 inspects every component.
 
 **Digests:** `StateDigest`, `ExecutionDigest`, and `TraceDigest` are exactly as in M0 (m0-design §9.2). The M1 golden file records, per committed program: `image_hash`, halt reason, `instret`, the UART output's BLAKE3, the event count, and the three digests.
+
+**Status (M1.8):** M1-A6 to M1-A8 are implemented in `tests/acceptance` (`src/m1/`, `tests/m1_a6.rs`, `tests/m1_a7.rs`, `tests/m1_a8.rs`), on the §9 builder. The canonical workload is `hello.elf`; the committed programs are `hello` and the 40 selected `rv32ui` tests (§10.2), which remain the M1-A2 regression suite.
+
+- **Golden file** `tests/golden/m1-reference.json`, separate from the M0 golden files, which are unchanged. It records the compatibility id and the seed, and for each program, in a fixed order: the ELF's BLAKE3 and the RAM's `image_hash`, the halt cause, trap `pc` and `tval`, `instret`, the event count, `pc` and `x1`–`x31` at the end, the UART bytes (hex) and their BLAKE3 (`hello` only), and the three digests. It is rendered by hand: fixed field order, lowercase hex, LF line ends, no paths or timestamps. `hello` ends in `Trap(EnvironmentCall)` with `gp` = 1, `a0` = 0, `instret` = 87, 728 events, and exactly `Hello, SystemScope!\n`.
+- **Portable snapshot** `tests/golden/m1-reference.mid.snap` (8,942 bytes): `hello` after 355 events, right after the UART accepts its tenth byte, with that byte's `WriteResp` the only queued event. This point exercises every component and the reissue hazard at once: a wrong restore would print a byte twice, send the store again, or lose the response. The golden file records its program, checkpoint, event index, seed, compatibility id, `image_hash`, size, and BLAKE3. Its check is M0 AT-2 step 4 plus the UART: bytes, restore, round-trip, then a run with no trace prefix to the golden event count, `StateDigest`, `ExecutionDigest`, registers, the full output, and exactly the ten remaining UART writes.
+- **M1-A6 checkpoints** on `hello` (728 events) and `ld_st` (7,718 events, the long `rv32ui` test) are found structurally from each run's CPU states and messages, and checked to be what their names say. `ld_st` has no UART, so it has no UART checkpoint. Each snapshot is dropped and restored into a freshly elaborated platform, which resumes the trace prefix; the resumed run must give the same final digests, trace bytes, registers, and UART output, and replay exactly the uninterrupted run's remaining events. The M1.7b every-event checkpoint test for `hello` (M1-A5) stays.
+- **M1-A6 rejections:** another ELF, another topology, another seed or compatibility id, and doctored CPU, RAM, UART, and bus configurations are refused by the existing restore rules; so are truncated, extended, and bad-magic snapshots and impossible CPU states.
+- **M1-A7:** O1–O5 end exactly like O0 for `hello` and `ld_st` (M0's `ensure_invariant`: digests, RNG, scheduler, every component), O1 and O5 record the same, golden trace, and O2 pauses once per CPU `Commit` (88 for `hello`, 963 for `ld_st`).
+- **M1-A8:** a fresh run of every program equals the golden file field by field and byte for byte, in the test process and in two `m1-run` processes; fresh platforms repeat every field; the seed matrix is §9's.
+- **Cross-OS:** each CI test job emits its own result and snapshot (`cargo xtask m1-golden emit`), and the `m1-cross-os` job has Windows check the Linux result and Linux check the Windows one (`cargo xtask m1-golden check`): equal to the committed files and the local run, and the foreign snapshot restores to the golden end.
 
 ### 10.2 `riscv-tests` Under a SystemScope Environment
 
@@ -621,7 +634,8 @@ ACT4 builds self-checking ELFs: it runs each test on the Sail reference model, c
 - **Blocking, both operating systems:** everything in M0 CI (including the M0 acceptance tests and the golden-unchanged check), then:
   - M1-A1, M1-A2, M1-A4, M1-A5, M1-A6, M1-A7;
   - M1-A8 against the committed fixtures;
-  - `cargo xtask rv32-fixtures verify`, which checks every committed fixture against its manifest (§10.6), and a check that the fixtures are unchanged after the run.
+  - `cargo xtask rv32-fixtures verify`, which checks every committed fixture against its manifest (§10.6), and a check that the fixtures are unchanged after the run;
+  - `cargo xtask m1-golden verify`, and the `m1-cross-os` job, which restores and checks each operating system's M1 result on the other (§10.1). CI never blesses.
 
   These need no external tools: they run the committed ELFs.
 - **Blocking, Linux only:**
@@ -714,7 +728,7 @@ The toolchain needed to build ELFs (a RISC-V GCC or Clang), Spike, Sail, and ACT
 
 ## 12. Implementation Order
 
-Status: M1.0 through M1.5 are complete. M1.6, the `rv32ui` fixtures and runner, is implemented, and all 40 selected tests pass. M1.7a, the standalone `SimpleUart`, is complete. M1.7b, `hello.elf` printing through the CPU, bus, and UART, is complete (§10.7). M1.8 is not started.
+Status: M1.0 through M1.5 are complete. M1.6, the `rv32ui` fixtures and runner, is implemented, and all 40 selected tests pass. M1.7a, the standalone `SimpleUart`, is complete. M1.7b, `hello.elf` printing through the CPU, bus, and UART, is complete (§10.7). M1.8, M1-A6 to M1-A8 with the `m1-reference` golden file and the portable snapshot, is implemented (§10.1). M1.9 is not started.
 
 1. **M1.0:** this document; the `plan.md` M1 update; in `contracts`, the compatibility id (§4.5) and the `mem.v1` contract, followed by a pin bump in `systemscope`, with the M0 golden digests unchanged.
 2. **M1.1:** `decode`, the immediate extractors, and the register file, with `IllegalInstruction` from the start.
