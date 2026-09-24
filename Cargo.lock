@@ -484,6 +484,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "systemscope-rv32"
+version = "0.0.0"
+dependencies = [
+ "blake3",
+ "serde_json",
+ "systemscope-elf",
+]
+
+[[package]]
 name = "systemscope-rv32i"
 version = "0.0.0"
 dependencies = [
@@ -656,6 +665,7 @@ name = "xtask"
 version = "0.0.0"
 dependencies = [
  "systemscope-acceptance",
+ "systemscope-rv32",
 ]
 
 [[package]]

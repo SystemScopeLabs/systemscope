@@ -3,3 +3,4 @@
 # Exact-byte test artifacts
 *.jsonl -text
 *.snap -text
+*.elf -text

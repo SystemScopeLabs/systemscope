@@ -3,18 +3,40 @@
 //! - `bless`: runs `m0-reference` for every fixed seed and rewrites the golden files in
 //!   `tests/golden/`, printing what changed. Tests never write golden files; this is the
 //!   only way they change, and the commit that changes them must say why in its body.
+//! - `rv32-fixtures build`: Linux only, with the pinned toolchain on `PATH`. Rebuilds the
+//!   40 `rv32ui` fixtures from the pinned `riscv-tests` with `tests/rv32/build-fixtures.sh`
+//!   (the only step that uses the network), then runs the `manifest` step. Tests never
+//!   rebuild fixtures; the commit that changes them must say why in its body.
+//! - `rv32-fixtures manifest [<cache-dir>]`: the second half of `build`, for a build run
+//!   by hand. Checks the upstream checkout in the cache (default `target/rv32-fixtures`),
+//!   rewrites `tests/rv32/fixtures/manifest.json`, and verifies.
+//! - `rv32-fixtures verify`: checks the committed fixtures against the manifest, with no
+//!   network and no compiler.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 use systemscope_acceptance::golden::{GOLDEN_PATH, Golden, MID_SNAPSHOT_PATH, describe_changes};
+use systemscope_rv32::manifest::{Manifest, verify};
+use systemscope_rv32::{BUILD_SCRIPT, FIXTURE_DIR, MANIFEST_PATH, SELECTED, upstream};
+
+const USAGE: &str = "usage: cargo xtask bless\n       \
+                     cargo xtask rv32-fixtures build | manifest [<cache-dir>] | verify";
+/// Where `rv32-fixtures build` fetches and builds, relative to the workspace root.
+const RV32_CACHE: &str = "target/rv32-fixtures";
 
 fn main() -> ExitCode {
-    match std::env::args().nth(1).as_deref() {
-        Some("bless") => bless(),
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    match args.as_slice() {
+        ["bless"] => bless(),
+        ["rv32-fixtures", "build"] => rv32_build(),
+        ["rv32-fixtures", "manifest"] => rv32_manifest(&root().join(RV32_CACHE)),
+        ["rv32-fixtures", "manifest", cache] => rv32_manifest(Path::new(cache)),
+        ["rv32-fixtures", "verify"] => rv32_verify(),
         _ => {
-            eprintln!("usage: cargo xtask bless");
+            eprintln!("{USAGE}");
             ExitCode::FAILURE
         }
     }
@@ -70,4 +92,89 @@ fn bless() -> ExitCode {
          (see CONTRIBUTING.md)."
     );
     ExitCode::SUCCESS
+}
+
+fn rv32_build() -> ExitCode {
+    if !cfg!(target_os = "linux") {
+        eprintln!("rv32-fixtures build runs on Linux only (docs/m1-design.md §10.6)");
+        return ExitCode::FAILURE;
+    }
+    let root = root();
+    let status = Command::new("bash")
+        .arg(BUILD_SCRIPT)
+        .arg(RV32_CACHE)
+        .arg(FIXTURE_DIR)
+        .args(SELECTED)
+        .current_dir(&root)
+        .status();
+    match status {
+        Ok(s) if s.success() => rv32_manifest(&root.join(RV32_CACHE)),
+        Ok(s) => {
+            eprintln!("{BUILD_SCRIPT} failed: {s}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("cannot run {BUILD_SCRIPT}: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn rv32_manifest(cache: &Path) -> ExitCode {
+    let root = root();
+    if let Err(errors) = upstream::check(&cache.join("riscv-tests")) {
+        eprintln!("the riscv-tests checkout in {} fails:", cache.display());
+        for e in errors {
+            eprintln!("  {e}");
+        }
+        return ExitCode::FAILURE;
+    }
+    let old = Manifest::read(&root).ok();
+    let new = match Manifest::generate(&root) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("cannot generate the manifest: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = fs::write(root.join(MANIFEST_PATH), new.render()) {
+        eprintln!("cannot write {MANIFEST_PATH}: {e}");
+        return ExitCode::FAILURE;
+    }
+    match &old {
+        None => println!("wrote a new {MANIFEST_PATH}"),
+        Some(old) => {
+            let changes = systemscope_rv32::manifest::describe_differences(old, &new);
+            if changes.is_empty() {
+                println!("{MANIFEST_PATH} is up to date");
+            } else {
+                println!("{MANIFEST_PATH} changed:");
+                for change in changes {
+                    println!("  {change}");
+                }
+            }
+        }
+    }
+    rv32_verify()
+}
+
+fn rv32_verify() -> ExitCode {
+    match verify(&root()) {
+        Ok(manifest) => {
+            println!(
+                "{} fixtures match {MANIFEST_PATH} (riscv-tests {}, {} excluded)",
+                manifest.selected.len(),
+                manifest.commit,
+                manifest.excluded.len()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(errors) => {
+            eprintln!("the fixtures do not match {MANIFEST_PATH}:");
+            for e in errors {
+                eprintln!("  {e}");
+            }
+            ExitCode::FAILURE
+        }
+    }
 }
