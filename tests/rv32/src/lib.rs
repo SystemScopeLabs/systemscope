@@ -15,7 +15,9 @@
 //!   pinned by its own `hello/manifest.json`, and run on `m1-reference` with the UART.
 //! - [`spike`] is M1-A3: every selected fixture's retirements against the pinned Spike's
 //!   commit log. Only `cargo xtask spike diff` runs Spike; tests use committed Spike logs.
-//!
+//! - [`progen`] is the rest of M1-A3: seeded RV32I programs for the same differential,
+//!   64 fixed seeds pinned by one digest plus a nightly random seed, and one
+//!   misaligned-access program per load and store width that must trap on both sides.
 //! - [`act4`] is M1-A4: the ACT4 RV32I corpus under `tests/act4`, self-checking ELFs with
 //!   expected values from the Sail reference model, pinned by `tests/act4/manifest.json`.
 //!   Only `cargo xtask act4 build` runs ACT4 and Sail.
@@ -29,6 +31,7 @@ use std::path::{Path, PathBuf};
 pub mod act4;
 pub mod hello;
 pub mod manifest;
+pub mod progen;
 pub mod runner;
 pub mod spike;
 pub mod upstream;

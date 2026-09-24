@@ -1,5 +1,5 @@
-//! M1-A3: the `rv32ui` fixtures against Spike, retirement by retirement
-//! (`docs/m1-design.md` §10.3).
+//! M1-A3: the `rv32ui` fixtures, and the [`progen`] programs, against Spike, retirement by
+//! retirement (`docs/m1-design.md` §10.3).
 //!
 //! ```text
 //! committed rv32ui-*.elf ──▶ Rv32iCpu on m1-reference ──rv32.commit trace──▶ [Retire] ─┐
@@ -23,6 +23,11 @@
 //!
 //! **Spike's exit status is not a verdict.** Spike exits 0 on its instruction limit too,
 //! so a run counts only with exit 0, no output, and the boundary above.
+//!
+//! **Generated programs** end like the fixtures and are judged the same way
+//! ([`judge_pass`]). **Trap programs** end in a misaligned access instead: Spike runs them
+//! with `-l` ([`spike_trap_args`]), whose log also names the trap, and [`judge_trap`]
+//! requires both sides to stop at the same instruction with the same cause and trap value.
 
 use std::fmt;
 use std::fs;
@@ -31,11 +36,13 @@ use std::process::Command;
 
 use systemscope_contracts::observe::StateView;
 use systemscope_contracts::trace::Value;
+use systemscope_elf::LoadImage;
 use systemscope_runtime::trace::Trace;
 use systemscope_rv32i::cpu::{COMMIT_KIND, HALT_KIND, TRAP_KIND};
 
-use crate::manifest::{Fixture, Manifest};
-use crate::runner::{self, CPU, End, PASS_CAUSE, Start};
+use crate::manifest::{Fixture, Manifest, load};
+use crate::progen::{self, ExpectedTrap, MISALIGNED, Program};
+use crate::runner::{self, CPU, End, Finished, PASS_CAUSE, Start};
 use crate::{FIXTURE_DIR, MAX_INSTRUCTIONS, RAM_BASE, RAM_SIZE, SELECTED, hex};
 
 /// The upstream Spike repository.
@@ -62,6 +69,16 @@ pub const SPIKE_LOGS: &str = "target/spike-logs";
 /// Tests compare SystemScope against it without Spike; `cargo xtask spike verify`
 /// requires the installed Spike to write it again, byte for byte.
 pub const SIMPLE_LOG: &str = "tests/rv32/spike/rv32ui-simple.log";
+/// The committed log of the generated program for seed 0, like [`SIMPLE_LOG`].
+pub const PROGEN_LOG: &str = "tests/rv32/spike/progen-0000000000000000.log";
+/// The committed start of the `-l` log of one misaligned-access program: its
+/// [`TRAP_LOG_LINES`] first lines, through the trap and into Spike's handler.
+/// `cargo xtask spike verify` requires the installed Spike's log to start with them.
+pub const TRAP_LOG: &str = "tests/rv32/spike/misaligned-lw-1.log";
+/// The lines [`TRAP_LOG`] keeps.
+pub const TRAP_LOG_LINES: usize = 16;
+/// The [`MISALIGNED`] case of [`TRAP_LOG`].
+pub const TRAP_LOG_CASE: usize = 2;
 
 /// The Spike command line for one fixture, after the executable. `--pcs` starts hart 0 at
 /// the ELF entry: Spike sets the hart's `pc` directly, so its boot ROM at `0x1000` never
@@ -494,28 +511,42 @@ fn run_both(
     let elf = format!("{FIXTURE_DIR}/{}", fixture.elf);
     let bytes = fs::read(root.join(&elf)).map_err(|e| format!("{elf}: {e}"))?;
     let tohost = elf_symbol(&bytes, "tohost").ok_or(format!("{elf} has no tohost symbol"))?;
+    let (finished, text) = run_sides(root, &image, &elf, spike, log, false, executed)?;
+    judge_pass(&finished, &parse_spike_log(&text)?, image.entry, tohost)
+}
 
-    // SystemScope: the integrated CPU, traced. Both sides run before either is judged,
-    // so a divergence is reported where it starts.
+/// Runs `image` traced on SystemScope, then the ELF at `elf` on Spike, with `-l` if
+/// `trap`, writing Spike's log to `log`. Returns SystemScope's run and Spike's log. Both
+/// sides run before either is judged, so a divergence is reported where it starts.
+fn run_sides(
+    root: &Path,
+    image: &LoadImage,
+    elf: &str,
+    spike: &Path,
+    log: &str,
+    trap: bool,
+    executed: &mut (bool, bool),
+) -> Result<(Finished, String), String> {
+    // SystemScope: the integrated CPU, traced.
     let finished = runner::execute(
-        runner::platform(&image, false),
+        runner::platform(image, false),
         Start::Init { traced: true },
         Vec::new(),
     );
     executed.0 = true;
-    let ours = finished
-        .trace
-        .as_ref()
-        .ok_or_else(|| "SystemScope recorded no trace".to_owned())
-        .and_then(from_trace);
 
     // Spike.
     if let Some(dir) = Path::new(log).parent() {
         fs::create_dir_all(root.join(dir)).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
     let _ = fs::remove_file(root.join(log));
+    let args = if trap {
+        spike_trap_args(image.entry, elf, log)
+    } else {
+        spike_args(image.entry, elf, log)
+    };
     let out = Command::new(spike)
-        .args(spike_args(image.entry, &elf, log))
+        .args(args)
         .current_dir(root)
         .output()
         .map_err(|e| format!("cannot run {}: {e}", spike.display()))?;
@@ -529,25 +560,49 @@ fn run_both(
         ));
     }
     let text = fs::read_to_string(root.join(log)).map_err(|e| format!("{log}: {e}"))?;
-    let theirs = parse_spike_log(&text)?;
+    Ok((finished, text))
+}
 
-    // The streams, then where Spike's ends, then SystemScope's own pass rule (M1-A2).
-    let ours = ours?;
-    compare(&ours.retires, &theirs)?;
-    let n = check_boundary(&theirs, image.entry, tohost)?;
+/// SystemScope's traced run of a passing program.
+fn our_stream(finished: &Finished) -> Result<SystemScopeStream, String> {
+    finished
+        .trace
+        .as_ref()
+        .ok_or_else(|| "SystemScope recorded no trace".to_owned())
+        .and_then(from_trace)
+}
+
+/// The verdict for a program that ends at the passing `write_tohost`: the streams are
+/// equal, Spike's ends at the boundary, and SystemScope then halts on the `ECALL` right
+/// after it with the M1-A2 pass rule, `instret` equal to the record count, and the
+/// registers Spike's writes leave. Returns the record count.
+pub fn judge_pass(
+    finished: &Finished,
+    theirs: &[Retire],
+    entry: u32,
+    tohost: u32,
+) -> Result<usize, String> {
+    let ours = our_stream(finished)?;
+    compare(&ours.retires, theirs)?;
+    let n = check_boundary(theirs, entry, tohost)?;
     runner::judge(&finished.outcome).map_err(|e| format!("SystemScope: {e}"))?;
-    // SystemScope then halts on the ECALL right after the boundary, with the same
-    // registers Spike's writes leave.
     let last = theirs[n - 1].pc;
     match (&ours.trap, &finished.outcome.end) {
-        (Some((pc, cause)), End::Trap { .. })
-            if *pc == last.wrapping_add(4) && cause == PASS_CAUSE => {}
+        (Some((pc, cause)), End::Trap { pc: halt, .. })
+            if *pc == last.wrapping_add(4) && halt == pc && cause == PASS_CAUSE => {}
         other => {
             return Err(format!(
                 "SystemScope does not halt on the ECALL after {last:#010x}: {other:?}"
             ));
         }
     }
+    check_end_state(finished, theirs)?;
+    Ok(n)
+}
+
+/// SystemScope retired exactly `theirs`, and its registers are those Spike's writes leave.
+fn check_end_state(finished: &Finished, theirs: &[Retire]) -> Result<(), String> {
+    let n = theirs.len();
     if finished.outcome.instret != n as u64 {
         return Err(format!(
             "SystemScope retired {}, Spike {n}",
@@ -555,7 +610,7 @@ fn run_both(
         ));
     }
     let view = finished.views.get(CPU.0 as usize).ok_or("no CPU view")?;
-    let (ours, theirs) = (registers(view)?, replay(&theirs));
+    let (ours, theirs) = (registers(view)?, replay(theirs));
     if ours != theirs {
         let differ: Vec<String> = (0..32)
             .filter(|&i| ours[i] != theirs[i])
@@ -571,7 +626,248 @@ fn run_both(
             differ.join(", ")
         ));
     }
-    Ok(n)
+    Ok(())
+}
+
+/// Spike's command line for a trap program: [`spike_args`] with `-l`, which also logs
+/// every instruction as it executes and every trap it takes.
+pub fn spike_trap_args(entry: u32, elf: &str, log: &str) -> Vec<String> {
+    let mut args = vec!["-l".to_owned()];
+    args.extend(spike_args(entry, elf, log));
+    args
+}
+
+/// The trap Spike reports in a `-l` log.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpikeTrap {
+    /// `epc`: the trapping instruction's address.
+    pub pc: u32,
+    /// The trapping instruction's word, from its instruction line.
+    pub insn: u32,
+    /// Spike's name for the cause, such as `trap_load_address_misaligned`.
+    pub cause: String,
+    /// The trap value.
+    pub tval: u32,
+}
+
+/// Spike's name for each SystemScope trap cause (§6), as its `-l` log writes it.
+pub const SPIKE_CAUSES: [(&str, &str); 9] = [
+    (
+        "InstructionAddressMisaligned",
+        "trap_instruction_address_misaligned",
+    ),
+    ("InstructionAccessFault", "trap_instruction_access_fault"),
+    ("IllegalInstruction", "trap_illegal_instruction"),
+    ("Breakpoint", "trap_breakpoint"),
+    ("LoadAddressMisaligned", "trap_load_address_misaligned"),
+    ("LoadAccessFault", "trap_load_access_fault"),
+    ("StoreAddressMisaligned", "trap_store_address_misaligned"),
+    ("StoreAccessFault", "trap_store_access_fault"),
+    ("EnvironmentCall", "trap_machine_ecall"),
+];
+
+/// Parses a pinned-Spike `-l --log-commits` log up to its first trap, strictly. Each
+/// instruction is an instruction line, `core   0: <pc> (<insn>) <disassembly>`, then
+/// either its commit line (as [`parse_spike_log`] reads it) for the same `pc` and word,
+/// or the trap:
+///
+/// ```text
+/// core   0: exception <cause>, epc <pc>
+/// core   0:           tval <tval>
+/// ```
+///
+/// Only the `pc` and word of an instruction line are read; Spike's disassembly is not.
+/// Lines after the trap, Spike's handler at `mtvec`, are not compared (§10.3). A log with
+/// no trap is an error.
+pub fn parse_spike_trap_log(log: &str) -> Result<(Vec<Retire>, SpikeTrap), String> {
+    let mut lines = log.lines().enumerate();
+    let mut retires = Vec::new();
+    let at = |i: usize, why: &str, line: &str| format!("Spike log line {}: {why}: {line:?}", i + 1);
+    while let Some((i, line)) = lines.next() {
+        let (pc, insn) = instruction_line(line).map_err(|why| at(i, &why, line))?;
+        let Some((k, next)) = lines.next() else {
+            return Err(at(i, "the log ends after an instruction line", line));
+        };
+        if let Some(rest) = next.strip_prefix("core   0: exception ") {
+            let (cause, epc) = rest
+                .split_once(", epc ")
+                .ok_or_else(|| at(k, "no epc", next))?;
+            if !cause.starts_with("trap_") || epc != format!("{pc:#010x}") {
+                return Err(at(
+                    k,
+                    &format!("not a trap of the instruction at {pc:#010x}"),
+                    next,
+                ));
+            }
+            let (j, tval_line) = lines
+                .next()
+                .ok_or_else(|| at(k, "no tval line after the trap", next))?;
+            let tval = tval_line
+                .strip_prefix("core   0:           tval ")
+                .ok_or_else(|| at(j, "not the trap's tval line", tval_line))
+                .and_then(|t| word(t, 8).map_err(|why| at(j, &why, tval_line)))?;
+            let trap = SpikeTrap {
+                pc,
+                insn,
+                cause: cause.to_owned(),
+                tval,
+            };
+            return Ok((retires, trap));
+        }
+        let retire = parse_spike_line(next).map_err(|why| at(k, &why, next))?;
+        if (retire.pc, retire.insn) != (pc, insn) {
+            return Err(at(
+                k,
+                "not the commit of the instruction line before it",
+                next,
+            ));
+        }
+        retires.push(retire);
+    }
+    Err("Spike's log has no trap".to_owned())
+}
+
+/// The `pc` and word of an instruction line, `core   0: <pc> (<insn>) <disassembly>`.
+fn instruction_line(line: &str) -> Result<(u32, u32), String> {
+    let rest = line
+        .strip_prefix("core   0: 0x")
+        .ok_or("not a hart 0 instruction line")?;
+    let pc = word(&format!("0x{}", rest.get(..8).ok_or("no pc")?), 8)?;
+    let insn = rest
+        .get(8..)
+        .and_then(|r| r.strip_prefix(" ("))
+        .and_then(|r| r.get(..10))
+        .ok_or("no (instruction)")?;
+    let insn = word(insn, 8)?;
+    let prefix = format!("core   0: {pc:#010x} ({insn:#010x}) ");
+    match line.strip_prefix(&prefix) {
+        Some(disassembly) if !disassembly.trim().is_empty() => Ok((pc, insn)),
+        _ => Err(format!("not laid out as Spike writes it: {prefix:?}...")),
+    }
+}
+
+/// The verdict for a trap program: the streams are equal up to the trap, both sides trap
+/// on the same instruction with the same cause and `tval`, and that trap is `expected`.
+/// SystemScope retired exactly Spike's records, with the registers they leave. Returns
+/// the record count.
+pub fn judge_trap(
+    finished: &Finished,
+    theirs: &[Retire],
+    trap: &SpikeTrap,
+    expected: &ExpectedTrap,
+) -> Result<usize, String> {
+    let ours = our_stream(finished)?;
+    compare(&ours.retires, theirs)?;
+    let spike_cause = SPIKE_CAUSES
+        .iter()
+        .find(|(ours, _)| *ours == expected.cause)
+        .map(|(_, theirs)| *theirs)
+        .ok_or_else(|| format!("no Spike name for {}", expected.cause))?;
+    let spike_says = (trap.pc, trap.insn, trap.cause.as_str(), trap.tval);
+    if spike_says != (expected.pc, expected.insn, spike_cause, expected.tval) {
+        return Err(format!(
+            "Spike traps with {trap:?}, not {spike_cause} at {:#010x} ({:#010x}), tval {:#010x}",
+            expected.pc, expected.insn, expected.tval
+        ));
+    }
+    match &finished.outcome.end {
+        End::Trap { cause, pc, tval }
+            if (cause.as_str(), *pc, *tval) == (expected.cause, expected.pc, expected.tval)
+                && ours.trap.as_ref().map(|t| t.0) == Some(expected.pc) => {}
+        other => {
+            return Err(format!(
+                "SystemScope ends with {other}, not Trap({}) at {:#010x}, tval {:#010x}",
+                expected.cause, expected.pc, expected.tval
+            ));
+        }
+    }
+    check_end_state(finished, theirs)?;
+    Ok(theirs.len())
+}
+
+/// Writes `program`'s ELF under `logs/progen/`, then runs it on both sides: a generated
+/// program to the passing `write_tohost`, a trap program (with `expected`) to its trap.
+pub fn program_differential(
+    root: &Path,
+    program: &Program,
+    expected: Option<&ExpectedTrap>,
+    spike: &Path,
+    logs: &str,
+) -> Diff {
+    let mut diff = Diff {
+        name: program.name.clone(),
+        blake3: *blake3::hash(&program.elf).as_bytes(),
+        executed: (false, false),
+        verdict: Ok(0),
+    };
+    diff.verdict = run_program(root, program, expected, spike, logs, &mut diff.executed);
+    diff
+}
+
+fn run_program(
+    root: &Path,
+    program: &Program,
+    expected: Option<&ExpectedTrap>,
+    spike: &Path,
+    logs: &str,
+    executed: &mut (bool, bool),
+) -> Result<usize, String> {
+    let elf = format!("{logs}/progen/{}.elf", program.name);
+    let log = format!("{logs}/progen/{}.log", program.name);
+    let path = root.join(&elf);
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    fs::write(&path, &program.elf).map_err(|e| format!("{elf}: {e}"))?;
+    let image = load(&program.name, &program.elf)?;
+    let (finished, text) = run_sides(
+        root,
+        &image,
+        &elf,
+        spike,
+        &log,
+        expected.is_some(),
+        executed,
+    )?;
+    match expected {
+        None => {
+            let tohost =
+                elf_symbol(&program.elf, "tohost").ok_or(format!("{elf} has no tohost symbol"))?;
+            judge_pass(&finished, &parse_spike_log(&text)?, image.entry, tohost)
+        }
+        Some(expected) => {
+            let (theirs, trap) = parse_spike_trap_log(&text)?;
+            judge_trap(&finished, &theirs, &trap, expected)
+        }
+    }
+}
+
+/// The generated programs for `seeds` against Spike (M1-A3).
+pub fn run_generated(root: &Path, spike: &Path, logs: &str, seeds: &[u64]) -> DiffReport {
+    let results = seeds
+        .iter()
+        .map(|&seed| program_differential(root, &progen::generate(seed), None, spike, logs))
+        .collect();
+    DiffReport {
+        selected: seeds.len(),
+        results,
+    }
+}
+
+/// Every misaligned-access program against Spike (M1-A3): the pinned Spike must trap on
+/// each, as SystemScope does.
+pub fn run_misaligned(root: &Path, spike: &Path, logs: &str) -> DiffReport {
+    let results = MISALIGNED
+        .iter()
+        .map(|case| {
+            let (program, expected) = progen::misaligned(case);
+            program_differential(root, &program, Some(&expected), spike, logs)
+        })
+        .collect();
+    DiffReport {
+        selected: MISALIGNED.len(),
+        results,
+    }
 }
 
 /// The whole differential.
@@ -754,6 +1050,38 @@ version {SPIKE_VERSION_LINE}
                 "simple matches, and its Spike log equals {SIMPLE_LOG}"
             )),
             Err(e) => errors.push(format!("the smoke run of simple: {e}")),
+        }
+        // A generated program, whose whole log is committed, and a trap program, whose
+        // log up to and just past the trap is.
+        let (lw, lw_trap) = progen::misaligned(&MISALIGNED[TRAP_LOG_CASE]);
+        for (program, expected, path, lines) in [
+            (progen::generate(0), None, PROGEN_LOG, None),
+            (lw, Some(&lw_trap), TRAP_LOG, Some(TRAP_LOG_LINES)),
+        ] {
+            let name = program.name.clone();
+            let smoke = program_differential(root, &program, expected, spike, SPIKE_LOGS)
+                .verdict
+                .and_then(|_| {
+                    let log = format!("{SPIKE_LOGS}/progen/{name}.log");
+                    let ours = fs::read_to_string(root.join(&log)).map_err(|e| e.to_string())?;
+                    let committed =
+                        fs::read_to_string(root.join(path)).map_err(|e| e.to_string())?;
+                    let ours = match lines {
+                        None => ours,
+                        Some(n) => ours.lines().take(n).map(|l| format!("{l}\n")).collect(),
+                    };
+                    if ours == committed {
+                        Ok(())
+                    } else {
+                        Err(format!("{log} differs from {path}"))
+                    }
+                });
+            match smoke {
+                Ok(()) => checked.push(format!(
+                    "{name} matches, and its Spike log equals the committed one"
+                )),
+                Err(e) => errors.push(format!("the smoke run of {name}: {e}")),
+            }
         }
     }
 
@@ -1173,5 +1501,233 @@ mod tests {
         let mut spike_missing = all(40);
         spike_missing[5].executed.1 = false;
         assert!(report(spike_missing, 40).accept(40).is_err());
+    }
+
+    const PROGEN_LOG: &str = include_str!("../spike/progen-0000000000000000.log");
+    const TRAP_LOG: &str = include_str!("../spike/misaligned-lw-1.log");
+
+    #[test]
+    fn the_committed_program_logs_are_where_verify_looks() {
+        let root = workspace_root();
+        let progen = fs::read_to_string(root.join(super::PROGEN_LOG)).unwrap();
+        assert_eq!(progen, PROGEN_LOG);
+        let trap = fs::read_to_string(root.join(super::TRAP_LOG)).unwrap();
+        assert_eq!(trap, TRAP_LOG);
+        assert_eq!(TRAP_LOG.lines().count(), TRAP_LOG_LINES);
+        assert_eq!(MISALIGNED[TRAP_LOG_CASE].name, "lw-1");
+    }
+
+    fn traced(program: &Program) -> Finished {
+        let image = load(&program.name, &program.elf).unwrap();
+        runner::execute(
+            runner::platform(&image, false),
+            Start::Init { traced: true },
+            Vec::new(),
+        )
+    }
+
+    /// Seed 0's generated program against its committed Spike log, with no Spike needed.
+    #[test]
+    fn generated_seed_0_matches_its_committed_spike_log() {
+        let program = progen::generate(0);
+        let tohost = elf_symbol(&program.elf, "tohost").unwrap();
+        let theirs = parse_spike_log(PROGEN_LOG).unwrap();
+        let finished = traced(&program);
+        assert_eq!(
+            judge_pass(&finished, &theirs, RAM_BASE, tohost),
+            Ok(theirs.len())
+        );
+        // Another program's run is not this log's.
+        let other = traced(&progen::generate(1));
+        assert!(judge_pass(&other, &theirs, RAM_BASE, tohost).is_err());
+        // Nor is a log cut before the boundary, or one ending at another tohost.
+        let cut = &theirs[..theirs.len() - 1];
+        assert!(judge_pass(&finished, cut, RAM_BASE, tohost).is_err());
+        assert!(judge_pass(&finished, &theirs, RAM_BASE, tohost + 8).is_err());
+        assert!(judge_pass(&finished, &theirs, RAM_BASE + 4, tohost).is_err());
+        // SystemScope's end must follow: the ECALL after the boundary, `instret`, and the
+        // registers Spike's writes leave.
+        let mut finished = finished;
+        let doctored = |finished: &mut Finished, doctor: &dyn Fn(&mut Finished)| {
+            doctor(finished);
+            judge_pass(finished, &theirs, RAM_BASE, tohost)
+        };
+        let end = finished.outcome.end.clone();
+        let End::Trap { cause, pc, tval } = end.clone() else {
+            panic!("{end}")
+        };
+        let moved = End::Trap {
+            cause,
+            pc: pc + 4,
+            tval,
+        };
+        assert!(doctored(&mut finished, &|f| f.outcome.end = moved.clone()).is_err());
+        finished.outcome.end = end;
+        assert!(doctored(&mut finished, &|f| f.outcome.instret += 1).is_err());
+        finished.outcome.instret -= 1;
+        assert!(doctored(&mut finished, &|f| bump(f, "x8")).is_err());
+        bump(&mut finished, "x8");
+        assert!(judge_pass(&finished, &theirs, RAM_BASE, tohost).is_ok());
+    }
+
+    /// Flips bit 0 of register `name` in the CPU's final view, doing or undoing a change
+    /// only the end-state check sees.
+    fn bump(finished: &mut Finished, name: &str) {
+        let view = &mut finished.views[CPU.0 as usize];
+        let (_, value) = view.fields.iter_mut().find(|(n, _)| *n == name).unwrap();
+        let Value::U64(v) = value else {
+            panic!("{name}")
+        };
+        *v ^= 1;
+    }
+
+    fn lw_1() -> (Finished, Vec<Retire>, SpikeTrap, ExpectedTrap) {
+        let (program, expected) = progen::misaligned(&MISALIGNED[TRAP_LOG_CASE]);
+        let (theirs, trap) = parse_spike_trap_log(TRAP_LOG).unwrap();
+        (traced(&program), theirs, trap, expected)
+    }
+
+    #[test]
+    fn the_trap_log_parses_to_the_trap() {
+        let (_, theirs, trap, _) = lw_1();
+        assert_eq!(theirs.len(), 5);
+        assert_eq!(
+            theirs[4],
+            retire(
+                0x8000_0010,
+                0x0002_a403,
+                Some((8, 0x5a5)),
+                Mem::Load { addr: 0x8001_0100 }
+            )
+        );
+        assert_eq!(
+            trap,
+            SpikeTrap {
+                pc: 0x8000_0014,
+                insn: 0x0012_a383,
+                cause: "trap_load_address_misaligned".to_owned(),
+                tval: 0x8001_0101,
+            }
+        );
+    }
+
+    #[test]
+    fn a_trap_log_out_of_shape_is_an_error() {
+        let lines: Vec<&str> = TRAP_LOG.lines().collect();
+        let join = |lines: &[&str]| lines.join("\n");
+        // No trap at all, or cut inside one.
+        assert!(parse_spike_trap_log(&join(&lines[..10])).is_err());
+        assert!(parse_spike_trap_log(&join(&lines[..11])).is_err());
+        assert!(parse_spike_trap_log(&join(&lines[..12])).is_err());
+        assert!(parse_spike_trap_log("").is_err());
+        let doctored = |i: usize, line: &str| {
+            let mut lines = lines.clone();
+            lines[i] = line;
+            parse_spike_trap_log(&join(&lines))
+        };
+        // A commit of another instruction than the line before it.
+        assert!(
+            doctored(
+                3,
+                "core   0: 3 0x80000010 (0x0062a023) mem 0x80010100 0x000005a5"
+            )
+            .is_err()
+        );
+        // An instruction line without its disassembly, or not an instruction line.
+        assert!(doctored(2, "core   0: 0x80000008 (0x5a500313) ").is_err());
+        assert!(doctored(2, "core   1: 0x80000008 (0x5a500313) li t1, 1445").is_err());
+        // A trap of another instruction, not a trap, or with no tval.
+        assert!(
+            doctored(
+                11,
+                "core   0: exception trap_load_address_misaligned, epc 0x80000010"
+            )
+            .is_err()
+        );
+        assert!(doctored(11, "core   0: exception interrupt_m_timer, epc 0x80000014").is_err());
+        assert!(doctored(11, "core   0: exception trap_load_address_misaligned").is_err());
+        assert!(doctored(12, "core   0:           epc 0x80010101").is_err());
+        assert!(doctored(12, "core   0:           tval 0x8001010").is_err());
+    }
+
+    /// `lw-1` against its committed Spike log, with no Spike needed, and every way the
+    /// trap verdict can go wrong.
+    #[test]
+    fn a_misaligned_program_matches_its_committed_trap() {
+        let (finished, theirs, trap, expected) = lw_1();
+        assert_eq!(judge_trap(&finished, &theirs, &trap, &expected), Ok(5));
+        let wrong = |doctor: &dyn Fn(&mut SpikeTrap, &mut ExpectedTrap)| {
+            let (mut trap, mut expected) = (trap.clone(), expected.clone());
+            doctor(&mut trap, &mut expected);
+            judge_trap(&finished, &theirs, &trap, &expected)
+        };
+        // Spike traps otherwise.
+        assert!(wrong(&|t, _| t.cause = "trap_load_access_fault".to_owned()).is_err());
+        assert!(wrong(&|t, _| t.tval += 1).is_err());
+        assert!(wrong(&|t, _| t.pc += 4).is_err());
+        assert!(wrong(&|t, _| t.insn ^= 1 << 20).is_err());
+        // The expectation is otherwise: SystemScope's trap no longer agrees.
+        let both = |cause: &'static str| {
+            wrong(&move |t, e| {
+                e.cause = cause;
+                t.cause = SPIKE_CAUSES
+                    .iter()
+                    .find(|c| c.0 == cause)
+                    .unwrap()
+                    .1
+                    .to_owned();
+            })
+        };
+        assert!(both("LoadAccessFault").is_err());
+        assert!(
+            wrong(&|t, e| {
+                e.tval += 4;
+                t.tval += 4;
+            })
+            .is_err()
+        );
+        assert!(wrong(&|_, e| e.cause = "NoSuchCause").is_err());
+        // Spike's stream is short of the trap, or stores another value: the traps and end
+        // registers agree, and only the stream differs.
+        assert!(judge_trap(&finished, &theirs[..4], &trap, &expected).is_err());
+        let mut stored = theirs.clone();
+        let Mem::Store { value, .. } = &mut stored[3].mem else {
+            panic!("{}", stored[3])
+        };
+        *value ^= 1;
+        assert!(judge_trap(&finished, &stored, &trap, &expected).is_err());
+        // SystemScope's `instret` or registers disagree with Spike's stream.
+        let mut finished = finished;
+        finished.outcome.instret += 1;
+        assert!(judge_trap(&finished, &theirs, &trap, &expected).is_err());
+        finished.outcome.instret -= 1;
+        bump(&mut finished, "x8");
+        assert!(judge_trap(&finished, &theirs, &trap, &expected).is_err());
+        bump(&mut finished, "x8");
+        assert_eq!(judge_trap(&finished, &theirs, &trap, &expected), Ok(5));
+        // SystemScope's run is not this program's.
+        let other = traced(&progen::misaligned(&MISALIGNED[TRAP_LOG_CASE + 1]).0);
+        assert!(judge_trap(&other, &theirs, &trap, &expected).is_err());
+        // A passing program's run is no trap program's.
+        assert!(judge_trap(&traced(&progen::generate(0)), &theirs, &trap, &expected).is_err());
+    }
+
+    #[test]
+    fn every_trap_cause_has_its_spike_name() {
+        let names: Vec<&str> = SPIKE_CAUSES.iter().map(|c| c.0).collect();
+        for case in &MISALIGNED {
+            assert!(names.contains(&case.cause), "{}", case.cause);
+        }
+        assert!(names.contains(&PASS_CAUSE));
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), SPIKE_CAUSES.len());
+        assert!(SPIKE_CAUSES.iter().all(|c| c.1.starts_with("trap_")));
+        assert_eq!(spike_trap_args(RAM_BASE, "e", "l")[0], "-l");
+        assert_eq!(
+            spike_trap_args(RAM_BASE, "e", "l")[1..],
+            spike_args(RAM_BASE, "e", "l")
+        );
     }
 }

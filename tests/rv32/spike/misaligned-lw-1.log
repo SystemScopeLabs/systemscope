@@ -1,0 +1,16 @@
+core   0: 0x80000000 (0x800102b7) lui     t0, 0x80010
+core   0: 3 0x80000000 (0x800102b7) x5  0x80010000
+core   0: 0x80000004 (0x10028293) addi    t0, t0, 256
+core   0: 3 0x80000004 (0x10028293) x5  0x80010100
+core   0: 0x80000008 (0x5a500313) li      t1, 1445
+core   0: 3 0x80000008 (0x5a500313) x6  0x000005a5
+core   0: 0x8000000c (0x0062a023) sw      t1, 0(t0)
+core   0: 3 0x8000000c (0x0062a023) mem 0x80010100 0x000005a5
+core   0: 0x80000010 (0x0002a403) lw      s0, 0(t0)
+core   0: 3 0x80000010 (0x0002a403) x8  0x000005a5 mem 0x80010100
+core   0: 0x80000014 (0x0012a383) lw      t2, 1(t0)
+core   0: exception trap_load_address_misaligned, epc 0x80000014
+core   0:           tval 0x80010101
+core   0: exception trap_instruction_access_fault, epc 0x00000000
+core   0:           tval 0x00000000
+core   0: exception trap_instruction_access_fault, epc 0x00000000

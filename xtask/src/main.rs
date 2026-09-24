@@ -30,8 +30,11 @@
 //!   at the pin, its version line, and a smoke run of `simple` whose log must equal the
 //!   committed one. Prints the binary's BLAKE3.
 //! - `spike diff [<dir>]`: `verify`, then M1-A3: every selected fixture's retirements on
-//!   SystemScope against Spike's, which must all match. Spike's logs go to
-//!   `target/spike-logs`.
+//!   SystemScope against Spike's, then the generated programs of the fixed seeds, then
+//!   the misaligned-access programs, which must all match. Spike's logs go to
+//!   `target/spike-logs`, and the generated ELFs to `target/spike-logs/progen`.
+//! - `spike random [<dir>]`: `verify`, then one generated program, for the seed in
+//!   `M1_PROGEN_SEED` (decimal or `0x` hex), against Spike. The nightly workflow runs it.
 //!
 //! - `act4 build [<cache-dir>]`: Linux x86_64 only, with git, curl, tar, xz, make, and a
 //!   host C compiler. Generates the ACT4 RV32I corpus with the pinned ACT4, Sail, and GCC
@@ -61,13 +64,16 @@ use systemscope_acceptance::m1::golden as m1;
 use systemscope_rv32::act4::{self, ACT4_MANIFEST, ACT4_SCRIPT};
 use systemscope_rv32::hello::{self, HELLO_DIR, HELLO_MANIFEST, HELLO_SCRIPT, HelloManifest};
 use systemscope_rv32::manifest::{Manifest, verify};
-use systemscope_rv32::spike::{self, SPIKE_COMMIT, SPIKE_DIR, SPIKE_LOGS, SPIKE_SCRIPT};
+use systemscope_rv32::progen::{self, FIXED_SEEDS, MISALIGNED};
+use systemscope_rv32::spike::{
+    self, DiffReport, SPIKE_COMMIT, SPIKE_DIR, SPIKE_LOGS, SPIKE_SCRIPT,
+};
 use systemscope_rv32::{BUILD_SCRIPT, FIXTURE_DIR, MANIFEST_PATH, SELECTED, upstream};
 
 const USAGE: &str = "usage: cargo xtask bless\n       \
                      cargo xtask m1-golden bless | verify | emit <dir> | check <dir>\n       \
                      cargo xtask rv32-fixtures build | manifest [<cache-dir>] | verify\n       \
-                     cargo xtask spike build | verify | diff [<dir>]\n       \
+                     cargo xtask spike build | verify | diff | random [<dir>]\n       \
                      cargo xtask act4 build [<cache-dir>] | install <out-dir> | check <out-dir> \
                      | verify | run";
 /// The golden file's name in an `m1-golden emit` directory.
@@ -427,6 +433,7 @@ fn spike_task(task: &str, dir: &Path) -> ExitCode {
             }
         }
         "diff" => spike_diff(dir),
+        "random" => spike_random(dir),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::FAILURE
@@ -495,29 +502,72 @@ fn spike_diff(dir: &Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let spike = spike_binary(dir);
+    let generated = spike::run_generated(&root(), &spike, SPIKE_LOGS, &FIXED_SEEDS);
+    let misaligned = spike::run_misaligned(&root(), &spike, SPIKE_LOGS);
+    let parts = [
+        ("rv32ui", &report, SELECTED.len()),
+        ("generated", &generated, FIXED_SEEDS.len()),
+        ("misaligned", &misaligned, MISALIGNED.len()),
+    ];
+    let mut accepted = true;
+    for (what, report, expected) in parts {
+        accepted &= print_diff_report(what, report, expected);
+    }
+    if !accepted {
+        return ExitCode::FAILURE;
+    }
+    println!(
+        "M1-A3: every selected rv32ui test and the generated program of every fixed seed \
+         retire exactly as on Spike {SPIKE_COMMIT}, and both trap alike on every \
+         misaligned access"
+    );
+    ExitCode::SUCCESS
+}
+
+/// Prints one part of the differential, then whether it is accepted.
+fn print_diff_report(what: &str, report: &DiffReport, expected: usize) -> bool {
     for result in &report.results {
         println!("{}", result.line());
     }
     println!(
-        "selected {}, run by SystemScope {}, run by Spike {}, matched {}, retirements \
-         compared {}",
+        "{what}: selected {}, run by SystemScope {}, run by Spike {}, matched {}, \
+         retirements compared {}",
         report.selected,
         report.systemscope_executed(),
         report.spike_executed(),
         report.passed(),
         report.compared()
     );
-    match report.accept(SELECTED.len()) {
-        Ok(()) => {
-            println!(
-                "M1-A3: every selected rv32ui test retires exactly as on Spike {SPIKE_COMMIT}"
-            );
-            ExitCode::SUCCESS
-        }
+    match report.accept(expected) {
+        Ok(()) => true,
         Err(e) => {
-            eprintln!("M1-A3 fails: {e}");
-            ExitCode::FAILURE
+            eprintln!("M1-A3 fails ({what}): {e}");
+            false
         }
+    }
+}
+
+fn spike_random(dir: &Path) -> ExitCode {
+    let var = progen::SEED_VAR;
+    let Some(seed) = std::env::var(var)
+        .ok()
+        .and_then(|text| systemscope_acceptance::parse_seed(&text))
+    else {
+        eprintln!("set {var} to the seed to test, e.g. {var}=0x1234");
+        return ExitCode::FAILURE;
+    };
+    // Printed first, so a failing run names its seed.
+    println!("{var}={seed:#x}");
+    if !spike_verify(dir) {
+        return ExitCode::FAILURE;
+    }
+    let report = spike::run_generated(&root(), &spike_binary(dir), SPIKE_LOGS, &[seed]);
+    if print_diff_report("random", &report, 1) {
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("the generated program for {var}={seed:#x} differs from Spike");
+        ExitCode::FAILURE
     }
 }
 
