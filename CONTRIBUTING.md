@@ -47,10 +47,12 @@ M0_SEED=0x1234 cargo nextest run -p systemscope-acceptance --run-ignored only
 
 ## Spike Differential
 
-M1-A3 compares every selected `rv32ui` fixture, retirement by retirement, with Spike at the commit pinned in `tests/rv32/build-spike.sh` (`docs/m1-design.md` §10.3). Only these tasks need Spike; the normal test suite runs without it, on committed Spike logs in `tests/rv32/spike/`.
+M1-A3 compares every selected `rv32ui` fixture, the generated programs for 64 fixed seeds, and 9 misaligned-access programs, retirement by retirement, with Spike at the commit pinned in `tests/rv32/build-spike.sh` (`docs/m1-design.md` §10.3). Only these tasks need Spike; the normal test suite runs without it, on committed Spike logs in `tests/rv32/spike/`.
 
 - `cargo xtask spike build [<dir>]` fetches and builds the pinned Spike into `<dir>` (default `target/spike`) on Linux, with git, a C++ compiler, make, and `dtc`, then verifies it.
-- `cargo xtask spike verify [<dir>]` checks the build's stamp, its clean checkout at the pin, and its version line, and requires it to write the committed `simple` log again. `cargo xtask spike diff [<dir>]` verifies, then runs all 40 fixtures on both sides; all must match. CI runs both in a Linux job.
+- `cargo xtask spike verify [<dir>]` checks the build's stamp, its clean checkout at the pin, and its version line, and requires it to write the committed `simple` and seed 0 logs again, and the committed start of the `lw-1` trap log. `cargo xtask spike diff [<dir>]` verifies, then runs all 40 fixtures, 64 generated programs, and 9 misaligned-access programs on both sides; all must match, and every misaligned access must trap on both. CI runs both in a Linux job.
+- `M1_PROGEN_SEED=<seed> cargo xtask spike random [<dir>]` verifies, then runs the generated program for one seed; the nightly job runs it with the night's seed, and `M1_PROGEN_SEED=<seed> cargo nextest run -p systemscope-rv32 --run-ignored only` runs that program on SystemScope alone.
+- The generator (`tests/rv32/src/progen.rs`) is pinned by a digest of the fixed seeds' programs. Changing what a seed produces needs a new generator context, and the committed seed 0 log comes again from the pinned Spike, never by hand.
 - `SPIKE`, if set, is the command the tasks run instead of `<dir>/bin/spike`: the same pinned build, reached another way.
 - A mismatch is a bug in SystemScope or a misread of Spike's log, never a case to special-case or skip. Do not edit the committed Spike logs by hand; they come from the pinned Spike.
 

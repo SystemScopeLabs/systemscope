@@ -86,7 +86,7 @@ systemscope/
 │  ├─ spike/              committed logs from the pinned Spike, for tests without it
 │  ├─ env/                the SystemScope riscv-tests environment (§10.2)
 │  ├─ fixtures/           committed ELFs and manifest.json (§10.6)
-│  └─ progen/             deterministic random-program generator (§10.3, not yet built)
+│  └─ src/progen.rs       the deterministic program generator and misaligned-access programs (§10.3)
 ├─ tests/act4/            the ACT4 corpus (§10.4): build-act4.sh, config/, fixtures/, manifest.json;
 │                         its runner is tests/rv32/src/act4.rs
 └─ tests/golden/          adds m1-reference.json and m1-reference.mid.snap
@@ -562,7 +562,7 @@ The trace continues through `resume_trace(prefix)` exactly as in M0 AT-2. The po
 - **M1-A8:** a fresh run of every program equals the golden file field by field and byte for byte, in the test process and in two `m1-run` processes; fresh platforms repeat every field; the seed matrix is §9's.
 - **Cross-OS:** each CI test job emits its own result and snapshot (`cargo xtask m1-golden emit`), and the `m1-cross-os` job has Windows check the Linux result and Linux check the Windows one (`cargo xtask m1-golden check`): equal to the committed files and the local run, and the foreign snapshot restores to the golden end.
 
-**Status (M1.9):** M1-A3 is implemented for the 40 `rv32ui` ELFs (§10.3): every selected test retires exactly as on the pinned Spike, 13,268 retirements in all. The deterministic random programs and the misaligned-access program of §10.3 are not built yet, so M1-A3 is not complete; they are known limitations until then.
+**Status (M1.10b):** M1-A3 is implemented as stated (§10.3). Every selected `rv32ui` test retires exactly as on the pinned Spike, 13,268 retirements in all. The generated programs for the 64 fixed seeds do too, 22,344 retirements in all. Each of the 9 misaligned-access programs traps on both sides at the same instruction, with the same cause and trap value, after the same 5 retirements. One random seed runs nightly.
 
 ### 10.2 `riscv-tests` Under a SystemScope Environment
 
@@ -614,7 +614,7 @@ Spike runs each compared program with `--log-commits`, 16 MiB of memory at `0x80
 - **Misaligned policy:** the Spike configuration must trap on misaligned accesses, as SystemScope does. The harness checks this once with a dedicated misaligned-access program.
 - **Programs exercising MMIO** (the UART) are not compared with Spike. Spike's device map differs.
 
-**Random programs** come from `tests/rv32/progen`, a Rust generator that writes RV32I machine code and a minimal ELF directly, with no assembler.
+**Random programs** come from `tests/rv32/src/progen.rs`, a Rust generator that writes RV32I machine code and a minimal ELF directly, with no assembler.
 
 - It is deterministic: the program is a function of its seed, drawn from a xoshiro256\*\* stream derived as in m0-design §5.2 with the context `"SystemScope 2026-09 rv32 progen v1"`.
 - Programs are straight-line code with forward branches only, so they always terminate.
@@ -628,9 +628,16 @@ Spike runs each compared program with `--log-commits`, 16 MiB of memory at `0x80
 - **Command:** `spike --isa=rv32i --priv=m --pcs=0:<entry> -m0x80000000:0x1000000 --disable-dtb --log-commits --log=<log> --instructions=10000000 <elf>`. `rv32i` is accepted as is. `--pcs` sets hart 0's `pc` to the ELF entry directly, so the boot ROM never runs; a test pins that the first compared record is at the entry. Without it, `--disable-dtb` leaves no boot ROM and Spike never reaches the program. `--disable-dtb` keeps the device tree, and `dtc`, out of the run; Spike's build still needs `dtc`.
 - **Records:** both sides normalize to one record per retirement: index, `pc`, instruction bits, register write, and memory access. SystemScope's side is read from its canonical `rv32.commit` trace records, never by re-executing; Spike's from its commit log, with a strict parser of its own that does not use the SystemScope decoder. Every line must be one hart-0, machine-mode retirement laid out exactly as the pinned Spike writes it; anything else fails. A write to `x0` is no write on either side (SystemScope records `rd = 0`, and Spike leaves it out). Memory is compared as recorded: for a load its address, for a store its address, width, and value. `next_pc` is covered by the next record's `pc` and the stream lengths.
 - **Stop:** every `rv32ui` log ends with the environment's `write_tohost` (§10.2), two stores, and that is where Spike's HTIF exits. The compared stream is Spike's whole log, `N` records, and it must start at the entry and end with a word store of 1 to the ELF's `tohost` symbol, one instruction, and a word store of 0 to `tohost + 4`, the last compared record. SystemScope's stream must have exactly `N` records; it then halts on the `ECALL` at the next address with the M1-A2 pass rule (`gp` = 1, `a0` = 0), `instret` = `N`, and `x1`–`x31` equal to Spike's register writes replayed from zero. Spike's exit status is not a verdict (it exits 0 on its instruction limit too): a run also needs empty output and the boundary above.
-- **Traps:** no `rv32ui` test traps before the boundary, so a trap there fails the differential. Comparing trapping `pc`s is for the trap programs, not yet built.
+- **Traps:** no `rv32ui` test or generated program traps before the boundary, so a trap there fails the differential. Trapping `pc`s are compared for the misaligned-access programs (below).
 - **Mismatches** report the test, its ELF BLAKE3, the retirement index, both records, and up to three records before and after; a length difference says which stream ends first. Acceptance is 40 selected, 40 run by each side, and 40 matched.
 - **Tests without Spike:** the parser runs on real pinned-Spike lines (`tests/rv32/spike/`), including the whole log of `simple`, which SystemScope's run must equal; negative tests change `pc`, instruction, `rd`, its value, and memory fields, or delete or add a record. `cargo xtask spike verify` checks the build's stamp, clean checkout at the pin, and version line, and requires Spike to write the committed `simple` log again, byte for byte.
+
+**Status (M1.10b):** the generator and the trap programs are in `tests/rv32/src/progen.rs`, and `cargo xtask spike diff` runs them after the `rv32ui` ELFs.
+
+- **Generated programs:** 256 groups of instructions from every RV32I class but `ECALL`/`EBREAK`: register and immediate ALU operations and shifts, `LUI`/`AUIPC`, loads and stores of every width, `FENCE`, branches, and `JAL`, and `JALR` through `AUIPC` (sometimes with an odd offset, which `JALR` clears). Immediates favour their edge values. Branches and jumps skip one to four later groups, never backward. Loads and stores set their base with `LUI` and `ADDI` and stay inside a 256-byte window of random data at `0x8001_0100`; `tohost` is at `0x8001_0000`, and `fromhost` at `0x8001_0040`. The ELF has `.text`, `.data`, and the `tohost` and `fromhost` symbols Spike's HTIF looks up. Each program is judged exactly like an `rv32ui` ELF (§10.3 above): the same boundary, pass rule, `instret`, and replayed registers.
+- **Seeds:** the 64 fixed seeds are 0 to 63, and one BLAKE3 digest over their ELFs' hashes pins what the generator produces; the committed Spike log of seed 0 is SystemScope's offline check. Nightly, `M1_PROGEN_SEED` (the M0 seed, printed first) runs its program on both operating systems and, with `cargo xtask spike random`, against Spike. The random-seed program has no golden digests.
+- **Misaligned-access programs:** `LH`, `LHU`, `LW`, `SH`, and `SW` at every misaligned offset, 9 programs. Each stores a word, loads it back, then makes the misaligned access. Spike runs them with `-l`, which logs every instruction and its trap: `exception <cause>, epc <pc>` and `tval <addr>`. The harness requires the stream up to the trap to be equal, and both sides to trap on that instruction with the same cause (Spike's `trap_load_address_misaligned` or `trap_store_address_misaligned`) and the effective address as trap value. SystemScope then halts; what Spike's handler does next is not compared. The start of `lw-1`'s log is committed for offline tests.
+- **Verify:** `cargo xtask spike verify` also requires the installed Spike to write seed 0's log again byte for byte, and `lw-1`'s committed start.
 
 ### 10.4 ACT4 and Sail
 
@@ -750,7 +757,7 @@ The testplan's coverpoints cover register choices, value edges, immediates, bran
 | Load/store misalignment and access faults | unit tests (`memory.rs`, `cpu.rs`, `system.rs`); `rv32ui` `ma_data` is excluded (§10.2) |
 | Privileged trap reporting (`mcause`, `mepc`, `mtval`, handlers) | not in M1 (§6): the trap is reported at the execution-environment boundary as `RvTrap`, which the unit tests check; privileged backends are M2/M3 |
 
-The Spike differential (M1-A3) compares the `rv32ui` streams up to their `tohost` stores and so adds no trap coverage.
+The Spike differential (M1-A3) compares the `rv32ui` and generated streams up to their `tohost` stores. Its only trap coverage is the misaligned-access programs (§10.3): load and store misalignment, against the pinned Spike.
 
 ### 10.5 CI
 
@@ -762,7 +769,7 @@ The Spike differential (M1-A3) compares the `rv32ui` streams up to their `tohost
 
   These need no external tools: they run the committed ELFs.
 - **Blocking, Linux only:**
-  - M1-A3 Spike lockstep, with Spike built from its pinned commit and cached: the `spike` job builds on a cache miss, then always runs `cargo xtask spike verify` before `cargo xtask spike diff`, so a cached build is used only once it matches the pin (M1.9, for the `rv32ui` ELFs);
+  - M1-A3 Spike lockstep, with Spike built from its pinned commit and cached: the `spike` job builds on a cache miss, then always runs `cargo xtask spike verify` before `cargo xtask spike diff`, so a cached build is used only once it matches the pin. The diff covers the 40 `rv32ui` ELFs, the 64 fixed-seed generated programs, and the 9 misaligned-access programs;
   - the fixture rebuild: `cargo xtask rv32-fixtures build` on `ubuntu-24.04` with the pinned toolchain packages, then no difference from the committed fixtures and manifest. This is the only job that installs the Ubuntu RISC-V toolchain packages or fetches `riscv-tests`;
   - "ACT4/Sail external validation (Ubuntu)", the `act4` job (§10.4): it generates the corpus twice, A and B, at the canonical path with the pinned stack (cached, and checked against the pins on every run), requires A and B to be byte-identical, requires each to reproduce the committed ELFs and manifest (`cargo xtask act4 check`), and runs `cargo xtask act4 run`. This is the only job that runs ACT4 or Sail.
 - **Nightly:** the random-seed program through Spike on Linux, and the M1 acceptance tests for that program on both operating systems.
@@ -852,7 +859,7 @@ The toolchain needed to build ELFs (a RISC-V GCC or Clang), Spike, Sail, and ACT
 
 ## 12. Implementation Order
 
-Status: M1.0 through M1.5 are complete. M1.6, the `rv32ui` fixtures and runner, is implemented, and all 40 selected tests pass. M1.7a, the standalone `SimpleUart`, is complete. M1.7b, `hello.elf` printing through the CPU, bus, and UART, is complete (§10.7). M1.8, M1-A6 to M1-A8 with the `m1-reference` golden file and the portable snapshot, is implemented (§10.1). M1.9, the Spike differential for the 40 `rv32ui` ELFs, is implemented (§10.3); the random-program generator and the misaligned-access program it was planned with are not. M1.10, ACT4 with Sail, is implemented: 39 of 39 RV32I tests pass (§10.4).
+Status: M1.0 through M1.5 are complete. M1.6, the `rv32ui` fixtures and runner, is implemented, and all 40 selected tests pass. M1.7a, the standalone `SimpleUart`, is complete. M1.7b, `hello.elf` printing through the CPU, bus, and UART, is complete (§10.7). M1.8, M1-A6 to M1-A8 with the `m1-reference` golden file and the portable snapshot, is implemented (§10.1). M1.9, the Spike differential for the 40 `rv32ui` ELFs, is implemented (§10.3). M1.10, ACT4 with Sail, is implemented: 39 of 39 RV32I tests pass (§10.4). M1.10b, the program generator and the misaligned-access programs that M1.9 deferred, is implemented, and M1-A3 is complete (§10.3).
 
 1. **M1.0:** this document; the `plan.md` M1 update; in `contracts`, the compatibility id (§4.5) and the `mem.v1` contract, followed by a pin bump in `systemscope`, with the M0 golden digests unchanged.
 2. **M1.1:** `decode`, the immediate extractors, and the register file, with `IllegalInstruction` from the start.
@@ -868,8 +875,9 @@ Status: M1.0 through M1.5 are complete. M1.6, the `rv32ui` fixtures and runner, 
    - **M1.7a:** `SimpleUart` (§7.3) as a standalone component, tested on its own and behind `AddressBus` with a test-only initiator.
    - **M1.7b:** `hello.elf` and the program printing through the UART on a CPU platform.
 9. **M1.8:** M1-A6 and M1-A7, the `m1-reference` golden file, and the portable snapshot.
-10. **M1.9:** the Spike differential, for the 40 `rv32ui` ELFs. The random-program generator and the misaligned-access program (§10.3) are deferred; M1-A3 needs them before the exit review.
+10. **M1.9:** the Spike differential, for the 40 `rv32ui` ELFs. The random-program generator and the misaligned-access program (§10.3) were deferred to M1.10b, after M1.10.
 11. **M1.10:** ACT4 and Sail (§10.4).
+   - **M1.10b:** the program generator and the misaligned-access programs, completing M1-A3 (§10.3).
 12. **M1.11:** CI, then the M1 exit review, then the tag `v0.2.0-m1`.
 
 The tag follows the M0 convention: a SemVer prerelease identifier marking a milestone. `contracts` gets the same milestone tag on the commit `systemscope` pins.
