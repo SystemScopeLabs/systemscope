@@ -199,3 +199,52 @@ jobs:
         run: |
           git diff --exit-code -- tests/rv32
           test -z "$(git status --porcelain -- tests/rv32)"
+
+  # docs/m1-design.md §10.3, M1-A3: every selected rv32ui fixture on SystemScope against
+  # the pinned Spike, retirement by retirement. The only job that builds or runs Spike.
+  # A cached build is used only after `spike verify` checks it against the pin.
+  spike:
+    name: M1-A3 Spike differential (Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: systemscope
+      # systemscope depends on `../contracts` by path (plan.md §10), so reproduce the
+      # sibling layout, with contracts pinned to a pushed revision (bump it deliberately).
+      - uses: actions/checkout@v4
+        with:
+          repository: SystemScopeLabs/contracts
+          ref: 4d6e912a7ccffb676d0f95ff523c553fe3048c47
+          path: contracts
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: systemscope
+      # Spike's configure requires dtc; the differential runs Spike with --disable-dtb.
+      - name: Install dtc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends device-tree-compiler=1.7.0-2build1
+      - uses: actions/cache@v4
+        id: spike-cache
+        with:
+          path: ~/spike
+          key: spike-${{ runner.os }}-${{ hashFiles('systemscope/tests/rv32/build-spike.sh') }}
+      - name: Build the pinned Spike
+        if: steps.spike-cache.outputs.cache-hit != 'true'
+        run: cargo xtask spike build ~/spike
+      - name: Spike matches the pin (stamp, checkout, version, smoke run)
+        run: cargo xtask spike verify ~/spike
+      - name: rv32ui fixtures match their manifest
+        run: cargo xtask rv32-fixtures verify
+      - name: M1-A3 retirement differential (40 selected tests)
+        run: cargo xtask spike diff ~/spike
+      - name: Keep Spike's logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spike-logs
+          path: systemscope/target/spike-logs
+          if-no-files-found: ignore
