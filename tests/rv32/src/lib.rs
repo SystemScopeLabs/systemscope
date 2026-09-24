@@ -21,6 +21,9 @@
 //! - [`act4`] is M1-A4: the ACT4 RV32I corpus under `tests/act4`, self-checking ELFs with
 //!   expected values from the Sail reference model, pinned by `tests/act4/manifest.json`.
 //!   Only `cargo xtask act4 build` runs ACT4 and Sail.
+//! - [`csrgen`] is the M2 part of the Spike differential: directed Zicsr, CSR, and `MRET`
+//!   programs run with the M2 CPU profile (`docs/m2-design.md` §4), and one program per
+//!   rejected CSR that must trap on both sides.
 //!
 //! Tests only read the committed fixtures. `cargo xtask rv32-fixtures build` rebuilds
 //! them on Linux, and `cargo xtask rv32-fixtures verify` checks them without a network or
@@ -29,12 +32,17 @@
 use std::path::{Path, PathBuf};
 
 pub mod act4;
+pub mod csrgen;
 pub mod hello;
 pub mod manifest;
 pub mod progen;
 pub mod runner;
 pub mod spike;
 pub mod upstream;
+
+/// The CPU profile the harnesses run: `M1` is `m1-reference`'s, and every M1 check keeps
+/// it; the `M2` profile runs the same suites (`docs/m2-design.md` §15.4).
+pub use systemscope_rv32i::Rv32iProfile;
 
 /// The upstream repository the tests come from.
 pub const RISCV_TESTS_REPO: &str = "https://github.com/riscv-software-src/riscv-tests.git";

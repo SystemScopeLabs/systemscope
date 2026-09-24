@@ -31,8 +31,10 @@
 //!   committed one. Prints the binary's BLAKE3.
 //! - `spike diff [<dir>]`: `verify`, then M1-A3: every selected fixture's retirements on
 //!   SystemScope against Spike's, then the generated programs of the fixed seeds, then
-//!   the misaligned-access programs, which must all match. Spike's logs go to
-//!   `target/spike-logs`, and the generated ELFs to `target/spike-logs/progen`.
+//!   the misaligned-access programs, which must all match; then the directed M2 CSR and
+//!   `MRET` programs with the M2 CPU profile against Spike with Zicsr, which must match
+//!   too. Spike's logs go to `target/spike-logs`, and the generated ELFs to
+//!   `target/spike-logs/progen`.
 //! - `spike random [<dir>]`: `verify`, then one generated program, for the seed in
 //!   `M1_PROGEN_SEED` (decimal or `0x` hex), against Spike. The nightly workflow runs it.
 //!
@@ -49,7 +51,7 @@
 //! - `act4 verify`: checks the committed corpus against its manifest, with no network,
 //!   ACT4, Sail, or compiler.
 //! - `act4 run`: `verify`, then M1-A4: runs every committed ACT4 ELF on `m1-reference`,
-//!   all of which must pass.
+//!   all of which must pass; then runs them all again with the M2 CPU profile.
 //!
 //! The `spike` tasks run `<dir>/bin/spike`, or the command in `SPIKE` if it is set: the
 //! same pinned build, reached another way (such as through WSL). Nothing else in the
@@ -62,13 +64,16 @@ use std::process::{Command, ExitCode};
 use systemscope_acceptance::golden::{GOLDEN_PATH, Golden, MID_SNAPSHOT_PATH, describe_changes};
 use systemscope_acceptance::m1::golden as m1;
 use systemscope_rv32::act4::{self, ACT4_MANIFEST, ACT4_SCRIPT};
+use systemscope_rv32::csrgen;
 use systemscope_rv32::hello::{self, HELLO_DIR, HELLO_MANIFEST, HELLO_SCRIPT, HelloManifest};
 use systemscope_rv32::manifest::{Manifest, verify};
 use systemscope_rv32::progen::{self, FIXED_SEEDS, MISALIGNED};
 use systemscope_rv32::spike::{
-    self, DiffReport, SPIKE_COMMIT, SPIKE_DIR, SPIKE_LOGS, SPIKE_SCRIPT,
+    self, DiffReport, SPIKE_COMMIT, SPIKE_DIR, SPIKE_ISA_M2, SPIKE_LOGS, SPIKE_SCRIPT,
 };
-use systemscope_rv32::{BUILD_SCRIPT, FIXTURE_DIR, MANIFEST_PATH, SELECTED, upstream};
+use systemscope_rv32::{
+    BUILD_SCRIPT, FIXTURE_DIR, MANIFEST_PATH, Rv32iProfile, SELECTED, upstream,
+};
 
 const USAGE: &str = "usage: cargo xtask bless\n       \
                      cargo xtask m1-golden bless | verify | emit <dir> | check <dir>\n       \
@@ -512,7 +517,7 @@ fn spike_diff(dir: &Path) -> ExitCode {
     ];
     let mut accepted = true;
     for (what, report, expected) in parts {
-        accepted &= print_diff_report(what, report, expected);
+        accepted &= print_diff_report("M1-A3", what, report, expected);
     }
     if !accepted {
         return ExitCode::FAILURE;
@@ -522,11 +527,21 @@ fn spike_diff(dir: &Path) -> ExitCode {
          retire exactly as on Spike {SPIKE_COMMIT}, and both trap alike on every \
          misaligned access"
     );
+    let m2 = spike::run_m2(&root(), &spike, SPIKE_LOGS);
+    let expected = csrgen::pass_programs().len() + csrgen::ILLEGAL.len();
+    if !print_diff_report("M2 CSR", "m2-csr", &m2, expected) {
+        return ExitCode::FAILURE;
+    }
+    println!(
+        "M2 CSR: every directed Zicsr, CSR, and MRET program retires exactly as on Spike \
+         {SPIKE_COMMIT} with --isa={SPIKE_ISA_M2}, CSR writes included, and both trap \
+         alike on every rejected CSR"
+    );
     ExitCode::SUCCESS
 }
 
-/// Prints one part of the differential, then whether it is accepted.
-fn print_diff_report(what: &str, report: &DiffReport, expected: usize) -> bool {
+/// Prints one part of `part_of`'s differential, then whether it is accepted.
+fn print_diff_report(part_of: &str, what: &str, report: &DiffReport, expected: usize) -> bool {
     for result in &report.results {
         println!("{}", result.line());
     }
@@ -542,7 +557,7 @@ fn print_diff_report(what: &str, report: &DiffReport, expected: usize) -> bool {
     match report.accept(expected) {
         Ok(()) => true,
         Err(e) => {
-            eprintln!("M1-A3 fails ({what}): {e}");
+            eprintln!("{part_of} fails ({what}): {e}");
             false
         }
     }
@@ -563,7 +578,7 @@ fn spike_random(dir: &Path) -> ExitCode {
         return ExitCode::FAILURE;
     }
     let report = spike::run_generated(&root(), &spike_binary(dir), SPIKE_LOGS, &[seed]);
-    if print_diff_report("random", &report, 1) {
+    if print_diff_report("M1-A3", "random", &report, 1) {
         ExitCode::SUCCESS
     } else {
         eprintln!("the generated program for {var}={seed:#x} differs from Spike");
@@ -727,10 +742,40 @@ fn act4_run() -> ExitCode {
                  TEST PASSED summary",
                 manifest.count
             );
-            ExitCode::SUCCESS
         }
         Err(e) => {
             eprintln!("M1-A4 fails: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    // docs/m2-design.md §15.4: the M2 CPU profile passes the same corpus.
+    let report = match act4::run_corpus_with(&root(), Rv32iProfile::M2) {
+        Ok((_, r)) => r,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    for result in report.results.iter().filter(|r| r.verdict.is_err()) {
+        println!("{}", result.line());
+    }
+    println!(
+        "M2 CPU profile: selected {}, executed {}, passed {}, failed {}",
+        report.selected,
+        report.executed(),
+        report.passed(),
+        report.failed()
+    );
+    match report.accept(manifest.count) {
+        Ok(()) => {
+            println!(
+                "all {} ACT4 RV32I tests also pass with the M2 CPU profile",
+                manifest.count
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("the M2 CPU profile fails the ACT4 corpus: {e}");
             ExitCode::FAILURE
         }
     }

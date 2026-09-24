@@ -210,7 +210,9 @@ jobs:
 
   # docs/m1-design.md §10.3, M1-A3: every selected rv32ui fixture, the generated programs
   # for the fixed seeds, and the misaligned-access programs on SystemScope against the
-  # pinned Spike, retirement by retirement. The only job that builds or runs Spike.
+  # pinned Spike, retirement by retirement; then the directed M2 Zicsr, CSR, and MRET
+  # programs (docs/m2-design.md §4) with the M2 CPU profile against Spike with
+  # --isa=rv32i_zicsr, CSR writes included. The only job that builds or runs Spike.
   # A cached build is used only after `spike verify` checks it against the pin.
   spike:
     name: M1-A3 Spike differential (Linux)
@@ -248,7 +250,7 @@ jobs:
         run: cargo xtask spike verify ~/spike
       - name: rv32ui fixtures match their manifest
         run: cargo xtask rv32-fixtures verify
-      - name: M1-A3 retirement differential (40 rv32ui, 64 generated, 9 misaligned)
+      - name: M1-A3 and M2 CSR retirement differential (40 rv32ui, 64 generated, 9 misaligned, 20 M2 CSR)
         run: cargo xtask spike diff ~/spike
       - name: Keep Spike's logs
         if: failure()

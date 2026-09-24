@@ -10,7 +10,7 @@ use systemscope_rv32::act4::{
     self, ACT4_CONFIG_DIR, ACT4_FIXTURE_DIR, ACT4_MANIFEST, ACT4_SCRIPT, ALLOWED_MNEMONICS,
     CANONICAL_PATH, EXTENSIONS, SM_SHIM,
 };
-use systemscope_rv32::{RAM_BASE, workspace_root};
+use systemscope_rv32::{RAM_BASE, Rv32iProfile, workspace_root};
 
 /// How many tests ACT4 selected for `EXTENSIONS=I` at the pinned commit, as the committed
 /// manifest records it. Checked here so that a regenerated corpus that silently shrinks
@@ -57,6 +57,26 @@ fn every_act4_test_passes_on_m1_reference() {
             EXPECTED_TESTS,
             EXPECTED_TESTS
         )
+    );
+}
+
+/// The M2 CPU profile passes the same corpus (`docs/m2-design.md` §15.4).
+#[test]
+fn every_act4_test_passes_with_the_m2_cpu_profile() {
+    let (manifest, report) = act4::run_corpus_with(&workspace_root(), Rv32iProfile::M2).unwrap();
+    let lines: Vec<String> = report.results.iter().map(|r| r.line()).collect();
+    assert_eq!(
+        report.accept(manifest.count),
+        Ok(()),
+        "{}",
+        lines.join(
+            "
+"
+        )
+    );
+    assert_eq!(
+        (report.selected, report.executed(), report.passed()),
+        (EXPECTED_TESTS, EXPECTED_TESTS, EXPECTED_TESTS)
     );
 }
 

@@ -113,7 +113,7 @@ impl Draw {
 
 // Encoders, RV32I base formats.
 const OP: u32 = 0x33;
-const OP_IMM: u32 = 0x13;
+pub(crate) const OP_IMM: u32 = 0x13;
 const LOAD: u32 = 0x03;
 const STORE: u32 = 0x23;
 const BRANCH: u32 = 0x63;
@@ -122,7 +122,7 @@ const JALR: u32 = 0x67;
 const LUI: u32 = 0x37;
 const AUIPC: u32 = 0x17;
 const MISC_MEM: u32 = 0x0f;
-const SYSTEM: u32 = 0x73;
+pub(crate) const SYSTEM: u32 = 0x73;
 
 fn r(funct7: u32, rs2: u8, rs1: u8, funct3: u32, rd: u8) -> u32 {
     funct7 << 25
@@ -133,7 +133,7 @@ fn r(funct7: u32, rs2: u8, rs1: u8, funct3: u32, rd: u8) -> u32 {
         | OP
 }
 
-fn i(opcode: u32, funct3: u32, rd: u8, rs1: u8, imm: i32) -> u32 {
+pub(crate) fn i(opcode: u32, funct3: u32, rd: u8, rs1: u8, imm: i32) -> u32 {
     (imm as u32 & 0xfff) << 20 | u32::from(rs1) << 15 | funct3 << 12 | u32::from(rd) << 7 | opcode
 }
 
@@ -172,7 +172,7 @@ fn u(opcode: u32, rd: u8, imm20: u32) -> u32 {
 }
 
 /// `LUI` and `ADDI` that leave `value` in `rd`.
-fn li(rd: u8, value: u32) -> [u32; 2] {
+pub(crate) fn li(rd: u8, value: u32) -> [u32; 2] {
     let lo = ((value & 0xfff) as i32) << 20 >> 20;
     let hi = value.wrapping_sub(lo as u32) >> 12;
     [u(LUI, rd, hi), i(OP_IMM, 0, rd, rd, lo)]
@@ -316,7 +316,7 @@ fn based(d: &mut Draw, base: u8, width: u32) -> ([u32; 2], i32) {
 /// The §10.2 pass sequence at `pc`: `FENCE`, `gp = 1`, `a7 = 93`, `a0 = 0`, then
 /// `write_tohost` (a word store of `gp` to `tohost`, and of zero to `tohost + 4`, each
 /// addressed through `t5`), then `ECALL`.
-fn pass_sequence(pc: u32) -> Vec<u32> {
+pub(crate) fn pass_sequence(pc: u32) -> Vec<u32> {
     const T5: u8 = 30;
     let mut words = vec![
         0x0ff0_000f, // fence iorw, iorw
@@ -497,7 +497,7 @@ pub fn misaligned(case: &Misaligned) -> (Program, ExpectedTrap) {
 /// [`DATA_BASE`] (`tohost`, `fromhost`, then `window` at [`WINDOW`]), as two `PT_LOAD`
 /// segments, with section headers and a symbol table naming `tohost` and `fromhost` for
 /// Spike's HTIF. Every offset is fixed by the code's length.
-fn elf(code: &[u32], window: &[u8]) -> Vec<u8> {
+pub(crate) fn elf(code: &[u32], window: &[u8]) -> Vec<u8> {
     const EHDR: u32 = 52;
     const PHDR: u32 = 32;
     const SHDR: u32 = 40;

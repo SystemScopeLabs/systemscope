@@ -36,7 +36,7 @@ use systemscope_platform::{
 use systemscope_runtime::runtime::{Dispatched, Runtime, SessionConfig};
 use systemscope_runtime::topology::TopologyBuilder;
 use systemscope_runtime::trace::Trace;
-use systemscope_rv32i::{Rv32iConfig, Rv32iCpu};
+use systemscope_rv32i::{Rv32iConfig, Rv32iCpu, Rv32iProfile};
 
 use crate::manifest::{Fixture, Manifest};
 use crate::{MAX_INSTRUCTIONS, RAM_BASE, RAM_SIZE, UART_BASE, hex};
@@ -161,6 +161,18 @@ pub fn platform(image: &LoadImage, uart: bool) -> Runtime {
 /// random streams, so the seed reaches only the session information, and with it the
 /// snapshot and the trace header.
 pub fn platform_with_seed(image: &LoadImage, uart: bool, seed: u64) -> Runtime {
+    platform_with_profile(image, uart, seed, Rv32iProfile::M1)
+}
+
+/// [`platform_with_seed`] with the CPU in `profile`. `m1-reference` is the `M1` profile;
+/// the `M2` profile runs the same RV32I programs on the same platform
+/// (`docs/m2-design.md` §6.1, §15.4).
+pub fn platform_with_profile(
+    image: &LoadImage,
+    uart: bool,
+    seed: u64,
+    profile: Rv32iProfile,
+) -> Runtime {
     let mut t = TopologyBuilder::new(SimulationClock::default());
     let cpu_clock = t
         .add_clock(
@@ -173,6 +185,7 @@ pub fn platform_with_seed(image: &LoadImage, uart: bool, seed: u64) -> Runtime {
         clock: cpu_clock,
         entry: image.entry,
         max_instructions: NonZeroU64::new(MAX_INSTRUCTIONS).expect("nonzero"),
+        profile,
     })
     .expect("the loader guarantees an aligned entry");
     let cpu = t.add_component("soc.cpu0", Box::new(cpu));
@@ -390,8 +403,18 @@ impl FixtureResult {
 
 /// Reads `fixture` under `root`, checks it against its manifest entry, and runs it traced.
 pub fn run_fixture(root: &Path, fixture: &Fixture) -> Result<FixtureResult, String> {
+    run_fixture_with(root, fixture, Rv32iProfile::M1)
+}
+
+/// [`run_fixture`] with the CPU in `profile`.
+pub fn run_fixture_with(
+    root: &Path,
+    fixture: &Fixture,
+    profile: Rv32iProfile,
+) -> Result<FixtureResult, String> {
     let image = fixture.read(root)?;
-    let outcome = run(&image, true, Vec::new());
+    let rt = platform_with_profile(&image, false, SEED, profile);
+    let outcome = execute(rt, Start::Init { traced: true }, Vec::new()).outcome;
     Ok(FixtureResult {
         name: fixture.name.clone(),
         blake3: fixture.blake3,
@@ -457,6 +480,11 @@ impl Report {
 /// Runs every test the committed manifest under `root` selects, after checking the
 /// selection itself.
 pub fn run_suite(root: &Path) -> Result<Report, String> {
+    run_suite_with(root, Rv32iProfile::M1)
+}
+
+/// [`run_suite`] with the CPU in `profile`.
+pub fn run_suite_with(root: &Path, profile: Rv32iProfile) -> Result<Report, String> {
     let manifest = Manifest::read(root)?;
     manifest.ensure_selection()?;
     let mut report = Report {
@@ -465,7 +493,7 @@ pub fn run_suite(root: &Path) -> Result<Report, String> {
         errors: Vec::new(),
     };
     for fixture in &manifest.selected {
-        match run_fixture(root, fixture) {
+        match run_fixture_with(root, fixture, profile) {
             Ok(result) => report.results.push(result),
             Err(e) => report.errors.push(e),
         }

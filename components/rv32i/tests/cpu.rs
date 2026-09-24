@@ -25,7 +25,7 @@ use systemscope_runtime::runtime::{Dispatched, Runtime, SessionConfig};
 use systemscope_runtime::topology::TopologyBuilder;
 use systemscope_runtime::trace::Trace;
 use systemscope_rv32i::cpu::{COMMIT, COMMIT_KIND, HALT_KIND, TRAP_KIND};
-use systemscope_rv32i::{Rv32iConfig, Rv32iCpu};
+use systemscope_rv32i::{Rv32iConfig, Rv32iCpu, Rv32iProfile};
 
 /// Main memory: 16 KiB. Programs start at its base; data lives one page up.
 const RAM_BASE: u32 = 0x8000_0000;
@@ -98,6 +98,7 @@ impl Machine {
             clock,
             entry: self.entry,
             max_instructions: NonZeroU64::new(self.max_instructions).unwrap(),
+            profile: Rv32iProfile::M1,
         })
         .unwrap();
         let cpu = t.add_component("soc.cpu", Box::new(cpu));

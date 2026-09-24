@@ -5,8 +5,10 @@ use std::rc::Rc;
 
 use systemscope_contracts::observe::{Control, EventView, Observer, WorldView};
 use systemscope_rv32::manifest::Manifest;
-use systemscope_rv32::runner::{End, PASS_CAUSE, judge, run, run_fixture, run_suite};
-use systemscope_rv32::{SELECTED, hex, workspace_root};
+use systemscope_rv32::runner::{
+    End, PASS_CAUSE, judge, run, run_fixture, run_suite, run_suite_with,
+};
+use systemscope_rv32::{Rv32iProfile, SELECTED, hex, workspace_root};
 
 #[test]
 fn simple_passes() {
@@ -53,6 +55,23 @@ fn the_selected_rv32ui_suite_passes() {
             r.line()
         );
         assert!(r.outcome.state.is_some() && r.outcome.trace.is_some());
+    }
+}
+
+/// The M2 CPU profile passes the same 40 tests (`docs/m2-design.md` §15.4).
+#[test]
+fn the_selected_rv32ui_suite_passes_with_the_m2_cpu_profile() {
+    let report = run_suite_with(&workspace_root(), Rv32iProfile::M2).unwrap();
+    for r in &report.results {
+        println!("{}", r.line());
+    }
+    report.accept(SELECTED.len()).unwrap();
+    for r in &report.results {
+        assert!(
+            matches!(&r.outcome.end, End::Trap { cause, .. } if cause == PASS_CAUSE),
+            "{}",
+            r.line()
+        );
     }
 }
 

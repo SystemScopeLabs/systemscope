@@ -9,8 +9,12 @@
 //! [`prepare_memory`] with its completions ([`complete_memory`], [`complete_load`],
 //! [`complete_store`]) for loads and stores, producing a [`PendingEffect`] or, for a trap,
 //! a [`PendingTrap`].
+//!
+//! The `M2` profile ([`Rv32iProfile`]) adds the privileged subset of `docs/m2-design.md`
+//! §4 in [`csr`]: the Zicsr instructions on eight machine CSRs ([`CsrFile`]) and `MRET`.
 
 pub mod cpu;
+pub mod csr;
 pub mod decode;
 pub mod execute;
 pub mod immediate;
@@ -18,7 +22,8 @@ pub mod instr;
 pub mod memory;
 pub mod regfile;
 
-pub use cpu::{CpuConfigError, Halt, Rv32iConfig, Rv32iCpu, RvTrap};
+pub use cpu::{CpuConfigError, Halt, Rv32iConfig, Rv32iCpu, Rv32iProfile, RvTrap};
+pub use csr::{CsrFile, CsrOp, CsrSource, PrivInstr, decode_privileged};
 pub use decode::{Illegal, decode};
 pub use execute::{
     ExecOutcome, NotAlu, NotControl, NotSystem, PendingEffect, PendingTrap, RegWrite, TrapCause,

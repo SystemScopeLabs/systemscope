@@ -28,6 +28,13 @@
 //! ([`judge_pass`]). **Trap programs** end in a misaligned access instead: Spike runs them
 //! with `-l` ([`spike_trap_args`]), whose log also names the trap, and [`judge_trap`]
 //! requires both sides to stop at the same instruction with the same cause and trap value.
+//!
+//! **M2 programs** ([`run_m2`], `docs/m2-design.md` §4) run with the M2 CPU profile, and
+//! Spike with [`SPIKE_ISA_M2`] and `-l` ([`spike_m2_args`]). A [`Retire`] then also holds
+//! the whitelisted CSR write: SystemScope's `csr` and `csr_value` fields, and Spike's
+//! `c<number>_<name> <value>` commit tokens. Spike's `mstatush` and `tcontrol` are not
+//! compared. A passing program's log ends with the `ECALL` Spike starts before its HTIF
+//! exits ([`pass_end`]); a trap program's is read up to its first trap.
 
 use std::fmt;
 use std::fs;
@@ -39,7 +46,9 @@ use systemscope_contracts::trace::Value;
 use systemscope_elf::LoadImage;
 use systemscope_runtime::trace::Trace;
 use systemscope_rv32i::cpu::{COMMIT_KIND, HALT_KIND, TRAP_KIND};
+use systemscope_rv32i::{Rv32iProfile, csr};
 
+use crate::csrgen;
 use crate::manifest::{Fixture, Manifest, load};
 use crate::progen::{self, ExpectedTrap, MISALIGNED, Program};
 use crate::runner::{self, CPU, End, Finished, PASS_CAUSE, Start};
@@ -63,6 +72,8 @@ pub const SPIKE_STAMP: &str = "spike.stamp";
 pub const SPIKE_ISA: &str = "rv32i";
 /// The privilege modes: machine mode only, the least Spike runs an ELF with.
 pub const SPIKE_PRIV: &str = "m";
+/// The ISA for the M2 CPU profile (`docs/m2-design.md` §4): RV32I and Zicsr.
+pub const SPIKE_ISA_M2: &str = "rv32i_zicsr";
 /// Where `cargo xtask spike` writes Spike's commit logs, relative to the workspace root.
 pub const SPIKE_LOGS: &str = "target/spike-logs";
 /// The committed log of `simple` from the pinned Spike, relative to the workspace root.
@@ -131,6 +142,9 @@ pub struct Retire {
     pub reg_write: Option<(u8, u32)>,
     /// The data access.
     pub mem: Mem,
+    /// The whitelisted CSR write of an M2 CSR instruction, `(csr, value stored)`: none
+    /// for M1 code, and none when the write is suppressed.
+    pub csr: Option<(u16, u32)>,
 }
 
 impl fmt::Display for Retire {
@@ -141,11 +155,15 @@ impl fmt::Display for Retire {
             None => write!(f, " no register write")?,
         }
         match self.mem {
-            Mem::None => Ok(()),
-            Mem::Load { addr } => write!(f, ", load {addr:#010x}"),
+            Mem::None => {}
+            Mem::Load { addr } => write!(f, ", load {addr:#010x}")?,
             Mem::Store { addr, width, value } => {
-                write!(f, ", store {width} B {value:#x} to {addr:#010x}")
+                write!(f, ", store {width} B {value:#x} to {addr:#010x}")?
             }
+        }
+        match self.csr {
+            Some((csr, value)) => write!(f, ", csr {csr:#05x} = {value:#010x}"),
+            None => Ok(()),
         }
     }
 }
@@ -188,8 +206,29 @@ pub fn from_trace(trace: &Trace) -> Result<SystemScopeStream, String> {
         };
         match record.kind {
             k if k == COMMIT_KIND => {
+                let mut csr = None;
                 let mem = match fields.as_slice() {
                     ["pc", "insn", "rd", "rd_value", "next_pc"] => Mem::None,
+                    // An M2 CSR instruction (m2-design §6.5): its CSR, then the value stored
+                    // unless the write is suppressed.
+                    ["pc", "insn", "rd", "rd_value", "next_pc", "csr"] => {
+                        csr_number(u32_at(5)?).ok_or_else(|| at("csr out of range"))?;
+                        Mem::None
+                    }
+                    [
+                        "pc",
+                        "insn",
+                        "rd",
+                        "rd_value",
+                        "next_pc",
+                        "csr",
+                        "csr_value",
+                    ] => {
+                        let number =
+                            csr_number(u32_at(5)?).ok_or_else(|| at("csr out of range"))?;
+                        csr = Some((number, u32_at(6)?));
+                        Mem::None
+                    }
                     ["pc", "insn", "rd", "rd_value", "next_pc", "addr"] => {
                         Mem::Load { addr: u32_at(5)? }
                     }
@@ -224,6 +263,7 @@ pub fn from_trace(trace: &Trace) -> Result<SystemScopeStream, String> {
                     insn: u32_at(1)?,
                     reg_write: reg_write(rd, u32_at(3)?),
                     mem,
+                    csr,
                 });
             }
             k if k == TRAP_KIND => {
@@ -303,6 +343,21 @@ fn parse_spike_line(line: &str) -> Result<Retire, String> {
             }
         };
     }
+    // The CSRs the instruction wrote, as `c<number>_<name> <value>`.
+    let mut csrs = Vec::new();
+    while let Some(token) = tokens.next_if(|t| t.starts_with('c')) {
+        let (number, name) = token[1..].split_once('_').ok_or("bad CSR")?;
+        let number = number
+            .parse::<u32>()
+            .ok()
+            .and_then(csr_number)
+            .ok_or("bad CSR number")?;
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Err(format!("bad CSR name {name:?}"));
+        }
+        let value = word(tokens.next().ok_or("CSR without a value")?, 8)?;
+        csrs.push((number, name, value));
+    }
     if let Some(extra) = tokens.next() {
         return Err(format!("unexpected {extra:?}"));
     }
@@ -320,6 +375,9 @@ fn parse_spike_line(line: &str) -> Result<Retire, String> {
             digits = usize::from(width) * 2
         )),
     }
+    for (number, name, value) in &csrs {
+        canonical.push_str(&format!(" c{number}_{name} {value:#010x}"));
+    }
     if line != canonical {
         return Err(format!("not laid out as Spike writes it: {canonical:?}"));
     }
@@ -328,7 +386,52 @@ fn parse_spike_line(line: &str) -> Result<Retire, String> {
         insn,
         reg_write: reg.and_then(|(rd, value)| reg_write(rd, value)),
         mem,
+        csr: csr_write(insn, &csrs)?,
     })
+}
+
+/// A CSR number, 12 bits.
+fn csr_number(n: u32) -> Option<u16> {
+    u16::try_from(n).ok().filter(|n| *n < 0x1000)
+}
+
+/// Spike's `mstatush`, which it writes with `mstatus`; M2 has none (m2-design §4.3).
+const SPIKE_MSTATUSH: u16 = 0x310;
+/// Spike's `tcontrol`, which its `MRET` writes; M2 has no trigger module.
+const SPIKE_TCONTROL: u16 = 0x7a5;
+
+/// The whitelisted CSR write among the CSRs a Spike commit line reports: `mstatush` and
+/// `tcontrol` are not compared, and any other CSR outside the whitelist is an error. At
+/// most one whitelisted CSR may be written, except by `MRET`: its implicit `mstatus`
+/// update, which SystemScope's trace does not record (§6.5), must come exactly as
+/// `mstatus`, `mstatush` = 0, `tcontrol` = 0, and is not compared here; the directed
+/// programs read `mstatus` right after every `MRET` instead.
+fn csr_write(insn: u32, csrs: &[(u16, &str, u32)]) -> Result<Option<(u16, u32)>, String> {
+    if insn == csr::MRET {
+        return match csrs {
+            [
+                (csr::MSTATUS, "mstatus", _),
+                (SPIKE_MSTATUSH, "mstatush", 0),
+                (SPIKE_TCONTROL, "tcontrol", 0),
+            ] => Ok(None),
+            _ => Err("MRET's CSR updates are not mstatus, mstatush = 0, tcontrol = 0".to_owned()),
+        };
+    }
+    let mut write = None;
+    for &(number, name, value) in csrs {
+        if number == SPIKE_MSTATUSH || number == SPIKE_TCONTROL {
+            continue;
+        }
+        if !csr::is_supported(number) {
+            return Err(format!(
+                "{name} ({number:#05x}) is outside the M2 whitelist"
+            ));
+        }
+        if write.replace((number, value)).is_some() {
+            return Err("more than one whitelisted CSR written".to_owned());
+        }
+    }
+    Ok(write)
 }
 
 /// `0x` and exactly `digits` lowercase hex digits.
@@ -511,25 +614,34 @@ fn run_both(
     let elf = format!("{FIXTURE_DIR}/{}", fixture.elf);
     let bytes = fs::read(root.join(&elf)).map_err(|e| format!("{elf}: {e}"))?;
     let tohost = elf_symbol(&bytes, "tohost").ok_or(format!("{elf} has no tohost symbol"))?;
-    let (finished, text) = run_sides(root, &image, &elf, spike, log, false, executed)?;
+    let (finished, text) = run_sides(
+        root,
+        &image,
+        &elf,
+        spike,
+        log,
+        (Rv32iProfile::M1, false),
+        executed,
+    )?;
     judge_pass(&finished, &parse_spike_log(&text)?, image.entry, tohost)
 }
 
-/// Runs `image` traced on SystemScope, then the ELF at `elf` on Spike, with `-l` if
-/// `trap`, writing Spike's log to `log`. Returns SystemScope's run and Spike's log. Both
-/// sides run before either is judged, so a divergence is reported where it starts.
+/// Runs `image` traced on SystemScope with the CPU `profile`, then the ELF at `elf` on
+/// Spike, with `-l` if `trap` or M2 ([`spike_m2_args`]), writing Spike's log to `log`.
+/// Returns SystemScope's run and Spike's log. Both sides run before either is judged, so a
+/// divergence is reported where it starts.
 fn run_sides(
     root: &Path,
     image: &LoadImage,
     elf: &str,
     spike: &Path,
     log: &str,
-    trap: bool,
+    (profile, trap): (Rv32iProfile, bool),
     executed: &mut (bool, bool),
 ) -> Result<(Finished, String), String> {
     // SystemScope: the integrated CPU, traced.
     let finished = runner::execute(
-        runner::platform(image, false),
+        runner::platform_with_profile(image, false, runner::SEED, profile),
         Start::Init { traced: true },
         Vec::new(),
     );
@@ -540,10 +652,10 @@ fn run_sides(
         fs::create_dir_all(root.join(dir)).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
     let _ = fs::remove_file(root.join(log));
-    let args = if trap {
-        spike_trap_args(image.entry, elf, log)
-    } else {
-        spike_args(image.entry, elf, log)
+    let args = match (profile, trap) {
+        (Rv32iProfile::M2, _) => spike_m2_args(image.entry, elf, log),
+        (Rv32iProfile::M1, true) => spike_trap_args(image.entry, elf, log),
+        (Rv32iProfile::M1, false) => spike_args(image.entry, elf, log),
     };
     let out = Command::new(spike)
         .args(args)
@@ -637,6 +749,22 @@ pub fn spike_trap_args(entry: u32, elf: &str, log: &str) -> Vec<String> {
     args
 }
 
+/// Spike's command line for a program run with the M2 CPU profile: [`spike_trap_args`]
+/// with [`SPIKE_ISA_M2`]. Every M2 program runs with `-l`, so a trap is always named.
+pub fn spike_m2_args(entry: u32, elf: &str, log: &str) -> Vec<String> {
+    let m1 = format!("--isa={SPIKE_ISA}");
+    spike_trap_args(entry, elf, log)
+        .into_iter()
+        .map(|arg| {
+            if arg == m1 {
+                format!("--isa={SPIKE_ISA_M2}")
+            } else {
+                arg
+            }
+        })
+        .collect()
+}
+
 /// The trap Spike reports in a `-l` log.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpikeTrap {
@@ -680,6 +808,20 @@ pub const SPIKE_CAUSES: [(&str, &str); 9] = [
 /// Lines after the trap, Spike's handler at `mtvec`, are not compared (§10.3). A log with
 /// no trap is an error.
 pub fn parse_spike_trap_log(log: &str) -> Result<(Vec<Retire>, SpikeTrap), String> {
+    match parse_spike_l_log(log)? {
+        (retires, Some(trap)) => Ok((retires, trap)),
+        (_, None) => Err("Spike's log has no trap".to_owned()),
+    }
+}
+
+/// Spike's name for an environment call from machine mode, the one trap its `-l` log
+/// writes without a tval line.
+const SPIKE_ECALL: &str = "trap_machine_ecall";
+
+/// Parses a `-l --log-commits` log as [`parse_spike_trap_log`] does, up to its first trap
+/// if it has one. A program run to the passing `write_tohost` has none but the `ECALL`
+/// after it, which Spike starts before its HTIF exits: see [`pass_end`].
+pub fn parse_spike_l_log(log: &str) -> Result<(Vec<Retire>, Option<SpikeTrap>), String> {
     let mut lines = log.lines().enumerate();
     let mut retires = Vec::new();
     let at = |i: usize, why: &str, line: &str| format!("Spike log line {}: {why}: {line:?}", i + 1);
@@ -699,20 +841,26 @@ pub fn parse_spike_trap_log(log: &str) -> Result<(Vec<Retire>, SpikeTrap), Strin
                     next,
                 ));
             }
-            let (j, tval_line) = lines
-                .next()
-                .ok_or_else(|| at(k, "no tval line after the trap", next))?;
-            let tval = tval_line
-                .strip_prefix("core   0:           tval ")
-                .ok_or_else(|| at(j, "not the trap's tval line", tval_line))
-                .and_then(|t| word(t, 8).map_err(|why| at(j, &why, tval_line)))?;
+            // Spike writes no tval line for a trap without one: of the causes here, only
+            // an environment call, whose `tval` is 0.
+            let tval = if cause == SPIKE_ECALL {
+                0
+            } else {
+                let (j, tval_line) = lines
+                    .next()
+                    .ok_or_else(|| at(k, "no tval line after the trap", next))?;
+                tval_line
+                    .strip_prefix("core   0:           tval ")
+                    .ok_or_else(|| at(j, "not the trap's tval line", tval_line))
+                    .and_then(|t| word(t, 8).map_err(|why| at(j, &why, tval_line)))?
+            };
             let trap = SpikeTrap {
                 pc,
                 insn,
                 cause: cause.to_owned(),
                 tval,
             };
-            return Ok((retires, trap));
+            return Ok((retires, Some(trap)));
         }
         let retire = parse_spike_line(next).map_err(|why| at(k, &why, next))?;
         if (retire.pc, retire.insn) != (pc, insn) {
@@ -724,7 +872,36 @@ pub fn parse_spike_trap_log(log: &str) -> Result<(Vec<Retire>, SpikeTrap), Strin
         }
         retires.push(retire);
     }
-    Err("Spike's log has no trap".to_owned())
+    Ok((retires, None))
+}
+
+/// The retirements of a `-l` log of a program that must pass. With `-l`, Spike starts the
+/// `ECALL` after `write_tohost` before its HTIF exits, so the log must end with exactly
+/// that: the `ECALL`'s instruction line and its trap, right after the last retirement.
+/// Anything else, a trap included, is an error. [`check_boundary`] then requires the
+/// retirements to end with `write_tohost`, as without `-l`.
+pub fn pass_end(log: &str) -> Result<Vec<Retire>, String> {
+    let (retires, trap) = parse_spike_l_log(log)?;
+    let last = retires.last().ok_or("Spike retired nothing")?.pc;
+    let ecall = last.wrapping_add(4);
+    let end = format!(
+        "core   0: {ecall:#010x} (0x00000073) ecall\ncore   0: exception {SPIKE_ECALL}, epc \
+         {ecall:#010x}\n"
+    );
+    match trap {
+        Some(t)
+            if (t.pc, t.insn, t.cause.as_str()) == (ecall, 0x73, SPIKE_ECALL)
+                && log.ends_with(&end) =>
+        {
+            Ok(retires)
+        }
+        Some(t) => Err(format!(
+            "Spike's log does not end with the ECALL at {ecall:#010x}, but traps with {t:?}"
+        )),
+        None => Err(format!(
+            "Spike's log does not end with the ECALL at {ecall:#010x}"
+        )),
+    }
 }
 
 /// The `pc` and word of an instruction line, `core   0: <pc> (<insn>) <disassembly>`.
@@ -794,20 +971,40 @@ pub fn program_differential(
     spike: &Path,
     logs: &str,
 ) -> Diff {
+    program_differential_with(root, program, expected, Rv32iProfile::M1, spike, logs)
+}
+
+/// [`program_differential`] with the CPU `profile`. An M2 program runs on Spike with
+/// [`spike_m2_args`], and one that must pass must not trap.
+pub fn program_differential_with(
+    root: &Path,
+    program: &Program,
+    expected: Option<&ExpectedTrap>,
+    profile: Rv32iProfile,
+    spike: &Path,
+    logs: &str,
+) -> Diff {
     let mut diff = Diff {
         name: program.name.clone(),
         blake3: *blake3::hash(&program.elf).as_bytes(),
         executed: (false, false),
         verdict: Ok(0),
     };
-    diff.verdict = run_program(root, program, expected, spike, logs, &mut diff.executed);
+    diff.verdict = run_program(
+        root,
+        program,
+        (expected, profile),
+        spike,
+        logs,
+        &mut diff.executed,
+    );
     diff
 }
 
 fn run_program(
     root: &Path,
     program: &Program,
-    expected: Option<&ExpectedTrap>,
+    (expected, profile): (Option<&ExpectedTrap>, Rv32iProfile),
     spike: &Path,
     logs: &str,
     executed: &mut (bool, bool),
@@ -826,19 +1023,23 @@ fn run_program(
         &elf,
         spike,
         &log,
-        expected.is_some(),
+        (profile, expected.is_some()),
         executed,
     )?;
-    match expected {
-        None => {
+    let (theirs, trap) = match (profile, expected) {
+        (Rv32iProfile::M1, None) => (parse_spike_log(&text)?, None),
+        (Rv32iProfile::M1, Some(_)) => parse_spike_trap_log(&text).map(|(r, t)| (r, Some(t)))?,
+        (Rv32iProfile::M2, Some(_)) => parse_spike_l_log(&text)?,
+        (Rv32iProfile::M2, None) => (pass_end(&text)?, None),
+    };
+    match (expected, trap) {
+        (None, _) => {
             let tohost =
                 elf_symbol(&program.elf, "tohost").ok_or(format!("{elf} has no tohost symbol"))?;
-            judge_pass(&finished, &parse_spike_log(&text)?, image.entry, tohost)
+            judge_pass(&finished, &theirs, image.entry, tohost)
         }
-        Some(expected) => {
-            let (theirs, trap) = parse_spike_trap_log(&text)?;
-            judge_trap(&finished, &theirs, &trap, expected)
-        }
+        (Some(expected), Some(trap)) => judge_trap(&finished, &theirs, &trap, expected),
+        (Some(_), None) => Err("Spike's log has no trap".to_owned()),
     }
 }
 
@@ -866,6 +1067,35 @@ pub fn run_misaligned(root: &Path, spike: &Path, logs: &str) -> DiffReport {
         .collect();
     DiffReport {
         selected: MISALIGNED.len(),
+        results,
+    }
+}
+
+/// The directed M2 programs against Spike, with the M2 CPU profile and
+/// [`SPIKE_ISA_M2`]: every [`csrgen::pass_programs`] program to the passing
+/// `write_tohost`, then every [`csrgen::illegal_programs`] program to its trap.
+pub fn run_m2(root: &Path, spike: &Path, logs: &str) -> DiffReport {
+    let passing = csrgen::pass_programs()
+        .into_iter()
+        .map(|program| (program, None));
+    let trapping = csrgen::illegal_programs()
+        .into_iter()
+        .map(|(program, expected)| (program, Some(expected)));
+    let results: Vec<Diff> = passing
+        .chain(trapping)
+        .map(|(program, expected)| {
+            program_differential_with(
+                root,
+                &program,
+                expected.as_ref(),
+                Rv32iProfile::M2,
+                spike,
+                logs,
+            )
+        })
+        .collect();
+    DiffReport {
+        selected: results.len(),
         results,
     }
 }
@@ -1134,6 +1364,7 @@ mod tests {
             insn,
             reg_write,
             mem,
+            csr: None,
         }
     }
 
@@ -1249,6 +1480,158 @@ mod tests {
         let hidden = parse_spike_log("core   0: 3 0x8000029c (0x00000013)").unwrap();
         assert_eq!(shown, hidden);
         assert_eq!(shown[0].reg_write, None);
+    }
+
+    /// Commit lines of the pinned Spike with `--isa=rv32i_zicsr`: a whitelisted CSR write
+    /// is kept, `mstatush` and `tcontrol` are not compared, and `MRET`'s implicit update
+    /// must have exactly Spike's shape.
+    #[test]
+    fn csr_writes_in_spike_lines_parse() {
+        let csr = |pc, insn, reg_write, csr| Retire {
+            csr,
+            ..retire(pc, insn, reg_write, Mem::None)
+        };
+        for (line, expected) in [
+            (
+                "core   0: 3 0x80000188 (0x340fd673) x12 0x12345678 c832_mscratch 0x0000001f",
+                csr(
+                    0x8000_0188,
+                    0x340f_d673,
+                    Some((12, 0x1234_5678)),
+                    Some((0x340, 0x1f)),
+                ),
+            ),
+            (
+                "core   0: 3 0x80000008 (0x30529073) c773_mtvec 0x80000280",
+                csr(0x8000_0008, 0x3052_9073, None, Some((0x305, 0x8000_0280))),
+            ),
+            (
+                "core   0: 3 0x80000114 (0x34429073) c836_mip 0x00000000",
+                csr(0x8000_0114, 0x3442_9073, None, Some((0x344, 0))),
+            ),
+            (
+                "core   0: 3 0x8000003c (0x31029073) c784_mstatush 0x00000000",
+                csr(0x8000_003c, 0x3102_9073, None, None),
+            ),
+            (
+                "core   0: 3 0x8000006c (0x30200073) c768_mstatus 0x00001880 c784_mstatush \
+                 0x00000000 c1957_tcontrol 0x00000000",
+                csr(0x8000_006c, 0x3020_0073, None, None),
+            ),
+        ] {
+            assert_eq!(parse_spike_log(line).unwrap(), [expected], "{line:?}");
+        }
+        for line in [
+            "core   0: 3 0x80000000 (0x30129073) c769_misa 0x40000100",
+            "core   0: 3 0x80000000 (0x34029073) c832_mscratch 0x00000001 c833_mepc 0x00000000",
+            "core   0: 3 0x80000000 (0x34029073) c832_mscratch 0x1f",
+            "core   0: 3 0x80000000 (0x34029073) c832_mscratch",
+            "core   0: 3 0x80000000 (0x34029073) c832_mscratch  0x00000001",
+            "core   0: 3 0x80000000 (0x34029073)  c832_mscratch 0x00000001",
+            "core   0: 3 0x80000000 (0x34029073) c4096_mscratch 0x00000001",
+            "core   0: 3 0x80000000 (0x34029073) c832_ 0x00000001",
+            "core   0: 3 0x80000000 (0x34029073) c0832_mscratch 0x00000001",
+            "core   0: 3 0x80000000 (0x34029073) c832_mscratch 0x00000001 x1  0x00000000",
+            "core   0: 3 0x8000006c (0x30200073) c768_mstatus 0x00001880",
+            "core   0: 3 0x8000006c (0x30200073)",
+            "core   0: 3 0x8000006c (0x30200073) c768_mstatus 0x00001880 c784_mstatush \
+             0x00000001 c1957_tcontrol 0x00000000",
+        ] {
+            assert!(parse_spike_log(line).is_err(), "{line:?}");
+        }
+    }
+
+    /// The end of a pinned-Spike `-l` log of a passing M2 program: `write_tohost`, then
+    /// the `ECALL`, whose trap has no tval line.
+    const M2_PASS_END: &str = "\
+core   0: 0x80000048 (0x00010f17) auipc   t5, 0x10
+core   0: 3 0x80000048 (0x00010f17) x30 0x80010048
+core   0: 0x8000004c (0xfa0f2e23) sw      zero, -68(t5)
+core   0: 3 0x8000004c (0xfa0f2e23) mem 0x80010004 0x00000000
+core   0: 0x80000050 (0x00000073) ecall
+core   0: exception trap_machine_ecall, epc 0x80000050
+";
+
+    #[test]
+    fn a_passing_l_log_ends_with_the_ecall() {
+        let retires = pass_end(M2_PASS_END).unwrap();
+        assert_eq!(retires.len(), 2);
+        assert_eq!(
+            retires[1].mem,
+            Mem::Store {
+                addr: 0x8001_0004,
+                width: 4,
+                value: 0
+            }
+        );
+        let (_, trap) = parse_spike_l_log(M2_PASS_END).unwrap();
+        assert_eq!(
+            trap,
+            Some(SpikeTrap {
+                pc: 0x8000_0050,
+                insn: 0x73,
+                cause: "trap_machine_ecall".to_owned(),
+                tval: 0
+            })
+        );
+        let lines: Vec<&str> = M2_PASS_END.lines().collect();
+        let join = |lines: &[&str]| lines.iter().map(|l| format!("{l}\n")).collect::<String>();
+        // No ECALL, a line after it, or another trap there.
+        assert!(pass_end(&join(&lines[..4])).is_err());
+        assert!(pass_end(&join(&lines[..5])).is_err());
+        assert!(pass_end(&format!("{M2_PASS_END}core   0: >>>>  trap_vector\n")).is_err());
+        let illegal = join(
+            &[
+                &lines[..4],
+                &[
+                    "core   0: 0x80000050 (0x30202573) csrr    a0, medeleg",
+                    "core   0: exception trap_illegal_instruction, epc 0x80000050",
+                    "core   0:           tval 0x30202573",
+                ],
+            ]
+            .concat(),
+        );
+        assert!(parse_spike_l_log(&illegal).unwrap().1.is_some());
+        assert!(pass_end(&illegal).is_err());
+        // Only an ECALL goes without a tval line.
+        let untold = join(
+            &[
+                &lines[..4],
+                &[
+                    "core   0: 0x80000050 (0x30202573) csrr    a0, medeleg",
+                    "core   0: exception trap_illegal_instruction, epc 0x80000050",
+                ],
+            ]
+            .concat(),
+        );
+        assert!(parse_spike_l_log(&untold).is_err());
+    }
+
+    /// SystemScope's CSR commits read back as the whitelisted CSR writes: a suppressed
+    /// write is none, and `MRET` records none.
+    #[test]
+    fn csr_commits_in_the_trace_are_csr_writes() {
+        let p = &csrgen::pass_programs()[0];
+        let image = load(&p.name, &p.elf).unwrap();
+        let finished = runner::execute(
+            runner::platform_with_profile(&image, false, runner::SEED, Rv32iProfile::M2),
+            Start::Init { traced: true },
+            Vec::new(),
+        );
+        let stream = our_stream(&finished).unwrap();
+        assert_eq!(stream.retires.len(), p.code.len() - 1);
+        for (r, &word) in stream.retires.iter().zip(&p.code) {
+            let expected = match systemscope_rv32i::decode_privileged(word) {
+                Some(instr @ systemscope_rv32i::PrivInstr::Csr { csr, .. }) if instr.writes() => {
+                    Some(csr)
+                }
+                _ => None,
+            };
+            assert_eq!(r.csr.map(|c| c.0), expected, "{r}");
+        }
+        // csrrw a0, mscratch, x0 after mscratch = 0x12345678.
+        assert_eq!(stream.retires[3].reg_write, Some((10, 0x1234_5678)));
+        assert_eq!(stream.retires[3].csr, Some((0x340, 0)));
     }
 
     #[test]

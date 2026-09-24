@@ -31,6 +31,7 @@ use systemscope_contracts::protocol::mem_v1::MemMsg;
 use systemscope_contracts::trace::Value as TraceValue;
 use systemscope_elf::LoadImage;
 use systemscope_platform::uart;
+use systemscope_rv32i::Rv32iProfile;
 
 use crate::hello::uart_traffic;
 use crate::manifest::{addr, array, digest, dir_entries, load, q, s};
@@ -946,8 +947,13 @@ pub struct Act4Run {
 
 /// Runs `image` untraced on `m1-reference` with the UART.
 pub fn run(image: &LoadImage) -> Act4Run {
+    run_with(image, Rv32iProfile::M1)
+}
+
+/// [`run`] with the CPU in `profile`.
+pub fn run_with(image: &LoadImage, profile: Rv32iProfile) -> Act4Run {
     let finished = runner::execute(
-        runner::platform(image, true),
+        runner::platform_with_profile(image, true, runner::SEED, profile),
         Start::Init { traced: false },
         Vec::new(),
     );
@@ -1020,8 +1026,17 @@ pub fn judge(name: &str, run: &Act4Run) -> Result<(), String> {
 
 /// Reads `test` under `root`, checks it against its manifest entry, and runs it.
 pub fn run_test(root: &Path, test: &Act4Test) -> Result<FixtureResult, String> {
+    run_test_with(root, test, Rv32iProfile::M1)
+}
+
+/// [`run_test`] with the CPU in `profile`.
+pub fn run_test_with(
+    root: &Path,
+    test: &Act4Test,
+    profile: Rv32iProfile,
+) -> Result<FixtureResult, String> {
     let image = test.read(root)?;
-    let run = run(&image);
+    let run = run_with(&image, profile);
     Ok(FixtureResult {
         name: test.recorded.name.clone(),
         blake3: test.blake3,
@@ -1034,6 +1049,15 @@ pub fn run_test(root: &Path, test: &Act4Test) -> Result<FixtureResult, String> {
 /// `cargo xtask act4 run`: verifies the committed corpus, then runs every test in it.
 /// [`Report::accept`] with the manifest's `count` is M1-A4.
 pub fn run_corpus(root: &Path) -> Result<(Act4Manifest, Report), String> {
+    run_corpus_with(root, Rv32iProfile::M1)
+}
+
+/// [`run_corpus`] with the CPU in `profile`: the M2 profile must pass the same corpus
+/// (`docs/m2-design.md` §15.4).
+pub fn run_corpus_with(
+    root: &Path,
+    profile: Rv32iProfile,
+) -> Result<(Act4Manifest, Report), String> {
     let manifest = verify(root).map_err(|errors| {
         format!(
             "the ACT4 corpus does not match {ACT4_MANIFEST}:\n  {}",
@@ -1046,7 +1070,7 @@ pub fn run_corpus(root: &Path) -> Result<(Act4Manifest, Report), String> {
         errors: Vec::new(),
     };
     for test in &manifest.tests {
-        match run_test(root, test) {
+        match run_test_with(root, test, profile) {
             Ok(result) => report.results.push(result),
             Err(e) => report.errors.push(e),
         }

@@ -20,7 +20,7 @@ use systemscope_contracts::snapshot::{RestoreError, SnapshotReader, SnapshotWrit
 use systemscope_contracts::time::ClockDomainId;
 use systemscope_contracts::trace::Value;
 use systemscope_rv32i::cpu::{COMMIT, FETCH, MEMORY, SNAPSHOT_SCHEMA, TRAP_KIND};
-use systemscope_rv32i::{CpuConfigError, Rv32iConfig, Rv32iCpu};
+use systemscope_rv32i::{CpuConfigError, Rv32iConfig, Rv32iCpu, Rv32iProfile};
 
 const ENTRY: u32 = 0x8000_0000;
 const CLOCK: ClockDomainId = ClockDomainId(0);
@@ -31,6 +31,7 @@ fn config() -> Rv32iConfig {
         clock: CLOCK,
         entry: ENTRY,
         max_instructions: NonZeroU64::new(LIMIT).unwrap(),
+        profile: Rv32iProfile::M1,
     }
 }
 

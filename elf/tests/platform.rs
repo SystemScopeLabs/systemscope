@@ -31,7 +31,7 @@ use systemscope_elf::{LoadImage, load_elf32};
 use systemscope_platform::{AddressBus, Ram, RamConfig, RamImage, Region, Segment};
 use systemscope_runtime::runtime::SessionConfig;
 use systemscope_runtime::topology::TopologyBuilder;
-use systemscope_rv32i::{CpuConfigError, Rv32iConfig, Rv32iCpu};
+use systemscope_rv32i::{CpuConfigError, Rv32iConfig, Rv32iCpu, Rv32iProfile};
 
 const RAM_BASE: u32 = 0x8000_0000;
 const RAM_SIZE: u32 = 0x4000;
@@ -230,6 +230,7 @@ fn the_entry_point_is_a_valid_cpu_entry() {
         clock,
         entry,
         max_instructions: NonZeroU64::new(1).unwrap(),
+        profile: Rv32iProfile::M1,
     };
     assert!(Rv32iCpu::new(config(image.entry)).is_ok());
     // What the loader rules out, the CPU would too: the two agree on alignment.
@@ -271,6 +272,7 @@ fn a_loaded_program_runs_from_its_entry_point_on_the_bus_and_ram() {
         clock,
         entry: image.entry,
         max_instructions: NonZeroU64::new(PROGRAM_LEN).unwrap(),
+        profile: Rv32iProfile::M1,
     })
     .unwrap();
     let cpu = t.add_component("soc.cpu", Box::new(cpu));
