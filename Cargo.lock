@@ -477,6 +477,8 @@ version = "0.0.0"
 dependencies = [
  "proptest",
  "systemscope-contracts",
+ "systemscope-platform",
+ "systemscope-runtime",
 ]
 
 [[package]]

@@ -12,6 +12,7 @@ rust-version = "1.98.1"
 systemscope-contracts = { path = "../contracts/crates/systemscope-contracts" }
 systemscope-runtime = { path = "runtime" }
 systemscope-toy = { path = "components/toy" }
+systemscope-platform = { path = "components/platform" }
 systemscope-reference = { path = "reference" }
 systemscope-acceptance = { path = "tests/acceptance" }
 

@@ -13,6 +13,10 @@ systemscope-contracts.workspace = true
 
 [dev-dependencies]
 proptest = "1"
+# CPU tests run programs against the real bus and RAM in the real runtime; the library
+# itself depends on neither.
+systemscope-platform.workspace = true
+systemscope-runtime.workspace = true
 
 [lints]
 workspace = true
