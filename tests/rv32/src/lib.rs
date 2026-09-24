@@ -16,12 +16,17 @@
 //! - [`spike`] is M1-A3: every selected fixture's retirements against the pinned Spike's
 //!   commit log. Only `cargo xtask spike diff` runs Spike; tests use committed Spike logs.
 //!
+//! - [`act4`] is M1-A4: the ACT4 RV32I corpus under `tests/act4`, self-checking ELFs with
+//!   expected values from the Sail reference model, pinned by `tests/act4/manifest.json`.
+//!   Only `cargo xtask act4 build` runs ACT4 and Sail.
+//!
 //! Tests only read the committed fixtures. `cargo xtask rv32-fixtures build` rebuilds
 //! them on Linux, and `cargo xtask rv32-fixtures verify` checks them without a network or
 //! a compiler.
 
 use std::path::{Path, PathBuf};
 
+pub mod act4;
 pub mod hello;
 pub mod manifest;
 pub mod runner;

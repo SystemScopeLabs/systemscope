@@ -33,6 +33,21 @@
 //!   SystemScope against Spike's, which must all match. Spike's logs go to
 //!   `target/spike-logs`.
 //!
+//! - `act4 build [<cache-dir>]`: Linux x86_64 only, with git, curl, tar, xz, make, and a
+//!   host C compiler. Generates the ACT4 RV32I corpus with the pinned ACT4, Sail, and GCC
+//!   in `/tmp/systemscope-act4` (`tests/act4/build-act4.sh`; the cache defaults to
+//!   `target/act4/cache`) into `target/act4/out`, then runs `install target/act4/out`.
+//!   Tests never regenerate the corpus; the commit that changes it must say why.
+//! - `act4 install <out-dir>`: the second half of `build`, for a generation run by hand.
+//!   Checks its record, replaces `tests/act4/fixtures/*.elf` with its ELFs, rewrites
+//!   `tests/act4/manifest.json`, and verifies.
+//! - `act4 check <out-dir>`: requires a generation to reproduce the committed corpus
+//!   byte for byte: the same tests, identical ELFs, and the same manifest. Writes nothing.
+//! - `act4 verify`: checks the committed corpus against its manifest, with no network,
+//!   ACT4, Sail, or compiler.
+//! - `act4 run`: `verify`, then M1-A4: runs every committed ACT4 ELF on `m1-reference`,
+//!   all of which must pass.
+//!
 //! The `spike` tasks run `<dir>/bin/spike`, or the command in `SPIKE` if it is set: the
 //! same pinned build, reached another way (such as through WSL). Nothing else in the
 //! workspace needs Spike.
@@ -43,6 +58,7 @@ use std::process::{Command, ExitCode};
 
 use systemscope_acceptance::golden::{GOLDEN_PATH, Golden, MID_SNAPSHOT_PATH, describe_changes};
 use systemscope_acceptance::m1::golden as m1;
+use systemscope_rv32::act4::{self, ACT4_MANIFEST, ACT4_SCRIPT};
 use systemscope_rv32::hello::{self, HELLO_DIR, HELLO_MANIFEST, HELLO_SCRIPT, HelloManifest};
 use systemscope_rv32::manifest::{Manifest, verify};
 use systemscope_rv32::spike::{self, SPIKE_COMMIT, SPIKE_DIR, SPIKE_LOGS, SPIKE_SCRIPT};
@@ -50,12 +66,18 @@ use systemscope_rv32::{BUILD_SCRIPT, FIXTURE_DIR, MANIFEST_PATH, SELECTED, upstr
 
 const USAGE: &str = "usage: cargo xtask bless\n       \
                      cargo xtask m1-golden bless | verify | emit <dir> | check <dir>\n       \
-                     cargo xtask rv32-fixtures build | manifest [<cache-dir>] | verify
-                            cargo xtask spike build | verify | diff [<dir>]";
+                     cargo xtask rv32-fixtures build | manifest [<cache-dir>] | verify\n       \
+                     cargo xtask spike build | verify | diff [<dir>]\n       \
+                     cargo xtask act4 build [<cache-dir>] | install <out-dir> | check <out-dir> \
+                     | verify | run";
 /// The golden file's name in an `m1-golden emit` directory.
 const M1_RESULT: &str = "m1-reference.json";
 /// Where `rv32-fixtures build` fetches and builds, relative to the workspace root.
 const RV32_CACHE: &str = "target/rv32-fixtures";
+/// Where `act4 build` keeps the pinned stack, relative to the workspace root.
+const ACT4_CACHE: &str = "target/act4/cache";
+/// Where `act4 build` generates the corpus, relative to the workspace root.
+const ACT4_OUT: &str = "target/act4/out";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -70,6 +92,12 @@ fn main() -> ExitCode {
         ["rv32-fixtures", "manifest"] => rv32_manifest(&root().join(RV32_CACHE)),
         ["rv32-fixtures", "manifest", cache] => rv32_manifest(Path::new(cache)),
         ["rv32-fixtures", "verify"] => rv32_verify(),
+        ["act4", "build"] => act4_build(&root().join(ACT4_CACHE)),
+        ["act4", "build", cache] => act4_build(Path::new(cache)),
+        ["act4", "install", out] => act4_install(Path::new(out)),
+        ["act4", "check", out] => act4_check(Path::new(out)),
+        ["act4", "verify"] => act4_verify(),
+        ["act4", "run"] => act4_run(),
         ["spike", task] => spike_task(task, &root().join(SPIKE_DIR)),
         ["spike", task, dir] => spike_task(task, Path::new(dir)),
         _ => {
@@ -471,7 +499,8 @@ fn spike_diff(dir: &Path) -> ExitCode {
         println!("{}", result.line());
     }
     println!(
-        "selected {}, run by SystemScope {}, run by Spike {}, matched {}, retirements          compared {}",
+        "selected {}, run by SystemScope {}, run by Spike {}, matched {}, retirements \
+         compared {}",
         report.selected,
         report.systemscope_executed(),
         report.spike_executed(),
@@ -487,6 +516,171 @@ fn spike_diff(dir: &Path) -> ExitCode {
         }
         Err(e) => {
             eprintln!("M1-A3 fails: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn act4_build(cache: &Path) -> ExitCode {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        eprintln!("act4 build runs on Linux x86_64 only (docs/m1-design.md §10.4)");
+        return ExitCode::FAILURE;
+    }
+    let root = root();
+    let out = root.join(ACT4_OUT);
+    match Command::new("bash")
+        .arg(ACT4_SCRIPT)
+        .arg(cache)
+        .arg(&out)
+        .current_dir(&root)
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        Ok(s) => {
+            eprintln!("{ACT4_SCRIPT} failed: {s}");
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("cannot run {ACT4_SCRIPT}: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    act4_install(&out)
+}
+
+fn act4_install(out: &Path) -> ExitCode {
+    match act4::install(&root(), out) {
+        Ok((new, None)) => println!("wrote a new {ACT4_MANIFEST} with {} tests", new.count),
+        Ok((new, Some(old))) => {
+            let changes = act4::describe_differences(&old, &new);
+            if changes.is_empty() {
+                println!("{ACT4_MANIFEST} is up to date");
+            } else {
+                println!("{ACT4_MANIFEST} changed:");
+                for change in changes {
+                    println!("  {change}");
+                }
+            }
+        }
+        Err(errors) => {
+            eprintln!("cannot install the generation in {}:", out.display());
+            for e in errors {
+                eprintln!("  {e}");
+            }
+            return ExitCode::FAILURE;
+        }
+    }
+    act4_verify()
+}
+
+fn act4_check(out: &Path) -> ExitCode {
+    match act4::check_regenerated(&root(), out) {
+        Ok(manifest) => {
+            println!(
+                "the generation in {} reproduces the committed ACT4 corpus: {} ELFs and \
+                 {ACT4_MANIFEST}, byte for byte",
+                out.display(),
+                manifest.count
+            );
+            ExitCode::SUCCESS
+        }
+        Err(errors) => {
+            eprintln!(
+                "the generation in {} does not reproduce the committed corpus:",
+                out.display()
+            );
+            for e in errors {
+                eprintln!("  {e}");
+            }
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn act4_verify() -> ExitCode {
+    match act4::verify(&root()) {
+        Ok(manifest) => {
+            print_act4_summary(&manifest);
+            ExitCode::SUCCESS
+        }
+        Err(errors) => {
+            eprintln!("the ACT4 corpus does not match {ACT4_MANIFEST}:");
+            for e in errors {
+                eprintln!("  {e}");
+            }
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The corpus's pins and instruction audit, as `verify` and `run` print them.
+fn print_act4_summary(manifest: &act4::Act4Manifest) {
+    println!(
+        "{} ACT4 ELFs match {ACT4_MANIFEST} (ACT4 {}, Sail {}, extensions {})",
+        manifest.count,
+        act4::ACT4_COMMIT,
+        act4::SAIL_VERSION,
+        act4::EXTENSIONS
+    );
+    println!(
+        "architectural capability {}; ACT4 adapter schema extensions {} (Sm is a schema \
+         shim, not a capability); include_priv_tests {}",
+        manifest.capability,
+        manifest.adapter_extensions.join(" + "),
+        manifest.include_priv_tests
+    );
+    let mut total = std::collections::BTreeMap::<&str, u64>::new();
+    for t in &manifest.tests {
+        for (m, n) in &t.recorded.instructions {
+            *total.entry(m.as_str()).or_default() += n;
+        }
+    }
+    let outside: u64 = total
+        .iter()
+        .filter(|(m, _)| !act4::ALLOWED_MNEMONICS.contains(m))
+        .map(|(_, n)| n)
+        .sum();
+    println!(
+        "instruction audit: {} distinct mnemonics; outside RV32I and ECALL (CSR, MRET, SRET, \
+         WFI, M, A, C, Zifencei, ...): {outside}; ecall {}, fence.tso {}",
+        total.len(),
+        total.get("ecall").copied().unwrap_or(0),
+        total.get("fence.tso").copied().unwrap_or(0)
+    );
+}
+
+fn act4_run() -> ExitCode {
+    let (manifest, report) = match act4::run_corpus(&root()) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    print_act4_summary(&manifest);
+    for result in &report.results {
+        println!("{}", result.line());
+    }
+    println!(
+        "manifest {}, fixtures {}, selected {}, executed {}, passed {}, failed {}",
+        manifest.count,
+        manifest.tests.len(),
+        report.selected,
+        report.executed(),
+        report.passed(),
+        report.failed()
+    );
+    match report.accept(manifest.count) {
+        Ok(()) => {
+            println!(
+                "M1-A4: all {} ACT4 RV32I tests pass on m1-reference, each with its exact \
+                 TEST PASSED summary",
+                manifest.count
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("M1-A4 fails: {e}");
             ExitCode::FAILURE
         }
     }
