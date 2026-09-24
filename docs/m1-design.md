@@ -87,6 +87,8 @@ systemscope/
 │  ├─ env/                the SystemScope riscv-tests environment (§10.2)
 │  ├─ fixtures/           committed ELFs and manifest.json (§10.6)
 │  └─ progen/             deterministic random-program generator (§10.3, not yet built)
+├─ tests/act4/            the ACT4 corpus (§10.4): build-act4.sh, config/, fixtures/, manifest.json;
+│                         its runner is tests/rv32/src/act4.rs
 └─ tests/golden/          adds m1-reference.json and m1-reference.mid.snap
 ```
 
@@ -632,21 +634,128 @@ Spike runs each compared program with `--log-commits`, 16 MiB of memory at `0x80
 
 ### 10.4 ACT4 and Sail
 
-ACT4 builds self-checking ELFs: it runs each test on the Sail reference model, configured like the DUT, and compiles the expected results into the test. For SystemScope the DUT configuration provides:
+ACT4 builds self-checking ELFs. It runs each test on the Sail reference model, configured like the DUT, and compiles the expected results into the test. The final ELF compares every result with Sail's and reports a verdict. ACT4 is not a complete verification suite, and passing it is not a certification; it is one of the four layers of §10.
 
+**Status (M1.10):** implemented. ACT4 selects 39 RV32I tests, and all 39 pass on `m1-reference` on both operating systems (M1-A4).
+
+**Capability and the Sm shim.** SystemScope's architectural capability is RV32I. It implements no Sm, no CSRs, and no privileged architecture, and M1.10 does not change that.
+
+- The ACT4 adapter schema extensions are I + Sm (shim). Sm appears only in the ACT4 UDB adapter configuration because the pinned ACT4/UDB schema requires Sm in order to express MXLEN=32. It does not describe a SystemScope CPU capability.
+  - UDB defines `MXLEN` only as an Sm parameter, and ACT4 reads it to pick each test's XLEN. A truthful I-only configuration fails UDB validation for that reason.
+  - `riscv/riscv-arch-test#2069` gives this configuration as the way to describe a DUT without privilege modes: Sm with placeholder parameters, and `include_priv_tests: False`.
+  - The Sm parameters take the least-claiming values UDB accepts. UDB validation is not bypassed, and ACT4 is not patched.
+- Three defenses keep Sm from reaching a test:
+  1. **Selection:** `EXTENSIONS=I` and `include_priv_tests: False`, so ACT4 selects only the I testplan's tests.
+  2. **Sail:** every extension but I is off (M, A, F, D, the C family, Zicsr, Zifencei, S, U, and the rest), with `mstatus.FS` and `VS` fixed at `ExtContext_Off`.
+  3. **Audit:** GNU objdump `-d -M no-aliases` over each final ELF's executable sections only. `.word` data between instructions, which the assembler marks with `$d` mapping symbols, is data and is skipped. Every mnemonic must be RV32I or `ecall`; `fence.tso`, the RV32I `FENCE` encoding with `fm = 1000`, counts as RV32I. The generation fails on anything else, CSR, `mret`, `sret`, `wfi`, M, A, C, or Zifencei included. The manifest records each test's counts, and `cargo xtask act4 verify` prints the total outside RV32I and ECALL, which is 0.
+
+**Pins** (`tests/act4/build-act4.sh`, the `act4` module's constants, and the manifest; a test keeps them equal):
+
+- ACT4 `https://github.com/riscv/riscv-arch-test.git` at `54cfe21bb70ecc0609ab5a70588f8ecfc3e4bf88`. SHA-256s: `testplans/I.csv` `12fc316e0fbacbebde91c3d730871929ec235f22e3a060aafed4734e1e4c0272`, `uv.lock` `4f5740cd6457b3c4bff96bd2b7b42b1785c987a3ead6c70d0b89b1493bd8a93b`, and `framework/src/act/data/Gemfile.lock` `5e06729627ddcfdb70ed37855c9309245b868db4f8461c4f63430c6b3d6891c5`. The generation requires the checkout unchanged afterwards.
+- Sail `0.14.1` (tag commit `e4b243f4eb5d1ed05bbbc030ad338c2a32c45d72`). The release tarball `sail-riscv-Linux-x86_64.tar.gz` has SHA-256 `de45a89748ca67a8a522b3ac0924c303b5609a16bb50d759bbd08c4d440df0eb`, and its `sail_riscv_sim` has `4ccc3bb600387165323f8812bf534e91740f51d1c05ebf6184afb4f6f2a9d2a9`.
+- GCC: riscv-collab `riscv-gnu-toolchain` release `2026.08.27`, `riscv64-elf-ubuntu-24.04-gcc.tar.xz`, SHA-256 `fe7dadf99dfaee59855b4be5f8d491dc66593bec295090e155a3ec51f0d14f56`.
+  - `riscv64-unknown-elf-gcc` has SHA-256 `fa4616e3aa8b2abddeb95e1b13be57a1ec425203278bf20debb02ce6c63385c3` and prints `riscv64-unknown-elf-gcc (g6afcc4f6d) 16.1.0`.
+  - `riscv64-unknown-elf-as` has `aad8812815e58b1727e31cf7d50302df3807e8c74847cfa29f24711f0895407c` and prints `GNU assembler (GNU Binutils) 2.47.20260726`.
+- mise `v2026.9.12` (linux-x64, SHA-256 `e79ae57945034903aee8aa2ea66b4c7ca9cd4f4edd5a8a78a589cbae6d0f428a`). It installs ACT4's own pins: Ruby 3.4.10, uv 0.11.33, and Bundler; uv picks Python 3.14.6.
+- The generation checks every download, binary hash, and version line on every run, with a cache or without one.
+
+**Configuration** (`tests/act4/config/systemscope-rv32i/`):
+
+- `test_config.yaml`: the compiler wrapper below, Sail, `include_priv_tests: False`.
+- `systemscope-rv32i.yaml`: the UDB configuration, I and the Sm shim, `MXLEN: 32`.
+- `sail.json`: derived from ACT4's `sail-RVI20U32` configuration, with the extensions off as above and RAM at `0x8000_0000`, 16 MiB. Sail validates it as is.
+- `link.ld`: ACT4's linker script with a 16 MiB RAM. The ELFs are ELF32 little-endian `EXEC` for RISC-V, with the entry at `0x8000_0000` and every `PT_LOAD` segment inside the RAM, with `p_vaddr == p_paddr`. The loader (§8) takes them unchanged.
 - `rvmodel_macros.h`:
-  - `RVMODEL_HALT_PASS` and `RVMODEL_HALT_FAIL` are expressed through the §10.2 convention (`a0`, then `ECALL`).
-  - No trap handler is provided.
-- A UDB configuration declaring RV32I only, with misaligned accesses trapping.
-- `include_priv_tests: false`, set from the start. ACT4 then leaves out every test that depends on privilege modes.
-- A linker script for `0x8000_0000`.
+  - `RVMODEL_HALT_PASS` sets `gp = 1`, `a0 = 0` and executes `ECALL`, the §10.2 convention. `RVMODEL_HALT_FAIL` does the same with `a0 = 1`.
+  - `RVMODEL_IO_WRITE_STR` writes ACT4's diagnostics to the `SimpleUart` byte by byte.
+  - There is no `tohost`, no trap handler, and no boot to M-mode.
+  - The interrupt macros, which only privileged tests use, expand to an assembler `.error`.
+- `systemscope-act4-gcc`: see Reproducibility.
+- ACT4 writes `rvtest_config.h`/`.svh` from the UDB configuration at generation time; they are not committed.
 
-**Open risk, to settle at M1.10:** with privilege tests excluded, whether `rvmodel_macros.h` or any remaining unprivileged test still needs Zicsr or a trap handler. If they do, the affected tests are listed as exclusions with reasons, exactly as in §10.2. SystemScope does not gain CSRs to run a test harness.
+**Flow:** ACT4 source → `.sig.elf`, built with ACT4's Sail macros → Sail → `.sig` → `.results` → the final ELF, built with SystemScope's macros and the results. The DUT macros reach only the final ELF. The script requires each stage's file to exist, to be non-empty, and to be no older than the one before, and records the SHA-256 of each `.sig` and `.results` in the manifest.
+
+**Reproducibility:**
+
+- Every generation runs at the canonical path `/tmp/systemscope-act4`, from a fresh checkout, so the ELFs' debug information names that path and no home or worktree path. No debug-path rewriting flag is used.
+- The compiler is `systemscope-act4-gcc`, a wrapper that builds in two stages, compile then link, through an object named after the ELF.
+  - GCC's one-shot build names a random `/tmp/ccXXXXXX.o` in the ELF's `STT_FILE` symbol. That name was the only difference between two generations, and no loaded byte differed.
+  - The wrapper passes every argument through unchanged. It fails on any invocation ACT4 does not make at the pin.
+  - Its BLAKE3 is a manifest input, like every configuration file, so a wrapper change without a regeneration fails `verify`.
+- Two generations, A and B, are byte-identical: ELFs, file modes `0644`, and the record. Each also reproduces the committed ELFs and manifest byte for byte.
+
+**Fixtures and manifest:**
+
+- `tests/act4/fixtures/` holds the 39 final ELFs and ACT4's license (Apache-2.0).
+- `tests/act4/manifest.json` records:
+  - the capability (RV32I), the adapter extensions (I + Sm, shim), and `include_priv_tests`;
+  - the generation's identity: every pin above, `EXTENSIONS=I`, and the canonical path;
+  - the download URLs and the Sail tag commit;
+  - the RAM, the audit allowlist, and the BLAKE3 of each input: the script, the five configuration files, the wrapper, and the license;
+  - the count, and per test: its name, source, ELF, BLAKE3, size, entry, the loader's `image_hash`, the `.sig` and `.results` SHA-256s, and its instruction counts.
+  - It records no host path and no timestamp.
+- The count and the names come from ACT4's selection at generation time; nothing hardcodes them beforehand. `verify` requires the fixture directory to hold exactly the manifest's ELFs, and `run` requires manifest, fixtures, selected, executed, and passed to be equal.
+
+**Tasks:**
+
+- `cargo xtask act4 build [<cache-dir>]` (Linux x86_64) runs the script into `target/act4/out`, then `install`s it.
+- `cargo xtask act4 install <out-dir>` checks a generation's record against the pins and the audit, replaces the ELFs, and rewrites the manifest.
+- `cargo xtask act4 check <out-dir>` requires a generation to reproduce the committed ELFs and manifest byte for byte.
+- `cargo xtask act4 verify` and `cargo xtask act4 run` need no network, ACT4, Sail, or compiler. Neither does `cargo nextest run -p systemscope-rv32 --test act4`.
+
+**Pass rule.** Each ELF runs through `systemscope-elf`, `Ram`, `Rv32iCpu`, `AddressBus`, and `SimpleUart` on `m1-reference`. A test passes only if:
+
+- the run ends in `Trap(EnvironmentCall)`, with `gp == 1` and `a0 == 0` (the §10.2 rule);
+- the UART received only one-byte writes to its TX register, and its view agrees with them;
+- those bytes are exactly `"\nRVCP-SUMMARY: TEST PASSED - Test File \"<name>.S\"\n\n"` for this test. There is no prefix match.
+
+Anything else fails: `a0 ≠ 0`, a `TEST FAILED` diagnostic, the instruction limit, any other trap (`IllegalInstruction`, an access fault, a misaligned access), a session fault, no halt, another test's summary, an ELF that does not match its manifest entry, or a missing one. Negative tests cover each case.
+
+**Mutations** (checked at M1.10, then reverted exactly):
+
+| Oracle mutation | ACT4 tests that fail |
+|---|---|
+| `SRA` computed as `SRL` (also `SRAI`) | `I-sra-00`, `I-srai-00` |
+| `SLT` compared unsigned | `I-slt-00` |
+| `LB` zero-extended | `I-lb-00` |
+| `BNE` inverted | `I-bne-00` |
+
+Each harness mutation fails at least one test: skipping one ELF, dropping the selected-count comparison, taking `a0 ≠ 0` as a pass, dropping the manifest hash check, taking the instruction limit as a pass, and dropping the diagnostic check.
+
+**Coverage.** The 39 tests are the RV32 rows of the pinned `testplans/I.csv`:
+
+| Group | Tests |
+|---|---|
+| ALU, register | `add` `sub` `and` `or` `xor` |
+| ALU, immediate | `addi` `andi` `ori` `xori`; `lui` `auipc` |
+| Shifts | `sll` `srl` `sra` `slli` `srli` `srai` |
+| Compares | `slt` `sltu` `slti` `sltiu` |
+| Branches | `beq` `bne` `blt` `bge` `bltu` `bgeu` |
+| Jumps | `jal`, `jalr` |
+| Loads | `lb` `lbu` `lh` `lhu` `lw` |
+| Stores | `sb` `sh` `sw` |
+| Ordering | `fence`, including the `fence.tso` encoding |
+| No-op | `nop` |
+
+The testplan's coverpoints cover register choices, value edges, immediates, branch and jump offsets, and memory alignment and values. The RV64-only rows (`addiw`, `ld`, `sd`, and the other `*w` instructions) are not selected at MXLEN 32.
+
+**Not covered by ACT4.** These M1 semantics are privileged or trap behavior. ACT4 tests them only in its privileged tests, which are off. They are covered elsewhere:
+
+| M1 semantics | Covered by |
+|---|---|
+| `ECALL` trap (`EnvironmentCall`, `tval` 0, precise) | unit tests (`components/rv32i/tests/system.rs`, `cpu.rs`); every `rv32ui` test and ACT4 test ends on it (M1-A2, M1-A4); the M1 golden (M1-A8) |
+| `EBREAK` (`Breakpoint`) | unit tests (`system.rs`, `cpu.rs`) |
+| `IllegalInstruction` | decode unit and property tests (`decode.rs`); `system.rs`, `cpu.rs` |
+| Instruction-address misalignment | unit tests (`control.rs`, `system.rs`) |
+| Load/store misalignment and access faults | unit tests (`memory.rs`, `cpu.rs`, `system.rs`); `rv32ui` `ma_data` is excluded (§10.2) |
+| Privileged trap reporting (`mcause`, `mepc`, `mtval`, handlers) | not in M1 (§6): the trap is reported at the execution-environment boundary as `RvTrap`, which the unit tests check; privileged backends are M2/M3 |
+
+The Spike differential (M1-A3) compares the `rv32ui` streams up to their `tohost` stores and so adds no trap coverage.
 
 ### 10.5 CI
 
 - **Blocking, both operating systems:** everything in M0 CI (including the M0 acceptance tests and the golden-unchanged check), then:
-  - M1-A1, M1-A2, M1-A4, M1-A5, M1-A6, M1-A7;
+  - M1-A1, M1-A2, M1-A4, M1-A5, M1-A6, M1-A7; M1-A4 runs the committed ACT4 corpus with `cargo xtask act4 verify`, `cargo nextest run -p systemscope-rv32 --test act4`, and `cargo xtask act4 run` (§10.4);
   - M1-A8 against the committed fixtures;
   - `cargo xtask rv32-fixtures verify`, which checks every committed fixture against its manifest (§10.6), and a check that the fixtures are unchanged after the run;
   - `cargo xtask m1-golden verify`, and the `m1-cross-os` job, which restores and checks each operating system's M1 result on the other (§10.1). CI never blesses.
@@ -654,7 +763,8 @@ ACT4 builds self-checking ELFs: it runs each test on the Sail reference model, c
   These need no external tools: they run the committed ELFs.
 - **Blocking, Linux only:**
   - M1-A3 Spike lockstep, with Spike built from its pinned commit and cached: the `spike` job builds on a cache miss, then always runs `cargo xtask spike verify` before `cargo xtask spike diff`, so a cached build is used only once it matches the pin (M1.9, for the `rv32ui` ELFs);
-  - the fixture rebuild: `cargo xtask rv32-fixtures build` on `ubuntu-24.04` with the pinned toolchain packages, then no difference from the committed fixtures and manifest. This is the only job that installs a RISC-V toolchain or fetches `riscv-tests`.
+  - the fixture rebuild: `cargo xtask rv32-fixtures build` on `ubuntu-24.04` with the pinned toolchain packages, then no difference from the committed fixtures and manifest. This is the only job that installs the Ubuntu RISC-V toolchain packages or fetches `riscv-tests`;
+  - "ACT4/Sail external validation (Ubuntu)", the `act4` job (§10.4): it generates the corpus twice, A and B, at the canonical path with the pinned stack (cached, and checked against the pins on every run), requires A and B to be byte-identical, requires each to reproduce the committed ELFs and manifest (`cargo xtask act4 check`), and runs `cargo xtask act4 run`. This is the only job that runs ACT4 or Sail.
 - **Nightly:** the random-seed program through Spike on Linux, and the M1 acceptance tests for that program on both operating systems.
 - The random-seed program has no golden digests, as in M0.
 
@@ -662,8 +772,8 @@ ACT4 builds self-checking ELFs: it runs each test on the Sail reference model, c
 
 The toolchain needed to build ELFs (a RISC-V GCC or Clang), Spike, Sail, and ACT4 run only on Linux. So ELFs are built once and committed:
 
-- **Contents:** `tests/rv32/fixtures/` holds the 40 `rv32ui` ELFs (`rv32ui-<test>.elf`) and, from later steps, the ACT4 ELFs and the dedicated trap programs. `hello.elf` lives in `tests/rv32/hello/` with its own manifest (§10.7), since `verify` requires the `rv32ui` directory to hold exactly the selection.
-- **`manifest.json`** records, for each fixture, its name, BLAKE3, and source. It also records the pinned versions of the toolchain, `riscv-tests`, ACT4, Sail, and Spike, plus the exclusions with their reasons. It is the acceptance contract: the runner takes the selection from it.
+- **Contents:** `tests/rv32/fixtures/` holds the 40 `rv32ui` ELFs (`rv32ui-<test>.elf`) and, from later steps, the dedicated trap programs. The ACT4 ELFs live in `tests/act4/fixtures/` with their own manifest (§10.4). `hello.elf` lives in `tests/rv32/hello/` with its own manifest (§10.7), since `verify` requires the `rv32ui` directory to hold exactly the selection.
+- **`manifest.json`** records, for each fixture, its name, BLAKE3, and source. It also records the pinned versions of the toolchain and `riscv-tests`, plus the exclusions with their reasons. ACT4 and Sail are pinned in `tests/act4/manifest.json` (§10.4), and Spike in its build script (§10.3). It is the acceptance contract: the runner takes the selection from it.
 - **Rebuilding** is a deliberate, Linux-only step, handled like `cargo xtask bless`:
   - a script rebuilds everything from the pinned versions and rewrites the manifest;
   - the commit explains why.
@@ -742,7 +852,7 @@ The toolchain needed to build ELFs (a RISC-V GCC or Clang), Spike, Sail, and ACT
 
 ## 12. Implementation Order
 
-Status: M1.0 through M1.5 are complete. M1.6, the `rv32ui` fixtures and runner, is implemented, and all 40 selected tests pass. M1.7a, the standalone `SimpleUart`, is complete. M1.7b, `hello.elf` printing through the CPU, bus, and UART, is complete (§10.7). M1.8, M1-A6 to M1-A8 with the `m1-reference` golden file and the portable snapshot, is implemented (§10.1). M1.9, the Spike differential for the 40 `rv32ui` ELFs, is implemented (§10.3); the random-program generator and the misaligned-access program it was planned with are not.
+Status: M1.0 through M1.5 are complete. M1.6, the `rv32ui` fixtures and runner, is implemented, and all 40 selected tests pass. M1.7a, the standalone `SimpleUart`, is complete. M1.7b, `hello.elf` printing through the CPU, bus, and UART, is complete (§10.7). M1.8, M1-A6 to M1-A8 with the `m1-reference` golden file and the portable snapshot, is implemented (§10.1). M1.9, the Spike differential for the 40 `rv32ui` ELFs, is implemented (§10.3); the random-program generator and the misaligned-access program it was planned with are not. M1.10, ACT4 with Sail, is implemented: 39 of 39 RV32I tests pass (§10.4).
 
 1. **M1.0:** this document; the `plan.md` M1 update; in `contracts`, the compatibility id (§4.5) and the `mem.v1` contract, followed by a pin bump in `systemscope`, with the M0 golden digests unchanged.
 2. **M1.1:** `decode`, the immediate extractors, and the register file, with `IllegalInstruction` from the start.
@@ -759,7 +869,7 @@ Status: M1.0 through M1.5 are complete. M1.6, the `rv32ui` fixtures and runner, 
    - **M1.7b:** `hello.elf` and the program printing through the UART on a CPU platform.
 9. **M1.8:** M1-A6 and M1-A7, the `m1-reference` golden file, and the portable snapshot.
 10. **M1.9:** the Spike differential, for the 40 `rv32ui` ELFs. The random-program generator and the misaligned-access program (§10.3) are deferred; M1-A3 needs them before the exit review.
-11. **M1.10:** ACT4 and Sail.
+11. **M1.10:** ACT4 and Sail (§10.4).
 12. **M1.11:** CI, then the M1 exit review, then the tag `v0.2.0-m1`.
 
 The tag follows the M0 convention: a SemVer prerelease identifier marking a milestone. `contracts` gets the same milestone tag on the commit `systemscope` pins.
@@ -768,6 +878,6 @@ The tag follows the M0 convention: a SemVer prerelease identifier marking a mile
 
 ## 13. Open Questions
 
-- **ACT4 prerequisites.** With `include_priv_tests: false`, do `rvmodel_macros.h` or any remaining RV32I test still need Zicsr or a trap handler (§10.4)?
+- **ACT4 prerequisites.** Resolved at M1.10 (§10.4): with `EXTENSIONS=I` and `include_priv_tests: False`, no selected test and no DUT macro needs Zicsr or a trap handler. The audit finds only RV32I instructions and `ECALL` in every final ELF, and no test is excluded. The pinned ACT4/UDB schema does need Sm declared to express MXLEN, as an adapter schema shim, not a capability.
 - **Spike configuration.** Resolved at M1.9 (§10.3): the pinned Spike accepts `rv32i`, and exits cleanly on the `write_tohost` stores under the §10.2 environment. The pin lives in the build script and the `spike` module rather than the fixture manifest.
 - **Spike job placement.** Resolved at M1.9: M1-A3 is a blocking Linux job that builds Spike from source on a cache miss.

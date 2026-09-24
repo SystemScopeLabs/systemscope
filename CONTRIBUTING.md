@@ -53,3 +53,12 @@ M1-A3 compares every selected `rv32ui` fixture, retirement by retirement, with S
 - `cargo xtask spike verify [<dir>]` checks the build's stamp, its clean checkout at the pin, and its version line, and requires it to write the committed `simple` log again. `cargo xtask spike diff [<dir>]` verifies, then runs all 40 fixtures on both sides; all must match. CI runs both in a Linux job.
 - `SPIKE`, if set, is the command the tasks run instead of `<dir>/bin/spike`: the same pinned build, reached another way.
 - A mismatch is a bug in SystemScope or a misread of Spike's log, never a case to special-case or skip. Do not edit the committed Spike logs by hand; they come from the pinned Spike.
+
+## ACT4 Corpus
+
+M1-A4 runs the ACT4 RV32I tests, self-checking ELFs whose expected values come from the Sail reference model (`docs/m1-design.md` §10.4). The ELFs and `tests/act4/manifest.json` are committed; only generating them needs ACT4, Sail, and the RISC-V GCC.
+
+- `cargo xtask act4 verify` checks the ELFs against the manifest, the pins, and the configuration hashes, and `cargo xtask act4 run` runs them all on `m1-reference`. Neither needs a network or an external tool. CI runs both on both operating systems.
+- `cargo xtask act4 build [<cache-dir>]` regenerates the corpus on Linux x86_64 with `tests/act4/build-act4.sh`, which fetches and checks the pinned stack. Regenerate only on purpose, for a new pin or configuration, and say why in the commit body. A CI job generates twice on a clean machine and fails on any byte difference from the other generation or from the committed files.
+- SystemScope's capability is RV32I. Sm appears in the UDB adapter configuration only because the pinned ACT4/UDB schema needs it to express MXLEN=32; it does not describe a CPU capability, and privileged tests stay off. Do not describe SystemScope as supporting Sm or privileged architecture.
+- A failing ACT4 test is a bug to diagnose: keep the ELF, check Sail's signature and results and the disassembly, then Spike if needed; add a regression test, then fix it. Fix configuration bugs in the configuration, never in the CPU. Do not patch ACT4, bypass UDB validation, or add a workaround without discussing it first.
