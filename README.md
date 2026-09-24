@@ -64,7 +64,7 @@ of it.
 |---|---|
 | **M0** (`v0.1.0-m0`) | Time, event queue, component contract, deterministic DES, Perfetto trace |
 | **M1** (`v0.2.0-m1`) | RV32I CPU and RAM, bare-metal ELF execution, UART output |
-| **M2** (next) | Interrupts, DMA, block storage (abstract SSD model) |
+| **M2** (next) | Interrupts, DMA, block storage (abstract SSD model); design in [docs/m2-design.md](docs/m2-design.md) |
 
 Later milestones (a modeled OS, the visualizer, HDL and native OS backends) are
 described in [plan.md](plan.md) §11.
