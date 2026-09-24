@@ -426,16 +426,22 @@ Implemented in M1.4a.
 
 ### 7.3 SimpleUart (F1)
 
-A minimal, SystemScope-specific device. It is not a 16550.
+Implemented in M1.7a (`components/platform/src/uart.rs`), as a standalone component; wiring it into a CPU platform and `hello.elf` are M1.7b.
+
+A minimal, SystemScope-specific device. It is not a 16550: no receive path, FIFO, baud rate, timing model, or interrupts. It has one `mem.v1` target port, `mem`, and a window of 8 bytes. Offsets are UART-relative, as the bus forwards them.
 
 | Offset | Access | Behavior |
 |---|---|---|
-| `0x0` TX | write, 1 byte | Appends the byte to the output buffer |
-| `0x4` STATUS | read, 1, 2, or 4 bytes, naturally aligned | Reads as the `u32` `1` (bit 0: TX ready, always set), little-endian |
+| `0x0` TX | write, exactly 1 byte | Appends the byte to the output buffer and responds `WriteOutcome::Done` |
+| `0x4` STATUS | read, 1, 2, or 4 bytes | Reads as the `u32` `1` (bit 0: TX ready, always set), little-endian: `[01]`, `[01, 00]`, or `[01, 00, 00, 00]` |
 
-- **Every other access gets a `Fault` response:** reads of TX, writes of any width other than 1 at TX, writes to STATUS, and any access in offsets `0x1`–`0x3` or `0x5`–`0x7`. Strict decoding keeps device behavior fully specified.
-- It responds in `Complete` after a fixed latency (§9).
-- **Snapshot:** the output buffer. **Trace:** `platform.uart.tx` (`byte`). `inspect()` shows the output buffer as Bytes.
+- **Every other access gets a `Fault { AccessFault }` response and changes nothing:** reads of TX, writes of any width other than 1 at TX, writes to STATUS, reads of STATUS with any other width, and any request touching offsets `0x1`–`0x3` or `0x5` and above, including one that starts at a register and runs past it, or whose last byte would lie past `u64::MAX`. Strict decoding keeps device behavior fully specified.
+- A zero-length request is a protocol violation, not an access: it faults the session with `ComponentFault`, as for the RAM and the bus.
+- **Ordering** follows the RAM (§7.2): a request is accepted when its event is dispatched, a TX byte is appended to the output **at acceptance**, and the response follows after a fixed, configured latency, in `Complete` (§9).
+- **Output is raw bytes** (`Vec<u8>`): every value `0x00`–`0xff` is kept as written, never decoded as text. The component exposes it read-only.
+- **Snapshot:** the latency, then the output buffer. Restore replaces the output with the snapshot's and rejects a different latency. A pending response is an event in the runtime's queue, not UART state, so a restore neither replays a TX write nor repeats a response: output after a restore is exactly the output at the snapshot.
+- **Trace:** `platform.uart.tx` (`byte`), once per accepted TX byte. Faulting requests emit nothing.
+- `inspect()` shows `tx_len`, the output length, and `tx_tail`, the last 64 output bytes as Bytes, so the view stays bounded however long a program prints.
 
 A bare-metal program prints with `*(volatile unsigned char *)0x10000000 = 'H';`.
 
@@ -684,7 +690,7 @@ The toolchain needed to build ELFs (a RISC-V GCC or Clang), Spike, Sail, and ACT
 
 ## 12. Implementation Order
 
-Status: M1.0 through M1.5 are complete. M1.6, the `rv32ui` fixtures and runner, is implemented, and all 40 selected tests pass.
+Status: M1.0 through M1.5 are complete. M1.6, the `rv32ui` fixtures and runner, is implemented, and all 40 selected tests pass. M1.7a, the standalone `SimpleUart`, is implemented; M1.7b is not started.
 
 1. **M1.0:** this document; the `plan.md` M1 update; in `contracts`, the compatibility id (§4.5) and the `mem.v1` contract, followed by a pin bump in `systemscope`, with the M0 golden digests unchanged.
 2. **M1.1:** `decode`, the immediate extractors, and the register file, with `IllegalInstruction` from the start.
@@ -696,7 +702,9 @@ Status: M1.0 through M1.5 are complete. M1.6, the `rv32ui` fixtures and runner, 
    - **M1.4c:** the `Rv32iCpu` component, fetching and accessing data through the bus in a runtime (§5.3, §5.6, §5.7). Its tests run programs on `AddressBus` and `Ram` in the real runtime, since the M0 `ToyBus` and `ToyMemory` speak `mem.v0`. Deferred to later steps: loading programs from ELF (M1.5), `SimpleUart` (M1.7), the `m1-reference` platform with its golden digests and AT-2 checkpoints (M1.8), and the riscv-tests, Spike, and Sail oracles (M1.6, M1.9, M1.10).
 6. **M1.5:** the ELF loader (§8): `systemscope-elf` turns an ELF32 RISC-V executable into a checked, RAM-relative load image and an entry point. Its tests hand the image to `Ram` and `Rv32iCpu` in the real runtime; the reference builder that does so for real runs is M1.8.
 7. **M1.6:** the SystemScope `riscv-tests` environment, the fixture pipeline, and the 40 `rv32ui` tests. This comes early because it is the strongest oracle available.
-8. **M1.7:** `SimpleUart` and `hello.elf`.
+8. **M1.7:** the UART, in two steps:
+   - **M1.7a:** `SimpleUart` (§7.3) as a standalone component, tested on its own and behind `AddressBus` with a test-only initiator.
+   - **M1.7b:** `hello.elf` and the program printing through the UART on a CPU platform.
 9. **M1.8:** M1-A6 and M1-A7, the `m1-reference` golden file, and the portable snapshot.
 10. **M1.9:** the random-program generator and the Spike differential.
 11. **M1.10:** ACT4 and Sail.
