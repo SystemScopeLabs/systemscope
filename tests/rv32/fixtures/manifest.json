@@ -34,7 +34,7 @@
   ],
   "ram": { "base": "0x80000000", "size": "0x01000000" },
   "inputs": [
-    { "path": "tests/rv32/build-fixtures.sh", "blake3": "e0f96e1674a96ebdeca4fe99306d12674ae13518df130a4f94d4dd5991cdce94" },
+    { "path": "tests/rv32/build-fixtures.sh", "blake3": "b8177ff77b265987acc910ac6910df0c7a6019ebae8785babd525ce001ed4ac9" },
     { "path": "tests/rv32/env/LICENSE.riscv-test-env", "blake3": "45c7921da19cd12bd59ed3cab7bf0860727debf292f9624544964f14191be844" },
     { "path": "tests/rv32/env/linker.ld", "blake3": "1747fc515d091319e0ba703d5800f11d745bf9f722f9a00f88996fcd4d534032" },
     { "path": "tests/rv32/env/riscv_test.h", "blake3": "8ea148e1343dbdadf0050f15a3031c3ec29315e3bcbb419eca242bbeeefdc631" },

@@ -115,9 +115,10 @@ for t in "${tests[@]}"; do
     grep -qx ecall <<<"$mnemonics" || die "$t: no ECALL (RVTEST_PASS)"
 done
 
-# 5. Install.
+# 5. Install. Fixtures are data for the simulator, not host programs: mode 0644, not the
+# executable mode the linker gives its output.
 rm -f "$out"/rv32ui-*.elf
 for t in "${tests[@]}"; do
-    cp "$cache/build-a/rv32ui-$t.elf" "$out/rv32ui-$t.elf"
+    install -m 0644 "$cache/build-a/rv32ui-$t.elf" "$out/rv32ui-$t.elf"
 done
 echo "built ${#tests[@]} fixtures into $out"
