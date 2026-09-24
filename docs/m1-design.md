@@ -244,7 +244,7 @@ CommitPending  Commit (same tick)   apply the effect, or record the trap
 
 This gives observers a precise meaning: `on_after_dispatch` of the `Complete` event shows the state before the instruction commits, and of the `Commit` event the state after.
 
-**Pure execution.** Execution is a pure function of the decoded `Instr`, `pc`, and the values of the source registers, which the caller reads before the instruction and passes in. It reads and changes no architectural state: no register, no `pc`, no `instret`, no runtime call, no event. Its result is a `PendingEffect { reg_write: Option<RegWrite { rd, value }>, next_pc }`, which the CPU holds as pending state and applies only if the instruction retires. An instruction that can trap returns an `ExecOutcome`: either `Effect(PendingEffect)` or `Trap(PendingTrap { cause, tval })`, never both. `PendingTrap` has no `pc`: the trapping instruction's address is the `pc` execution was called with, and the CPU adds it to build the `RvTrap` (§6) in `Commit`. Each instruction family has its own function, and each returns a family-specific error (`NotAlu`, `NotControl`) for instructions outside its family.
+**Pure execution.** Execution is a pure function of the decoded `Instr`, `pc`, and the values of the source registers, which the caller reads before the instruction and passes in. It reads and changes no architectural state: no register, no `pc`, no `instret`, no runtime call, no event. Its result is a `PendingEffect { reg_write: Option<RegWrite { rd, value }>, next_pc }`, which the CPU holds as pending state and applies only if the instruction retires. An instruction that can trap returns an `ExecOutcome`: either `Effect(PendingEffect)` or `Trap(PendingTrap { cause, tval })`, never both. `PendingTrap` has no `pc`: the trapping instruction's address is the `pc` execution was called with, and the CPU adds it to build the `RvTrap` (§6) in `Commit`. Each instruction family has its own function, and each returns a family-specific error (`NotAlu`, `NotControl`, `NotMemory`) for instructions outside its family.
 
 - **ALU instructions** (`LUI`, `AUIPC`, `OP-IMM`, `OP`) go through `execute_alu(instr, pc, rs1, rs2)`, which returns `NotAlu` for every other instruction. Source values an instruction does not use are ignored.
 - **Every ALU instruction writes `rd` and sets `next_pc = pc + 4`,** with wrap-around.
@@ -257,6 +257,15 @@ This gives observers a precise meaning: `on_after_dispatch` of the `Complete` ev
 - **The target must be 4-byte aligned** (no C extension, so IALIGN = 32). If it is, the instruction retires with `next_pc = target`, and `JAL`/`JALR` write `rd = pc + 4`, `x0` included. If not, the result is `Trap(PendingTrap { cause: InstructionAddressMisaligned, tval: target })`, and the link write is not made: it exists only in a retiring `Effect`.
 - `JALR` with `rd = rs1` needs no special case: the target comes from the `rs1` value passed in, read before the instruction, and `rd` is written only when the effect is applied.
 - **An aligned target is never a control-flow trap,** mapped or not. The branch or jump retires; if nothing answers at the target, the next fetch gets `Fault` and raises `InstructionAccessFault` on that fetch (§6). Target computation is not access validation.
+- **Loads and stores** are split in two pure halves, because a memory response comes between deciding the access and knowing the result (M1.4b). Neither half touches the register file, `pc`, or the runtime, and neither sends a message: the CPU does that (M1.4c).
+  - `prepare_memory(instr, pc, rs1, rs2)` returns `NotMemory` for every other instruction. For a load or store it computes the **effective address `rs1 + offset` modulo 2^32**, with the sign-extended I-immediate for loads and S-immediate for stores. Wrapping is not a fault; whether anything is mapped there is the bus's business.
+  - **Alignment is checked before any request exists.** Byte accesses are always aligned, `LH`/`LHU`/`SH` need `addr % 2 = 0`, and `LW`/`SW` need `addr % 4 = 0`. A misaligned access returns `MemoryPrep::Trap` with `LoadAddressMisaligned` or `StoreAddressMisaligned` and `tval = addr`. No request is planned, so a misaligned store can never write memory.
+  - An aligned access returns `MemoryPrep::Request(MemoryPlan)`: a `LoadPlan { rd, addr, width, extension, next_pc }` or a `StorePlan { addr, data, next_pc }`, with `next_pc = pc + 4`. A store's `data` is the low 1, 2, or 4 bytes of `rs2`, little-endian; the upper bits are dropped. A load plan holds no register write yet.
+  - `complete_load(plan, outcome)` finishes a load. `Data` of exactly 1, 2, or 4 bytes is assembled little-endian, then **extended after the response**: `LB`/`LH` sign-extend, `LBU`/`LHU` zero-extend, and `LW` keeps the 32-bit pattern. The result is `Effect(PendingEffect { reg_write: Some(RegWrite { rd, value }), next_pc })`.
+  - `complete_store(plan, outcome)` finishes a store: `Done` gives `Effect(PendingEffect { reg_write: None, next_pc })`. The RAM made the bytes visible when it accepted the request; the instruction itself retires only in `Commit` after the `WriteResp`.
+  - **An access fault is converted after the response.** `Fault { AccessFault }` gives `Trap(PendingTrap { cause: LoadAccessFault or StoreAccessFault, tval: addr })`. The `mem.v1` contract guarantees a faulting write changed nothing at the target.
+  - **A malformed response is a model bug, not a trap.** `Data` of the wrong length, or a response of the wrong kind (`complete_memory(plan, msg)` pairs a `LoadPlan` with a `ReadResp` and a `StorePlan` with a `WriteResp`), is a `MemoryCompletionError`. It never becomes `LoadAccessFault` or `StoreAccessFault`; the CPU raises it as `ComponentFault` (M1.4c). Matching the response's `TxnId` is also the CPU's job.
+  - **A load to `x0` still accesses memory.** It sends its request, can fault, and completes with `RegWrite { rd: x0, .. }`, which the register file discards. Dropping it would lose the access fault.
 
 **Reset:** at `init` the CPU schedules the first `FetchIssue` at tick 0 (`Cycles { domain: cpu, k: 0 }`, `Request`), with `pc = entry` and every register 0.
 
@@ -345,6 +354,8 @@ pub enum TrapCause {
 
 - `JALR` computes its target as `(x[rs1] + imm) & !1`, using `x[rs1]` from before the instruction, and checks alignment afterwards.
 - Alignment is checked before an access is issued, so a misaligned access never reaches the bus.
+- **An access fault is architectural; a malformed response is not.** `LoadAccessFault` and `StoreAccessFault` come only from a `Fault { AccessFault }` response to an aligned access. A response of the wrong length or kind is a component bug and faults the session (§5.3); it never becomes a trap.
+- **Precise memory traps.** A misaligned access traps before its request is sent; an access fault traps when the `Fault` response arrives. Either way the instruction does not retire: registers, `pc`, and `instret` are unchanged. For stores, memory is unchanged too: a misaligned store sends nothing, and a faulting store is rejected by the bus or target without writing. A store that the target accepts is visible from acceptance, and the instruction retires in `Commit` after its `Done` response.
 - The `tval` values follow the RISC-V privileged convention, so they compare directly with Spike and Sail.
 
 ---
@@ -612,7 +623,7 @@ The toolchain needed to build ELFs (a RISC-V GCC or Clang), Spike, Sail, and ACT
 4. **M1.3:** branches and jumps, including misaligned-target traps.
 5. **M1.4:** memory, in three steps:
    - **M1.4a:** `systemscope-platform` with `AddressBus` and `Ram` (§7.1, §7.2), tested on their own with a test-only initiator.
-   - **M1.4b:** the pure semantics of loads and stores: effective addresses, misaligned and access-fault traps.
+   - **M1.4b:** the pure semantics of loads and stores (§5.3): effective addresses, alignment, extension and byte order, misaligned and access-fault traps, and the split between architectural faults and malformed responses.
    - **M1.4c:** the `Rv32iCpu` component, fetching and accessing data through the bus in a runtime.
 6. **M1.5:** the ELF loader.
 7. **M1.6:** the SystemScope `riscv-tests` environment, the fixture pipeline, and the 40 `rv32ui` tests. This comes early because it is the strongest oracle available.
