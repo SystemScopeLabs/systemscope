@@ -236,20 +236,21 @@ CommitPending  Commit (same tick)   apply the effect, or record the trap
 - **Fetch goes through memory.** `FetchIssue` sends `ReadReq { addr: pc, len: 4 }` on `mem`. The instruction word is the little-endian `u32` of the response's four bytes.
 - **Decode and execute happen when the fetch response arrives,** in `Complete`. They compute the instruction's effect into CPU-internal pending state and change no architectural state.
 - **A load or store** then issues its one data request in `Request` of the next CPU cycle. Rule S2 forbids an earlier phase in the same tick (m0-design §4.3). Its response arrives in `Complete`.
-- **Architectural state changes only in `Commit`.** The CPU wakes itself in `Commit` of the same tick (`Cycles { domain: cpu, k: 0 }`) and resolves the pending instruction in one of two ways:
+- **Architectural state changes only in `Commit`.** The CPU wakes itself in `Commit` of the same tick (`ScheduleWhen::Now`, so the commit stays in the response's tick even if that tick is not a clock edge) and resolves the pending instruction in one of two ways:
   - **It retires:** `x[rd] ← value` if `rd ≠ 0`, then `pc ← next_pc`, then `instret += 1`, and the CPU emits `rv32.commit`.
   - **It traps:** it does **not** retire. Registers, `pc`, and `instret` are unchanged, and the CPU emits `rv32.trap` and halts (§6). This holds for every trap cause, `ECALL` and `EBREAK` included.
 - **Memory and device state follow their target's rules,** not the CPU's `Commit`. A store is visible at the RAM when the RAM accepts it, as in M0 (m0-design §9.1), and a UART byte is output when the UART accepts it. With one outstanding operation, no instruction can observe the difference.
-- After a commit, the next `FetchIssue` is a wake at the next CPU cycle's `Request`.
+- After a commit, the next `FetchIssue` is a wake at the next CPU cycle's `Request` (`Cycles { domain: cpu, k: 1 }`). A data request is scheduled the same way.
 
 This gives observers a precise meaning: `on_after_dispatch` of the `Complete` event shows the state before the instruction commits, and of the `Commit` event the state after.
 
-**Pure execution.** Execution is a pure function of the decoded `Instr`, `pc`, and the values of the source registers, which the caller reads before the instruction and passes in. It reads and changes no architectural state: no register, no `pc`, no `instret`, no runtime call, no event. Its result is a `PendingEffect { reg_write: Option<RegWrite { rd, value }>, next_pc }`, which the CPU holds as pending state and applies only if the instruction retires. An instruction that can trap returns an `ExecOutcome`: either `Effect(PendingEffect)` or `Trap(PendingTrap { cause, tval })`, never both. `PendingTrap` has no `pc`: the trapping instruction's address is the `pc` execution was called with, and the CPU adds it to build the `RvTrap` (§6) in `Commit`. Each instruction family has its own function, and each returns a family-specific error (`NotAlu`, `NotControl`, `NotMemory`) for instructions outside its family.
+**Pure execution.** Execution is a pure function of the decoded `Instr`, `pc`, and the values of the source registers, which the caller reads before the instruction and passes in. It reads and changes no architectural state: no register, no `pc`, no `instret`, no runtime call, no event. Its result is a `PendingEffect { reg_write: Option<RegWrite { rd, value }>, next_pc }`, which the CPU holds as pending state and applies only if the instruction retires. An instruction that can trap returns an `ExecOutcome`: either `Effect(PendingEffect)` or `Trap(PendingTrap { cause, tval })`, never both. `PendingTrap` has no `pc`: the trapping instruction's address is the `pc` execution was called with, and the CPU adds it to build the `RvTrap` (§6) in `Commit`. Each instruction family has its own function, and each returns a family-specific error (`NotAlu`, `NotControl`, `NotSystem`, `NotMemory`) for instructions outside its family.
 
 - **ALU instructions** (`LUI`, `AUIPC`, `OP-IMM`, `OP`) go through `execute_alu(instr, pc, rs1, rs2)`, which returns `NotAlu` for every other instruction. Source values an instruction does not use are ignored.
 - **Every ALU instruction writes `rd` and sets `next_pc = pc + 4`,** with wrap-around.
 - **An `x0` destination stays in the effect.** `RegWrite { rd: x0, .. }` is produced like any other write, so traces keep the instruction's `rd` and HINTs need no special case. The register file discards it when the effect is applied.
 - Arithmetic wraps modulo 2^32. `SLT`/`SLTI` compare as `i32`; `SLTU`/`SLTIU` compare as `u32`, with the `SLTIU` immediate sign-extended first. Bitwise immediates use the sign-extended 32-bit pattern. Every shift uses the low 5 bits of its amount, in registers and in `shamt` alike.
+- **`FENCE`, `ECALL`, and `EBREAK`** go through `execute_system(instr, pc)`, which returns `NotSystem` for every other instruction. `FENCE` retires as a no-op with `next_pc = pc + 4` (§5.2); `ECALL` returns `Trap(EnvironmentCall, tval 0)` and `EBREAK` returns `Trap(Breakpoint, tval pc)` (§6).
 - **Branches and jumps** go through `execute_control(instr, pc, rs1, rs2)`, which returns `NotControl` for every other instruction. Address arithmetic wraps modulo 2^32; a target that wraps past 0 is an ordinary address.
 - `BEQ`/`BNE` compare for equality, `BLT`/`BGE` as `i32`, `BLTU`/`BGEU` as `u32`. A branch never writes a register.
 - **A branch that is not taken** retires with `next_pc = pc + 4`. It never checks its target, so it never traps, even when `pc + offset` is misaligned.
@@ -267,7 +268,15 @@ This gives observers a precise meaning: `on_after_dispatch` of the `Complete` ev
   - **A malformed response is a model bug, not a trap.** `Data` of the wrong length, or a response of the wrong kind (`complete_memory(plan, msg)` pairs a `LoadPlan` with a `ReadResp` and a `StorePlan` with a `WriteResp`), is a `MemoryCompletionError`. It never becomes `LoadAccessFault` or `StoreAccessFault`; the CPU raises it as `ComponentFault` (M1.4c). Matching the response's `TxnId` is also the CPU's job.
   - **A load to `x0` still accesses memory.** It sends its request, can fault, and completes with `RegWrite { rd: x0, .. }`, which the register file discards. Dropping it would lose the access fault.
 
-**Reset:** at `init` the CPU schedules the first `FetchIssue` at tick 0 (`Cycles { domain: cpu, k: 0 }`, `Request`), with `pc = entry` and every register 0.
+**Reset:** at `init` the CPU schedules the first `FetchIssue` at tick 0 (`Cycles { domain: cpu, k: 0 }`, `Request`), with `pc = entry` and every register 0. `Rv32iCpu::new` rejects a misaligned `entry`.
+
+**The CPU component (M1.4c).** `Rv32iCpu` lives in `components/rv32i/src/cpu.rs` and depends only on contracts. It implements no instruction semantics: a fetched word goes through `decode`, then through exactly one of `execute_alu`, `execute_control`, `execute_system`, or `prepare_memory`; a data response goes through `complete_memory`.
+
+- **States.** `FetchIssue`, `FetchWait { txn }`, `MemIssue { insn, plan }`, `MemWait { txn, insn, plan }`, `CommitPending { insn, outcome }`, `Halted(reason)`. `insn` in `CommitPending` is absent only after a faulting fetch. Every state but `Halted` waits for exactly one runtime-owned event: a wake (`FETCH`, `MEMORY`, or `COMMIT`) or the response to the one outstanding request. A wake whose token does not match the state faults the session.
+- **Correlation.** Every request takes the next value of a CPU-owned `TxnId` counter, which is consumed only when the send succeeds. A response is accepted only in `FetchWait` or `MemWait`, only for the `TxnId` that state holds, and only in `Complete`. Anything else faults the session: a wrong, stale, or duplicate `TxnId`, or a response while nothing is outstanding. A duplicate response therefore never causes a second commit.
+- **Fetch responses.** `Data` of exactly 4 bytes is the instruction word. `Fault` becomes `InstructionAccessFault` with `tval = pc`. `Data` of any other length, or a `WriteResp`, faults the session.
+- **Data responses.** `complete_memory` pairs the response with the plan, so a `ReadResp` to a store or a `WriteResp` to a load is a `MemoryCompletionError`, as is load data of the wrong length. The CPU raises every `MemoryCompletionError` as `ComponentFault` and never converts it into an access fault.
+- **Trap versus session fault.** A trap is an outcome of the instruction: a fetch `Fault`, an illegal word, a misaligned target or access, `ECALL`/`EBREAK`, or a data `Fault`. It is recorded in `Commit`, changes no architectural state, and halts the CPU. A session fault (`SimError::ComponentFault`) is a model bug. It is returned from the handler that sees it, before any state changes, and neither retires nor traps. Besides the cases above, a request arriving on the initiator port and a message that is not `mem.v1` also fault the session.
 
 ### 5.4 Timing
 
@@ -290,26 +299,30 @@ A halted CPU schedules nothing more. With no pending events, `run` returns `Stop
 
 ### 5.6 Snapshot
 
-The CPU's snapshot holds:
+The CPU's snapshot (schema 1) holds only CPU-owned state:
 
-- its configuration: `entry`, `max_instructions`;
+- its configuration: the clock domain, `entry`, and `max_instructions`;
 - `pc`, `x[1..32]`, `instret`, and the next `TxnId`;
 - the execution state, with its contents:
-  - `FetchWait { txn }`, `MemWait { txn, insn, op }`, `CommitPending { insn, effect }`, or `Halted(reason)`;
-  - the raw instruction bits, never a decoded form, since decoding is a pure function of them.
+  - `FetchIssue`, `FetchWait { txn }`, `MemIssue { insn }`, `MemWait { txn, insn }`, `CommitPending { insn?, outcome }`, or `Halted(reason)`, where `outcome` is the pending `PendingEffect` or `PendingTrap` and a trap halt keeps its `cause`, `pc`, and `tval`;
+  - the raw instruction bits, never a decoded form or a memory plan. Decoding and `prepare_memory` are pure functions of the bits, `pc`, and the registers, none of which change while an instruction is pending, so restore recomputes the plan.
+
+**The pending event is never in the CPU's snapshot.** The wake the CPU scheduled, the request it sent, and the response on its way back all live in the runtime's queue, whose snapshot holds them. `MemWait` means "the request has been sent": restoring it waits for the response already in the queue. Restore takes no context and cannot send, so **a store in flight at a checkpoint is never reissued**: the RAM receives it exactly once, whether or not the run was checkpointed.
 
 Restore rejects:
 
 - a configuration different from the elaborated CPU's;
-- an outstanding `txn` at or above the next `TxnId`;
-- instruction bits that do not decode to an instruction consistent with the recorded state;
-- a misaligned `pc`.
+- a misaligned `pc`;
+- an outstanding `txn` other than the latest one issued (next `TxnId` − 1), since at most one request is ever outstanding;
+- a pending memory instruction whose bits are not an aligned load or store at the recorded `pc` and registers;
+- a pending outcome the instruction could not produce: for a non-memory instruction, anything but the pure result; for a load, a write to another register, another `next_pc`, or an access fault at another address; for a store, anything but a retirement or the matching access fault; after a faulting fetch, anything but `InstructionAccessFault` at `pc`;
+- a trap halt whose `pc` is not the architectural `pc`, and an `instret` inconsistent with the instruction limit.
 
-A checkpoint may fall anywhere in an instruction: while a fetch is in flight, between `Complete` and `Commit`, or while a load or store is in flight. AT-2 covers each of these (§10.1).
+A checkpoint may fall anywhere in an instruction: before a fetch, while a fetch is in flight, between `Complete` and `Commit`, before a data request is sent, or while a load or store is in flight. The `systemscope-rv32i` tests resume from every event boundary of a program that covers each of these; AT-2 covers them for `m1-reference` (§10.1).
 
 ### 5.7 Inspect and Trace
 
-`inspect()` shows `pc`, `x1`…`x31`, `instret`, the execution state's name, and, when halted, the halt reason with the trap's `cause`, `pc`, and `tval`.
+`inspect()` shows `pc`, `x1`…`x31`, `instret`, and `state` (`fetch_issue`, `fetch_wait`, `mem_issue`, `mem_wait`, `commit_pending`, or `halted`). When halted it adds `halt` (`trap` or `instruction_limit`) and, for a trap, `cause`, `trap_pc`, and `tval`.
 
 Canonical trace records are kept to what later tools need. The runtime's `runtime.dispatch` records already show every fetch and data transaction.
 
@@ -318,6 +331,10 @@ Canonical trace records are kept to what later tools need. The runtime's `runtim
 | `rv32.commit` | each retired instruction, in `Commit` | `pc` U64 · `insn` U64 · `rd` U64 (0 when nothing is written) · `rd_value` U64 · `next_pc` U64; then, for loads, `addr` U64; for stores, `addr` U64 · `width` U64 · `value` U64 |
 | `rv32.trap` | a trapping instruction, in `Commit` | `pc` U64 · `insn` U64 · `cause` Str · `tval` U64 |
 | `rv32.halt` | an instruction-limit halt, in `Commit` | `instret` U64 |
+
+- A write to `x0` writes nothing, so its record has `rd = 0` and `rd_value = 0`.
+- Load and store details are computed from the instruction and the registers before the commit applies, so a load whose `rd` is its base register still reports the address it read.
+- A trap after a faulting fetch has no instruction word; its `insn` is 0.
 
 There are no `fetch` or `decode` records. They would roughly quadruple trace volume without carrying information the dispatch records lack.
 
@@ -337,7 +354,7 @@ pub enum TrapCause {
 ```
 
 - **Traps are precise.** The trapping instruction does not retire: it writes no register, does not change `pc`, does not increment `instret`, and, for stores, writes no memory. `RvTrap.pc` is the address of the trapping instruction.
-- Pure execution reports a trap as `PendingTrap { cause, tval }` (§5.3), and the CPU adds `pc` when it builds the `RvTrap`. The `TrapCause` in code lists only the causes implemented so far; the others are added with the parts of the CPU that raise them.
+- Pure execution reports a trap as `PendingTrap { cause, tval }` (§5.3), and the CPU adds `pc` when it builds the `RvTrap`. Since M1.4c, `TrapCause` in code has all nine causes. `TrapCause::name` gives the `rv32.trap` spelling, which is the name used in this section.
 - The CPU records the trap in `Commit` and enters `Halted(Trap)`. In M2 and M3, a privileged backend connects this same boundary to real machine or supervisor traps.
 
 | Cause | Raised by | `tval` |
@@ -624,7 +641,7 @@ The toolchain needed to build ELFs (a RISC-V GCC or Clang), Spike, Sail, and ACT
 5. **M1.4:** memory, in three steps:
    - **M1.4a:** `systemscope-platform` with `AddressBus` and `Ram` (§7.1, §7.2), tested on their own with a test-only initiator.
    - **M1.4b:** the pure semantics of loads and stores (§5.3): effective addresses, alignment, extension and byte order, misaligned and access-fault traps, and the split between architectural faults and malformed responses.
-   - **M1.4c:** the `Rv32iCpu` component, fetching and accessing data through the bus in a runtime.
+   - **M1.4c:** the `Rv32iCpu` component, fetching and accessing data through the bus in a runtime (§5.3, §5.6, §5.7). Its tests run programs on `AddressBus` and `Ram` in the real runtime, since the M0 `ToyBus` and `ToyMemory` speak `mem.v0`. Deferred to later steps: loading programs from ELF (M1.5), `SimpleUart` (M1.7), the `m1-reference` platform with its golden digests and AT-2 checkpoints (M1.8), and the riscv-tests, Spike, and Sail oracles (M1.6, M1.9, M1.10).
 6. **M1.5:** the ELF loader.
 7. **M1.6:** the SystemScope `riscv-tests` environment, the fixture pipeline, and the 40 `rv32ui` tests. This comes early because it is the strongest oracle available.
 8. **M1.7:** `SimpleUart` and `hello.elf`.
