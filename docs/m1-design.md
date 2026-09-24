@@ -443,27 +443,34 @@ A bare-metal program prints with `*(volatile unsigned char *)0x10000000 = 'H';`.
 
 ## 8. ELF Loader (`systemscope-elf`)
 
-The loader is **host-side code, not a component**. It runs before the topology is built, turns an ELF file into a load image, and never touches a running simulation.
+Implemented in M1.5.
+
+The loader is **host-side code, not a component**. It runs before the topology is built, turns an ELF file into a load image, and never touches a running simulation. It has no ports, events, snapshot, or simulation context, and depends on no simulation crate.
 
 ```text
-ELF bytes ──▶ LoadImage { segments: [(addr, bytes)], entry, image_hash }
-                 │                                   │
-                 └─▶ Ram::new(size, image)           └─▶ Rv32iCpu::new(entry, max_instructions)
+load_elf32(elf, ram_base, ram_size) ──▶ LoadImage { segments: [(offset, bytes)], entry, image_hash }
+                                           │                                     │
+                                           └─▶ Ram::new(size, image)             └─▶ Rv32iCpu::new(entry, max_instructions)
 ```
 
-- **The loader rejects:**
-  - anything other than `ELFCLASS32`, little-endian (`ELFDATA2LSB`), `EM_RISCV`, `ET_EXEC`;
-  - malformed headers and program-header tables that fall outside the file;
-  - a `PT_LOAD` segment whose file range falls outside the file, or with `p_filesz > p_memsz`;
-  - a `PT_LOAD` segment outside the RAM region;
-  - overlapping `PT_LOAD` segments;
-  - an entry point that is misaligned or not inside a loaded segment.
-- **Only `PT_LOAD` segments are loaded.** Bytes from `p_filesz` to `p_memsz` are zero-filled (`.bss`). Section headers and symbols are not needed. A test harness that needs a symbol such as `tohost` reads it separately.
-- **Addresses:** the loader converts segment addresses to RAM offsets using the RAM region's base from the platform configuration.
-- **`image_hash`** is the BLAKE3 of the ELF file's bytes. It identifies the program:
+- **Supported subset:** `ELFCLASS32`, little-endian (`ELFDATA2LSB`), `EV_CURRENT` (in `e_ident` and `e_version`), `EM_RISCV`, `ET_EXEC`, a 52-byte header, and 32-byte program headers. Everything else is rejected, including ELF64, big-endian files, `ET_DYN` (PIE), and `ET_REL`. There is no relocation, dynamic linking, or symbol lookup, and section headers are never read. A test harness that needs a symbol such as `tohost` reads it separately.
+- **Only `PT_LOAD` segments are loaded;** other program headers are ignored whatever they contain. Every `PT_LOAD` must have `p_filesz <= p_memsz` and a file range `[p_offset, p_offset + p_filesz)` inside the file. A `PT_LOAD` with `p_memsz == 0` places nothing: after those two checks it is ignored, including its address, as Spike's loader skips it.
+- **Load address: `p_vaddr`, which must equal `p_paddr`.**
+  - The CPU has no MMU and runs at the addresses the program was linked for, which are `p_vaddr`. Bare-metal loaders such as Spike's (`fesvr/elfloader.cc`) place segments at `p_paddr`.
+  - GNU ld and LLD emit `p_paddr == p_vaddr` unless a linker script gives a section a separate load address (`AT>`). Such an image expects something to copy it at run time, which a flat RAM image cannot express.
+  - Requiring both to agree gives one meaning to every accepted file, and SystemScope and Spike place it identically. A loaded segment where they differ is rejected.
+- **The segment's memory is `p_memsz` bytes:** the `p_filesz` bytes from the file, then zeros up to `p_memsz` (`.bss`). The zeros are materialized in the load image, so the RAM receives the whole segment.
+- **Placement:** each loaded segment must fit in the 32-bit address space (`p_vaddr + p_memsz <= 2^32`) and lie entirely inside the RAM region `[ram_base, ram_base + ram_size)`. Loaded segments must not overlap, in any header order; adjacent segments are fine. The region itself must be non-empty and end at or below `2^32`.
+- **Offsets are RAM-relative:** `offset = p_vaddr - ram_base`, the RAM's own addressing (§7.2). Segments come out sorted by offset, non-empty, and non-overlapping, whatever the program-header order. The entry point stays an absolute address, since the CPU fetches through the bus.
+- **The entry point** must be 4-byte aligned (no C extension; `Rv32iCpu::new` rejects the same) and inside a loaded segment's memory, `.bss` included. Being inside the RAM is not enough. Segment permissions (`p_flags`) are not checked, as the CPU has no memory protection.
+- **`image_hash`** is the BLAKE3 of the original ELF file's bytes, not of the load image. It identifies the program:
   - The RAM stores it in its snapshot, so a snapshot can never be restored under a different program (m0-design §6: component parameters live in the component's snapshot, not in `topology_hash`).
   - Golden files are keyed by it.
-- The loader is hand-written. It covers only this subset of ELF32, which keeps the dependency set unchanged.
+  - `LoadImage.image_hash` is the value `RamImage.image_hash` takes; turning a `LoadImage` into a `RamImage` only widens each offset to `u64`.
+- **Untrusted input:** every field is read through bounds-checked, explicitly little-endian helpers, and all arithmetic on file values is checked or done in `u64`. Malformed input returns an error, never a panic, and the result does not depend on the host's byte order or word size. Segments are checked against the RAM before any is built, so memory use is bounded by `ram_size`.
+- **Errors** (`ElfError`) name the failing check: malformed header, bad magic, unsupported class, byte order, version, type, or machine, malformed program-header table, invalid segment (file size, file range, address mismatch, address overflow), invalid RAM region, segment outside the RAM, overlapping segments, and misaligned or out-of-segment entry. Segment errors carry the program-header index.
+- The loader is hand-written. It covers only this subset of ELF32, which keeps the dependency set to `blake3`, already in the workspace.
+- **Tests** build ELF files at run time with a test-only writer that shares no code with the parser, and compare against an oracle computed from the writer's own description. They cover each rule and its boundaries, property tests over valid layouts, targeted defects, and arbitrary bytes, and hand the result to the real `Ram` and `Rv32iCpu` in the real runtime. No ELF fixtures are committed.
 
 ---
 
@@ -634,6 +641,8 @@ The toolchain needed to build ELFs (a RISC-V GCC or Clang), Spike, Sail, and ACT
 
 ## 12. Implementation Order
 
+Status: M1.0 through M1.4c are complete. M1.5, the ELF loader, is implemented.
+
 1. **M1.0:** this document; the `plan.md` M1 update; in `contracts`, the compatibility id (§4.5) and the `mem.v1` contract, followed by a pin bump in `systemscope`, with the M0 golden digests unchanged.
 2. **M1.1:** `decode`, the immediate extractors, and the register file, with `IllegalInstruction` from the start.
 3. **M1.2:** the ALU instructions, with the independent test interpreter.
@@ -642,7 +651,7 @@ The toolchain needed to build ELFs (a RISC-V GCC or Clang), Spike, Sail, and ACT
    - **M1.4a:** `systemscope-platform` with `AddressBus` and `Ram` (§7.1, §7.2), tested on their own with a test-only initiator.
    - **M1.4b:** the pure semantics of loads and stores (§5.3): effective addresses, alignment, extension and byte order, misaligned and access-fault traps, and the split between architectural faults and malformed responses.
    - **M1.4c:** the `Rv32iCpu` component, fetching and accessing data through the bus in a runtime (§5.3, §5.6, §5.7). Its tests run programs on `AddressBus` and `Ram` in the real runtime, since the M0 `ToyBus` and `ToyMemory` speak `mem.v0`. Deferred to later steps: loading programs from ELF (M1.5), `SimpleUart` (M1.7), the `m1-reference` platform with its golden digests and AT-2 checkpoints (M1.8), and the riscv-tests, Spike, and Sail oracles (M1.6, M1.9, M1.10).
-6. **M1.5:** the ELF loader.
+6. **M1.5:** the ELF loader (§8): `systemscope-elf` turns an ELF32 RISC-V executable into a checked, RAM-relative load image and an entry point. Its tests hand the image to `Ram` and `Rv32iCpu` in the real runtime; the reference builder that does so for real runs is M1.8.
 7. **M1.6:** the SystemScope `riscv-tests` environment, the fixture pipeline, and the 40 `rv32ui` tests. This comes early because it is the strongest oracle available.
 8. **M1.7:** `SimpleUart` and `hello.elf`.
 9. **M1.8:** M1-A6 and M1-A7, the `m1-reference` golden file, and the portable snapshot.
