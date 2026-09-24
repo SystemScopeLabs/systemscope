@@ -29,7 +29,8 @@ use systemscope_contracts::snapshot::{SnapshotReader, SnapshotWriter};
 use systemscope_contracts::time::ClockDomainId;
 use systemscope_contracts::trace::Value;
 use systemscope_rv32i::cpu::{
-    COMMIT, COMMIT_KIND, FETCH, HALT_KIND, INTERRUPT_KIND, MEMORY, SNAPSHOT_SCHEMA_M2, TRAP_KIND,
+    COMMIT, COMMIT_KIND, FETCH, HALT_KIND, INTERRUPT_KIND, MEMORY, SNAPSHOT_SCHEMA,
+    SNAPSHOT_SCHEMA_M2, TRAP_KIND,
 };
 use systemscope_rv32i::{Halt, Rv32iConfig, Rv32iCpu, Rv32iProfile};
 
@@ -1105,6 +1106,112 @@ fn a_restored_pending_level_with_mie_clear_waits_for_software() {
     let records = step(&mut cpu, &mut ctx, csrrsi(0, MSTATUS, 8));
     assert_eq!(records[1..], [interrupt(ENTRY + 16, HANDLER)]);
     assert_eq!(cpu.instret(), 4);
+}
+
+/// Where the restored handler's `MRET` returns to in cases C and D.
+const RETURN_PC: u32 = 0x8000_0200;
+/// The restored handler's `MRET`.
+const MRET_PC: u32 = HANDLER + 0x10;
+/// `instret` in the restored handler state.
+const RESTORED_INSTRET: u64 = 41;
+
+/// A CPU in handler state (MIE clear, MPIE and MEIE set, `mepc` = [`RETURN_PC`], `pc` at
+/// the `MRET`) with the line at `irq`, through the real schema 2 path: the forged bytes are
+/// decoded by `restore`, encoded again by `snapshot` (unchanged: no new field, same
+/// order), and decoded again into the CPU that runs.
+fn restored_handler(irq: bool) -> (Rv32iCpu, MockCtx) {
+    let csrs = Csrs {
+        mepc: RETURN_PC,
+        irq,
+        ..IN_HANDLER
+    };
+    assert_eq!(csrs.mstatus(), 0x1880, "MIE 0, MPIE 1, MPP 0b11");
+    let forged = forge(LIMIT, MRET_PC, &[], RESTORED_INSTRET, &csrs);
+    let decoded = restore(LIMIT, &forged);
+    assert_eq!(decoded.snapshot_schema_version(), SNAPSHOT_SCHEMA_M2);
+    let encoded = snapshot_of(&decoded);
+    assert_eq!(encoded, forged, "schema 2 round-trips byte for byte");
+    let cpu = restore(LIMIT, &encoded);
+    assert_eq!(snapshot_of(&cpu), forged);
+    assert_eq!(state(&cpu), "fetch_issue");
+    assert_eq!(cpu.pc(), MRET_PC);
+    assert_eq!(cpu.instret(), RESTORED_INSTRET);
+    assert_eq!(seen(&cpu), Seen::from(csrs));
+    (cpu, MockCtx::new())
+}
+
+/// The schemas the restored cases rely on are the frozen ones.
+#[test]
+fn the_restored_cases_use_the_frozen_schemas() {
+    assert_eq!(SNAPSHOT_SCHEMA, 1);
+    assert_eq!(SNAPSHOT_SCHEMA_M2, 2);
+    let m1 = Rv32iCpu::new(config(Rv32iProfile::M1, LIMIT)).unwrap();
+    let m2 = Rv32iCpu::new(config(Rv32iProfile::M2, LIMIT)).unwrap();
+    assert_eq!(m1.snapshot_schema_version(), SNAPSHOT_SCHEMA);
+    assert_eq!(m2.snapshot_schema_version(), SNAPSHOT_SCHEMA_M2);
+}
+
+/// §6.4 case C: a handler restored with the line still asserted. Its `MRET` retires once
+/// (MIE ← MPIE = 1, MPIE ← 1), the boundary samples MEIP still set, and the CPU re-enters
+/// at once: nothing at `mepc` runs, `mepc` is written with the same return address, and
+/// `instret` counts only the `MRET`.
+#[test]
+fn a_restored_handler_with_the_line_held_reenters_after_mret() {
+    let (mut cpu, mut ctx) = restored_handler(true);
+    assert_eq!(read(&cpu, "mip"), 0x800, "the restored level is pending");
+    let records = step(&mut cpu, &mut ctx, MRET);
+    assert_eq!(
+        records,
+        [
+            (
+                COMMIT_KIND,
+                vec![
+                    ("pc", u(MRET_PC)),
+                    ("insn", u(MRET)),
+                    ("rd", u(0)),
+                    ("rd_value", u(0)),
+                    ("next_pc", u(RETURN_PC)),
+                ]
+            ),
+            interrupt(RETURN_PC, HANDLER),
+        ]
+    );
+    assert_eq!(cpu.instret(), RESTORED_INSTRET + 1, "only the MRET retired");
+    assert_eq!(cpu.pc(), HANDLER & !3);
+    assert_eq!(read(&cpu, "mip"), 0x800);
+    assert_eq!(read(&cpu, "mepc"), RETURN_PC);
+    assert_eq!(read(&cpu, "mcause"), 0x8000_000b);
+    assert_eq!(read(&cpu, "mtval"), 0);
+    // MIE 0, MPIE 1, MPP 0b11.
+    assert_eq!(read(&cpu, "mstatus"), 0x1880);
+    // The next fetch is the handler's, not the instruction at RETURN_PC.
+    issue_fetch(&mut cpu, &mut ctx);
+    assert_eq!(cpu.pc(), HANDLER);
+    assert!(ctx.traced.is_empty());
+}
+
+/// §6.4 case D: the same handler restored with the line deasserted. Its `MRET` retires
+/// once (MIE ← MPIE) and returns normally: no entry, no `rv32.interrupt`, and the
+/// instruction at `mepc` runs next.
+#[test]
+fn a_restored_handler_with_the_line_low_returns_after_mret() {
+    let (mut cpu, mut ctx) = restored_handler(false);
+    assert_eq!(read(&cpu, "mip"), 0);
+    let records = step(&mut cpu, &mut ctx, MRET);
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].0, COMMIT_KIND);
+    assert_eq!(field(&records[0], "next_pc"), RETURN_PC);
+    assert_eq!(cpu.instret(), RESTORED_INSTRET + 1);
+    assert_eq!(cpu.pc(), RETURN_PC);
+    assert_eq!(read(&cpu, "mepc"), RETURN_PC);
+    // MIE ← MPIE = 1, MPIE ← 1, MPP 0b11.
+    assert_eq!(read(&cpu, "mstatus"), 0x1888);
+    // The instruction at RETURN_PC runs next, without an entry.
+    let records = step(&mut cpu, &mut ctx, addi(6, 0, 1));
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(field(&records[0], "pc"), RETURN_PC);
+    assert_eq!(reg(&cpu, 6), 1);
+    assert_eq!(cpu.instret(), RESTORED_INSTRET + 2);
 }
 
 /// Every event of a program with level changes, entries, and an `MRET` re-entry: a CPU
