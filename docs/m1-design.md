@@ -1,6 +1,6 @@
 # M1 Design: RV32I Architectural CPU
 
-> Status: Draft · Parent: [plan.md](../plan.md) · Builds on: [m0-design.md](m0-design.md)
+> Status: Complete (M1.11; exit criteria met, §11) · Parent: [plan.md](../plan.md) · Builds on: [m0-design.md](m0-design.md)
 
 M1 runs real RISC-V machine code on the M0 runtime:
 
@@ -847,19 +847,29 @@ The toolchain needed to build ELFs (a RISC-V GCC or Clang), Spike, Sail, and ACT
 
 ## 11. M1 Exit Criteria
 
-- [ ] `mem.v1` is in `contracts`, with rustdoc, golden encoding vectors, and strict decoding. `mem.v0` is unchanged.
-- [ ] `systemscope-rv32i` implements all 40 RV32I instructions and every trap of §6.
-- [ ] `systemscope-platform` implements `AddressBus`, `Ram` (sparse pages), and `SimpleUart`. `systemscope-elf` loads and validates ELF32 images.
-- [ ] **M1-A1 to M1-A8 pass in CI on Linux and Windows,** with M1-A3 on Linux.
-- [ ] The M0 golden digests are byte-identical to `v0.1.0-m0`, and the serialized compatibility id is decoupled from the crate version (§4.5).
-- [ ] The fixture manifest pins every external tool version and lists every exclusion with its reason.
-- [ ] Contract changes discovered during M1 are reflected back into this document.
+- [x] `mem.v1` is in `contracts`, with rustdoc, golden encoding vectors, and strict decoding. `mem.v0` is unchanged.
+- [x] `systemscope-rv32i` implements all 40 RV32I instructions and every trap of §6.
+- [x] `systemscope-platform` implements `AddressBus`, `Ram` (sparse pages), and `SimpleUart`. `systemscope-elf` loads and validates ELF32 images.
+- [x] **M1-A1 to M1-A8 pass in CI on Linux and Windows,** with M1-A3 on Linux.
+- [x] The M0 golden digests are byte-identical to `v0.1.0-m0`, and the serialized compatibility id is decoupled from the crate version (§4.5).
+- [x] The fixture manifest pins every external tool version and lists every exclusion with its reason.
+- [x] Contract changes discovered during M1 are reflected back into this document.
+
+Evidence, per item:
+
+1. `contracts` at `4d6e912` (the commit `systemscope` pins) defines `mem.v1` in `protocol/mem_v1.rs`, with rustdoc, and `tests/mem_v1_encoding.rs` pins its canonical encoding with hand-written golden bytes for every variant, and checks strict decoding: unknown versions and tags, every truncation, trailing bytes, and length mismatches are rejected, and random messages round-trip. `protocol/mem.rs` (`mem.v0`) is byte-identical to `v0.1.0-m0`.
+2. `systemscope-rv32i` decodes and executes all 40 instructions and raises every trap of §6, checked four ways: its unit and property tests against the independent interpreter (M1-A1), the 40 selected `rv32ui` tests (M1-A2), the Spike differential for those tests, 64 generated programs, and 9 misaligned-access programs (M1-A3), and 39 of 39 ACT4 RV32I tests (M1-A4). The trap coverage of each is in §10.4.
+3. `AddressBus`, `Ram`, and `SimpleUart` are in `components/platform` (M1.4a, M1.7a), and `systemscope-elf` in `elf/` (M1.5), each with the tests of §7 and §8.
+4. The `systemscope` CI run at `569bddc` passed every job: the test jobs on `ubuntu-latest` and `windows-latest` (M1-A1, M1-A2, M1-A4 to M1-A8, and the M0 acceptance tests), the `m1-cross-os` jobs in both directions, the Linux Spike job (M1-A3), the fixture rebuild, and the ACT4/Sail generation job. It used `contracts` pinned at `4d6e912`.
+5. `tests/golden/m0-reference.json` and `tests/golden/m0-reference.mid.snap` have no diff from `v0.1.0-m0`, and CI checks them on every run. The compatibility id is the `contracts` constant `COMPATIBILITY_ID` = `"0.0.0"`, not a crate version (§4.5).
+6. `tests/rv32/fixtures/manifest.json` pins the `riscv-tests` and environment commits, the Ubuntu toolchain packages with their versions and `.deb` SHA-256, the flags, and the hashes of every build input, and lists `fence_i` and `ma_data` with their reasons (§10.2). `tests/act4/manifest.json` does the same for ACT4, Sail, and the GCC (§10.4), `hello/manifest.json` for `hello.elf`, and the Spike commit is pinned in `tests/rv32/build-spike.sh` and the `spike` module (§10.3).
+7. The `contracts` changes of M1 are the compatibility id (§4.5) and `mem.v1` (§4.1 to §4.3), both described here; `mem.v0` is frozen (§4.4).
 
 ---
 
 ## 12. Implementation Order
 
-Status: M1.0 through M1.5 are complete. M1.6, the `rv32ui` fixtures and runner, is implemented, and all 40 selected tests pass. M1.7a, the standalone `SimpleUart`, is complete. M1.7b, `hello.elf` printing through the CPU, bus, and UART, is complete (§10.7). M1.8, M1-A6 to M1-A8 with the `m1-reference` golden file and the portable snapshot, is implemented (§10.1). M1.9, the Spike differential for the 40 `rv32ui` ELFs, is implemented (§10.3). M1.10, ACT4 with Sail, is implemented: 39 of 39 RV32I tests pass (§10.4). M1.10b, the program generator and the misaligned-access programs that M1.9 deferred, is implemented, and M1-A3 is complete (§10.3).
+Status: M1.0 through M1.5 are complete. M1.6, the `rv32ui` fixtures and runner, is implemented, and all 40 selected tests pass. M1.7a, the standalone `SimpleUart`, is complete. M1.7b, `hello.elf` printing through the CPU, bus, and UART, is complete (§10.7). M1.8, M1-A6 to M1-A8 with the `m1-reference` golden file and the portable snapshot, is implemented (§10.1). M1.9, the Spike differential for the 40 `rv32ui` ELFs, is implemented (§10.3). M1.10, ACT4 with Sail, is implemented: 39 of 39 RV32I tests pass (§10.4). M1.10b, the program generator and the misaligned-access programs that M1.9 deferred, is implemented, and M1-A3 is complete (§10.3). M1.11 checked the exit criteria (§11) and froze this document for the tag `v0.2.0-m1`; the release notes are in [releases/v0.2.0-m1.md](releases/v0.2.0-m1.md).
 
 1. **M1.0:** this document; the `plan.md` M1 update; in `contracts`, the compatibility id (§4.5) and the `mem.v1` contract, followed by a pin bump in `systemscope`, with the M0 golden digests unchanged.
 2. **M1.1:** `decode`, the immediate extractors, and the register file, with `IllegalInstruction` from the start.
