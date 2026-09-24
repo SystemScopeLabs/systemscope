@@ -470,7 +470,7 @@ load_elf32(elf, ram_base, ram_size) ──▶ LoadImage { segments: [(offset, by
 - **Untrusted input:** every field is read through bounds-checked, explicitly little-endian helpers, and all arithmetic on file values is checked or done in `u64`. Malformed input returns an error, never a panic, and the result does not depend on the host's byte order or word size. Segments are checked against the RAM before any is built, so memory use is bounded by `ram_size`.
 - **Errors** (`ElfError`) name the failing check: malformed header, bad magic, unsupported class, byte order, version, type, or machine, malformed program-header table, invalid segment (file size, file range, address mismatch, address overflow), invalid RAM region, segment outside the RAM, overlapping segments, and misaligned or out-of-segment entry. Segment errors carry the program-header index.
 - The loader is hand-written. It covers only this subset of ELF32, which keeps the dependency set to `blake3`, already in the workspace.
-- **Tests** build ELF files at run time with a test-only writer that shares no code with the parser, and compare against an oracle computed from the writer's own description. They cover each rule and its boundaries, property tests over valid layouts, targeted defects, and arbitrary bytes, and hand the result to the real `Ram` and `Rv32iCpu` in the real runtime. No ELF fixtures are committed.
+- **Tests** build ELF files at run time with a test-only writer that shares no code with the parser, and compare against an oracle computed from the writer's own description. They cover each rule and its boundaries, property tests over valid layouts, targeted defects, and arbitrary bytes, and hand the result to the real `Ram` and `Rv32iCpu` in the real runtime. These tests commit no ELF files; the committed `rv32ui` fixtures (§10.6) are loaded by the same loader.
 
 ---
 
@@ -546,16 +546,24 @@ The trace continues through `resume_trace(prefix)` exactly as in M0 AT-2. The po
 
 The test bodies themselves use no `SYSTEM` instructions, so M1 replaces only the environment.
 
-**`tests/rv32/env/riscv_test.h`:**
+**`tests/rv32/env/riscv_test.h`**, derived from `env/p/riscv_test.h` of the pinned `riscv-tests` (§10.6):
 
-- `RVTEST_CODE_BEGIN` sets every register to 0 and falls into the test. It uses no CSRs and no `mret`.
+- `RVTEST_CODE_BEGIN` sets every register to 0 (upstream `INIT_XREG`), sets `TESTNUM` (`gp`) to 0, and falls into the test. It uses no CSRs, no `mret`, and no trap handler: the upstream trap vector, `mhartid` check, `satp`/PMP/delegation setup, `mtvec`/`mstatus` writes, and `mret` are gone.
+- It also drops upstream `CHECK_XLEN`, which jumps to `RVTEST_PASS` when the XLEN check fails. On SystemScope that branch could only turn a broken `slli` or `bltz` into a pass.
 - `RVTEST_PASS` is `fence; li gp, 1; li a7, 93; li a0, 0; <tohost store>; ecall`.
-- `RVTEST_FAIL` is the same with `a0 = (TESTNUM << 1) | 1`.
-- `RVTEST_DATA_BEGIN` provides the `tohost` and `fromhost` symbols. The `tohost` store is how Spike stops (§10.3).
-- A linker script places the image at `0x8000_0000`.
+- `RVTEST_FAIL` is `fence; gp = (gp << 1) | 1; li a7, 93; a0 = gp; <tohost store>; ecall`, so `a0 = (TESTNUM << 1) | 1`.
+- The `<tohost store>` is upstream's `write_tohost`: `sw gp, tohost` and `sw zero, tohost + 4`. On SystemScope it is an ordinary RAM write before the `ecall`. It is there so Spike can run the same ELFs and stop on it (§10.3); whether Spike does is verified at M1.9.
+- `RVTEST_CODE_END` is an all-zero word, which RV32I reserves as illegal, instead of upstream's `unimp`: without the C extension the assembler encodes `unimp` as `csrrw x0, cycle, x0`, a Zicsr instruction. Nothing executes it.
+- `RVTEST_DATA_BEGIN` and `RVTEST_DATA_END` are upstream's: the `tohost` and `fromhost` symbols in a `.tohost` section, and the signature labels.
 - The upstream `test_macros.h` and test sources are used unmodified.
 
-**Pass rule:** the run halts with `Trap(EnvironmentCall)`, and then `gp == 1` and `a0 == 0`. Any other halt, including `InstructionLimit`, fails the test and reports `a0 >> 1` as the failing test number.
+**`tests/rv32/env/linker.ld`**, derived from `env/p/link.ld`: `.text.init` at `0x8000_0000` (the entry, `_start`), then `.tohost`, `.text`, `.rodata`, `.data`, and `.bss` at fixed alignments, with no `AT>`, so every `PT_LOAD` has `p_paddr == p_vaddr` (§8). Every fixture has two `PT_LOAD` segments, code (R E) at `0x8000_0000` and data (RW) at `0x8000_1000`, and ends below `0x8000_3000`.
+
+**The runner** (`tests/rv32`, crate `systemscope-rv32`) runs each fixture alone on `m1-reference` without the UART (§9): the same CPU, bus, RAM, latencies, seed, and `max_instructions`.
+
+**Pass rule:** the run halts with `Trap(EnvironmentCall)`, and then `gp == 1` and `a0 == 0`. Any other halt, including `InstructionLimit`, a runtime fault, or no halt, fails the test. A failure reports the halt, the trap cause, `pc` and `tval`, `gp`, `a0` with `a0 >> 1` as the failing test number, `instret`, and the ELF's BLAKE3.
+
+**M1-A2 acceptance:** selected == executed == passed == 40 and failed == 0, with the selection read from the manifest and checked against the list below, so a test that silently does not run fails M1-A2 as surely as one that fails. Each run's event count and `StateDigest`, `ExecutionDigest`, and `TraceDigest` are reported, not yet compared with golden values (M1.8). Tracing and an extra observer change none of them.
 
 **Selected tests:** the upstream `rv32ui` list has 42 tests. M1 excludes two:
 
@@ -604,12 +612,13 @@ ACT4 builds self-checking ELFs: it runs each test on the Sail reference model, c
 
 - **Blocking, both operating systems:** everything in M0 CI (including the M0 acceptance tests and the golden-unchanged check), then:
   - M1-A1, M1-A2, M1-A4, M1-A5, M1-A6, M1-A7;
-  - M1-A8 against the committed fixtures.
+  - M1-A8 against the committed fixtures;
+  - `cargo xtask rv32-fixtures verify`, which checks every committed fixture against its manifest (§10.6), and a check that the fixtures are unchanged after the run.
 
   These need no external tools: they run the committed ELFs.
 - **Blocking, Linux only:**
   - M1-A3 Spike lockstep, with Spike built from its pinned commit and cached;
-  - a check that every committed fixture matches its manifest hash.
+  - the fixture rebuild: `cargo xtask rv32-fixtures build` on `ubuntu-24.04` with the pinned toolchain packages, then no difference from the committed fixtures and manifest. This is the only job that installs a RISC-V toolchain or fetches `riscv-tests`.
 - **Nightly:** the random-seed program through Spike on Linux, and the M1 acceptance tests for that program on both operating systems.
 - The random-seed program has no golden digests, as in M0.
 
@@ -617,13 +626,47 @@ ACT4 builds self-checking ELFs: it runs each test on the Sail reference model, c
 
 The toolchain needed to build ELFs (a RISC-V GCC or Clang), Spike, Sail, and ACT4 run only on Linux. So ELFs are built once and committed:
 
-- **Contents:** `tests/rv32/fixtures/` holds the 40 `rv32ui` ELFs, the ACT4 ELFs, `hello.elf`, and the dedicated trap programs.
-- **`manifest.json`** records, for each fixture, its name, BLAKE3, and source. It also records the pinned versions of the toolchain, `riscv-tests`, ACT4, Sail, and Spike, plus the exclusions with their reasons.
+- **Contents:** `tests/rv32/fixtures/` holds the 40 `rv32ui` ELFs (`rv32ui-<test>.elf`) and, from later steps, the ACT4 ELFs, `hello.elf`, and the dedicated trap programs.
+- **`manifest.json`** records, for each fixture, its name, BLAKE3, and source. It also records the pinned versions of the toolchain, `riscv-tests`, ACT4, Sail, and Spike, plus the exclusions with their reasons. It is the acceptance contract: the runner takes the selection from it.
 - **Rebuilding** is a deliberate, Linux-only step, handled like `cargo xtask bless`:
   - a script rebuilds everything from the pinned versions and rewrites the manifest;
   - the commit explains why.
 - **Tests never build fixtures.** They only read them, so Windows and Linux run byte-identical programs.
 - **Licensing:** upstream license notices are kept next to the fixtures derived from `riscv-tests` and ACT4.
+
+**`rv32ui` fixtures (M1.6):**
+
+- **Pins:**
+  - `riscv-tests` at `793a5ff2d99a6d9fbd91e84c34b9a0437e313b88` (2026-09-22), the head of `master` when M1.6 started, with its `env` submodule at `6de71edb142be36319e380ce782c3d1830c65d68`. It has the 42-test `rv32ui` list of §10.2, each an `rv32ui/<test>.S` wrapper around `rv64ui/<test>.S`. A newer commit comes in only through a deliberate rebuild.
+  - Toolchain: the Ubuntu 24.04 packages `gcc-riscv64-unknown-elf` `13.2.0-11ubuntu1+12` and `binutils-riscv64-unknown-elf` `2.42-1ubuntu1+6`, recorded with their `.deb` SHA-256s.
+  - Flags: `-march=rv32i -mabi=ilp32 -static -mcmodel=medany -fvisibility=hidden -nostdlib -nostartfiles -Wl,--build-id=none`. These are upstream's flags for the `p` environment, narrowed to RV32I and without a build-id note.
+- **Manifest fields:**
+  - schema version;
+  - repository and commits;
+  - distribution, packages, versions, and SHA-256s;
+  - flags and the RAM;
+  - the BLAKE3 of each build input: `riscv_test.h`, `linker.ld`, the build script, and both license files;
+  - per selected test, in name order: its name, wrapper and body sources, ELF file, BLAKE3, the loader's `image_hash`, and entry;
+  - the exclusions with reasons.
+- **`cargo xtask rv32-fixtures build`** (Linux) runs `tests/rv32/build-fixtures.sh`, which:
+  - checks the tool versions;
+  - fetches the pinned commit into `target/rv32-fixtures`, the only network access, and checks the checkout is unmodified;
+  - compiles and links each selected test twice, from copies at two different paths, and requires identical bytes;
+  - checks each ELF: ELF32 RISC-V `ET_EXEC`, entry and `_start` at `0x8000_0000`, RISC-V attributes `rv32i2p1`, and a no-aliases disassembly that contains only RV32I mnemonics (no CSR, `mret`, or `ebreak`) with `fence` and `ecall`;
+  - replaces the ELFs.
+
+  xtask then:
+  - checks that the upstream `rv32ui` list is exactly the selection plus the exclusions, and that each wrapper includes the recorded body;
+  - rewrites the manifest and verifies it.
+- **`cargo xtask rv32-fixtures verify`** needs no network or compiler. It checks that:
+  - the manifest parses and has exactly the 40 selected and 2 excluded tests;
+  - it equals, byte for byte, the manifest generated from the files on disk: each ELF's BLAKE3, the loader accepting it with the recorded `image_hash` and an entry at the RAM base, and each input's hash;
+  - the fixture directory holds nothing else.
+- **Reproducibility:**
+  - Two builds at different paths, and a fresh fetch into another directory, give identical bytes.
+  - One source of nondeterminism was found. In a one-step build, GCC passes the linker a random temporary object name, which the linker records as a `FILE` symbol. The script therefore compiles and links separately.
+  - The CI rebuild job repeats the build on a clean machine.
+- `.gitattributes` marks `*.elf` as binary; the manifest is LF text.
 
 ---
 
@@ -641,7 +684,7 @@ The toolchain needed to build ELFs (a RISC-V GCC or Clang), Spike, Sail, and ACT
 
 ## 12. Implementation Order
 
-Status: M1.0 through M1.4c are complete. M1.5, the ELF loader, is implemented.
+Status: M1.0 through M1.5 are complete. M1.6, the `rv32ui` fixtures and runner, is implemented, and all 40 selected tests pass.
 
 1. **M1.0:** this document; the `plan.md` M1 update; in `contracts`, the compatibility id (§4.5) and the `mem.v1` contract, followed by a pin bump in `systemscope`, with the M0 golden digests unchanged.
 2. **M1.1:** `decode`, the immediate extractors, and the register file, with `IllegalInstruction` from the start.
