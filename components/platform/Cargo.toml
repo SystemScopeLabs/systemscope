@@ -1,6 +1,6 @@
 [package]
 name = "systemscope-platform"
-description = "Platform components for SystemScope M1: address bus and sparse RAM"
+description = "Platform components for SystemScope M1: address bus, sparse RAM, and a simple UART"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
