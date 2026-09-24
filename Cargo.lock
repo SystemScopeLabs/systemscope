@@ -489,7 +489,10 @@ version = "0.0.0"
 dependencies = [
  "blake3",
  "serde_json",
+ "systemscope-contracts",
  "systemscope-elf",
+ "systemscope-platform",
+ "systemscope-runtime",
  "systemscope-rv32i",
 ]
 

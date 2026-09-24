@@ -1,7 +1,8 @@
-//! The M1 `rv32ui` fixtures (`docs/m1-design.md` §10.2, §10.6).
+//! The M1 `rv32ui` fixtures and their runner (`docs/m1-design.md` §10.2, §10.6).
 //!
 //! ```text
 //! pinned riscv-tests + env/ ──build-fixtures.sh (Linux)──▶ fixtures/rv32ui-*.elf + manifest.json
+//! fixtures ──systemscope-elf──▶ Rv32iCpu + AddressBus + Ram ──▶ ECALL ──▶ PASS / FAIL
 //! ```
 //!
 //! - The constants here pin everything a fixture is built from, and name exactly which
@@ -9,6 +10,7 @@
 //!   script pins the same versions.
 //! - [`manifest`] writes and checks `fixtures/manifest.json`, the acceptance contract: the
 //!   selected ELFs, their hashes, and the pins they were built with.
+//! - [`runner`] runs a fixture on the reference platform and applies the pass rule.
 //!
 //! Tests only read the committed fixtures. `cargo xtask rv32-fixtures build` rebuilds
 //! them on Linux, and `cargo xtask rv32-fixtures verify` checks them without a network or
@@ -17,6 +19,7 @@
 use std::path::{Path, PathBuf};
 
 pub mod manifest;
+pub mod runner;
 pub mod upstream;
 
 /// The upstream repository the tests come from.

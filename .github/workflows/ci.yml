@@ -74,7 +74,7 @@ jobs:
         with:
           tool: cargo-nextest
       - name: Unit and integration tests
-        run: cargo nextest run --workspace --exclude systemscope-acceptance --locked --profile ci --no-fail-fast
+        run: cargo nextest run --workspace --exclude systemscope-acceptance --exclude systemscope-rv32 --locked --profile ci --no-fail-fast
       # nextest does not run doctests.
       - name: Doctests
         run: cargo test --workspace --doc --locked
@@ -88,9 +88,55 @@ jobs:
         run: cargo nextest run -p systemscope-acceptance --locked --profile ci --no-fail-fast --test at2
       - name: AT-3 observation invariance (O0-O5, compile-fail)
         run: cargo nextest run -p systemscope-acceptance --locked --profile ci --no-fail-fast --test at3 --test compile_fail
+      # docs/m1-design.md §10.2, §10.6: the committed rv32ui ELFs, run from the same bytes
+      # on both operating systems. Neither step builds anything or uses the network.
+      - name: rv32ui fixtures match the manifest
+        run: cargo xtask rv32-fixtures verify
+      - name: M1-A2 rv32ui (40 selected tests)
+        run: cargo nextest run -p systemscope-rv32 --locked --profile ci --no-fail-fast
+      - name: rv32ui fixtures unchanged
+        shell: bash
+        run: git diff --exit-code -- tests/rv32/fixtures
       # Only `cargo xtask bless` writes golden files; a test that wrote one would show here.
       - name: Golden files unchanged
         shell: bash
         run: |
           git diff --exit-code
           test -z "$(git status --porcelain)"
+
+  # docs/m1-design.md §10.6: rebuilds the rv32ui fixtures from the pinned riscv-tests with
+  # the pinned toolchain on a clean machine, and requires the committed bytes and manifest
+  # back. The only job that installs a RISC-V toolchain or fetches riscv-tests.
+  rv32-fixtures:
+    name: rv32ui fixtures rebuild (Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: systemscope
+      # systemscope depends on `../contracts` by path (plan.md §10), so reproduce the
+      # sibling layout, with contracts pinned to a pushed revision (bump it deliberately).
+      - uses: actions/checkout@v4
+        with:
+          repository: SystemScopeLabs/contracts
+          ref: 4d6e912a7ccffb676d0f95ff523c553fe3048c47
+          path: contracts
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: systemscope
+      # The versions tests/rv32/fixtures/manifest.json records; the build script checks
+      # the tools' version strings again.
+      - name: Install the pinned RISC-V toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-riscv64-unknown-elf=13.2.0-11ubuntu1+12 \
+            binutils-riscv64-unknown-elf=2.42-1ubuntu1+6
+      - name: Rebuild the fixtures
+        run: cargo xtask rv32-fixtures build
+      - name: Rebuilt fixtures and manifest are byte-identical
+        run: |
+          git diff --exit-code -- tests/rv32
+          test -z "$(git status --porcelain -- tests/rv32)"

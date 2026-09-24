@@ -1,6 +1,6 @@
 [package]
 name = "systemscope-rv32"
-description = "SystemScope M1 rv32ui fixtures and their manifest"
+description = "SystemScope M1 rv32ui fixtures, their manifest, and the riscv-tests runner"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,10 @@ publish = false
 [dependencies]
 blake3 = "1"
 serde_json = "1"
+systemscope-contracts.workspace = true
 systemscope-elf.workspace = true
+systemscope-platform.workspace = true
+systemscope-runtime.workspace = true
 systemscope-rv32i.workspace = true
 
 [lints]
