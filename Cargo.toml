@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["runtime", "components/*", "reference", "tests/acceptance", "xtask"]
+members = ["runtime", "components/*", "elf", "reference", "tests/acceptance", "xtask"]
 
 [workspace.package]
 version = "0.0.0"
@@ -13,6 +13,7 @@ systemscope-contracts = { path = "../contracts/crates/systemscope-contracts" }
 systemscope-runtime = { path = "runtime" }
 systemscope-toy = { path = "components/toy" }
 systemscope-platform = { path = "components/platform" }
+systemscope-rv32i = { path = "components/rv32i" }
 systemscope-reference = { path = "reference" }
 systemscope-acceptance = { path = "tests/acceptance" }
 

@@ -1,0 +1,23 @@
+[package]
+name = "systemscope-elf"
+description = "Host-side ELF32 RISC-V loader for SystemScope M1: executable images to RAM load images"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# Host-side code, not a component: it depends on nothing in the simulation
+# (docs/m1-design.md §3, §8). The parser is hand-written; blake3 names the program.
+[dependencies]
+blake3 = "1"
+
+[dev-dependencies]
+proptest = "1"
+# Integration tests hand a load image to the real RAM and CPU and run it in the real
+# runtime; the library itself depends on none of them.
+systemscope-contracts.workspace = true
+systemscope-platform.workspace = true
+systemscope-runtime.workspace = true
+systemscope-rv32i.workspace = true
+
+[lints]
+workspace = true
