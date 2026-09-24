@@ -13,6 +13,8 @@
 //! - [`runner`] runs a fixture on the reference platform and applies the pass rule.
 //! - [`hello`] is M1-A5: `hello.elf`, built from `hello/hello.S` with the same toolchain,
 //!   pinned by its own `hello/manifest.json`, and run on `m1-reference` with the UART.
+//! - [`spike`] is M1-A3: every selected fixture's retirements against the pinned Spike's
+//!   commit log. Only `cargo xtask spike diff` runs Spike; tests use committed Spike logs.
 //!
 //! Tests only read the committed fixtures. `cargo xtask rv32-fixtures build` rebuilds
 //! them on Linux, and `cargo xtask rv32-fixtures verify` checks them without a network or
@@ -23,6 +25,7 @@ use std::path::{Path, PathBuf};
 pub mod hello;
 pub mod manifest;
 pub mod runner;
+pub mod spike;
 pub mod upstream;
 
 /// The upstream repository the tests come from.

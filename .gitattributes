@@ -4,3 +4,4 @@
 *.jsonl -text
 *.snap -text
 *.elf -text
+*.log -text
