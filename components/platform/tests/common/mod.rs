@@ -1,8 +1,8 @@
 //! Test harnesses shared by the platform tests. Test-only: nothing here is part of the
 //! crate.
 //!
-//! - [`MockCtx`] drives one component directly, recording what it sends and traces, so
-//!   unit and property tests run without a runtime.
+//! - [`MockCtx`] drives one component directly, recording what it sends (`mem.v1` and
+//!   `irq.v0`) and traces, so unit and property tests run without a runtime.
 //! - [`Script`] is a stateless `mem.v1` initiator for runtime tests: it schedules every
 //!   request during `init`, so its pending requests live in the runtime's queue and it
 //!   has nothing to snapshot. Responses show up in the runtime's dispatch records.
@@ -15,6 +15,7 @@ use systemscope_contracts::component::{
 use systemscope_contracts::error::SimError;
 use systemscope_contracts::event::{Phase, ScheduleWhen};
 use systemscope_contracts::protocol::Message;
+use systemscope_contracts::protocol::irq_v0::IrqMsg;
 use systemscope_contracts::protocol::mem_v1::{self, MemMsg, TxnId};
 use systemscope_contracts::rng::SimRng;
 use systemscope_contracts::snapshot::{RestoreError, SnapshotReader, SnapshotWriter};
@@ -28,6 +29,22 @@ pub struct Sent {
     pub msg: MemMsg,
     pub when: ScheduleWhen,
     pub phase: Phase,
+}
+
+/// One `irq.v0` `send` a component made.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IrqSent {
+    pub port: PortId,
+    pub asserted: bool,
+    pub when: ScheduleWhen,
+    pub phase: Phase,
+}
+
+/// Which protocol a `send` used, in the order the component sent them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SendKind {
+    Mem,
+    Irq,
 }
 
 /// One `trace` record a component made.
@@ -46,6 +63,8 @@ impl SimRng for NoRng {
 pub struct MockCtx {
     pub phase: Phase,
     pub sent: Vec<Sent>,
+    pub irqs: Vec<IrqSent>,
+    pub order: Vec<SendKind>,
     pub traced: Vec<Traced>,
     rng: NoRng,
 }
@@ -55,6 +74,8 @@ impl MockCtx {
         MockCtx {
             phase,
             sent: Vec::new(),
+            irqs: Vec::new(),
+            order: Vec::new(),
             traced: Vec::new(),
             rng: NoRng,
         }
@@ -72,6 +93,16 @@ impl MockCtx {
             msg: msg.into(),
         };
         component.handle_event(&ev, self)
+    }
+
+    /// Delivers any message on `port` of `component`, in this context's phase.
+    pub fn deliver_msg(
+        &mut self,
+        component: &mut dyn Component,
+        port: PortId,
+        msg: Message,
+    ) -> Result<(), SimError> {
+        component.handle_event(&Delivered::Message { port, msg }, self)
     }
 
     /// The only message sent since the last call, which is cleared.
@@ -98,15 +129,27 @@ impl InitContext for MockCtx {
         when: ScheduleWhen,
         phase: Phase,
     ) -> Result<(), SimError> {
-        let Message::MemV1(msg) = msg else {
-            panic!("platform components speak mem.v1 only");
-        };
-        self.sent.push(Sent {
-            port,
-            msg,
-            when,
-            phase,
-        });
+        match msg {
+            Message::MemV1(msg) => {
+                self.order.push(SendKind::Mem);
+                self.sent.push(Sent {
+                    port,
+                    msg,
+                    when,
+                    phase,
+                });
+            }
+            Message::Irq(IrqMsg::Level { asserted }) => {
+                self.order.push(SendKind::Irq);
+                self.irqs.push(IrqSent {
+                    port,
+                    asserted,
+                    when,
+                    phase,
+                });
+            }
+            other => panic!("platform components speak mem.v1 and irq.v0 only: {other:?}"),
+        }
         Ok(())
     }
 

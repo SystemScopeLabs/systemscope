@@ -6,12 +6,17 @@
 //! memory that serves those offsets, and [`SimpleUart`] is a transmit-only output device
 //! with a TX and a STATUS register. None of them knows about the CPU.
 //!
+//! M2 adds [`SimpleIrqController`] (`docs/m2-design.md` §7.2), a level-sensitive
+//! aggregator of `irq.v0` lines with a `PENDING` and an `ENABLE` register.
+//!
 //! Like the M0 toy components, they depend only on `systemscope-contracts`.
 
 pub mod bus;
+pub mod irqc;
 pub mod ram;
 pub mod uart;
 
 pub use bus::{AddressBus, BusConfigError, Region};
+pub use irqc::{IrqControllerConfig, IrqControllerConfigError, SimpleIrqController};
 pub use ram::{Ram, RamConfig, RamConfigError, RamImage, Segment};
 pub use uart::{SimpleUart, UartConfig};
