@@ -23,6 +23,19 @@
 //!   verifies.
 //! - `rv32-fixtures verify`: checks the committed fixtures and `hello.elf` against their
 //!   manifests, with no network and no compiler.
+//! - `spike build [<dir>]`: Linux only, with git, a C++ compiler, make, and dtc. Fetches
+//!   and builds the pinned Spike into `<dir>` (default `target/spike`) with
+//!   `tests/rv32/build-spike.sh`, then runs `verify`.
+//! - `spike verify [<dir>]`: checks the Spike in `<dir>`: its stamp, its source checkout
+//!   at the pin, its version line, and a smoke run of `simple` whose log must equal the
+//!   committed one. Prints the binary's BLAKE3.
+//! - `spike diff [<dir>]`: `verify`, then M1-A3: every selected fixture's retirements on
+//!   SystemScope against Spike's, which must all match. Spike's logs go to
+//!   `target/spike-logs`.
+//!
+//! The `spike` tasks run `<dir>/bin/spike`, or the command in `SPIKE` if it is set: the
+//! same pinned build, reached another way (such as through WSL). Nothing else in the
+//! workspace needs Spike.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -32,11 +45,13 @@ use systemscope_acceptance::golden::{GOLDEN_PATH, Golden, MID_SNAPSHOT_PATH, des
 use systemscope_acceptance::m1::golden as m1;
 use systemscope_rv32::hello::{self, HELLO_DIR, HELLO_MANIFEST, HELLO_SCRIPT, HelloManifest};
 use systemscope_rv32::manifest::{Manifest, verify};
+use systemscope_rv32::spike::{self, SPIKE_COMMIT, SPIKE_DIR, SPIKE_LOGS, SPIKE_SCRIPT};
 use systemscope_rv32::{BUILD_SCRIPT, FIXTURE_DIR, MANIFEST_PATH, SELECTED, upstream};
 
 const USAGE: &str = "usage: cargo xtask bless\n       \
                      cargo xtask m1-golden bless | verify | emit <dir> | check <dir>\n       \
-                     cargo xtask rv32-fixtures build | manifest [<cache-dir>] | verify";
+                     cargo xtask rv32-fixtures build | manifest [<cache-dir>] | verify
+                            cargo xtask spike build | verify | diff [<dir>]";
 /// The golden file's name in an `m1-golden emit` directory.
 const M1_RESULT: &str = "m1-reference.json";
 /// Where `rv32-fixtures build` fetches and builds, relative to the workspace root.
@@ -55,6 +70,8 @@ fn main() -> ExitCode {
         ["rv32-fixtures", "manifest"] => rv32_manifest(&root().join(RV32_CACHE)),
         ["rv32-fixtures", "manifest", cache] => rv32_manifest(Path::new(cache)),
         ["rv32-fixtures", "verify"] => rv32_verify(),
+        ["spike", task] => spike_task(task, &root().join(SPIKE_DIR)),
+        ["spike", task, dir] => spike_task(task, Path::new(dir)),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::FAILURE
@@ -368,5 +385,109 @@ fn rv32_verify() -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+fn spike_task(task: &str, dir: &Path) -> ExitCode {
+    match task {
+        "build" => spike_build(dir),
+        "verify" => {
+            if spike_verify(dir) {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        "diff" => spike_diff(dir),
+        _ => {
+            eprintln!("{USAGE}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The Spike to run: `SPIKE`, or the one installed in `dir`.
+fn spike_binary(dir: &Path) -> PathBuf {
+    std::env::var_os("SPIKE").map_or_else(|| dir.join("bin/spike"), PathBuf::from)
+}
+
+fn spike_build(dir: &Path) -> ExitCode {
+    if !cfg!(target_os = "linux") {
+        eprintln!("spike build runs on Linux only (docs/m1-design.md §10.3)");
+        return ExitCode::FAILURE;
+    }
+    match Command::new("bash")
+        .arg(SPIKE_SCRIPT)
+        .arg(dir)
+        .current_dir(root())
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        Ok(s) => {
+            eprintln!("{SPIKE_SCRIPT} failed: {s}");
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("cannot run {SPIKE_SCRIPT}: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    spike_task("verify", dir)
+}
+
+fn spike_verify(dir: &Path) -> bool {
+    let binary = spike_binary(dir);
+    match spike::verify_install(&root(), dir, &binary) {
+        Ok(checked) => {
+            println!("Spike {SPIKE_COMMIT} in {} verified:", dir.display());
+            for line in checked {
+                println!("  {line}");
+            }
+            true
+        }
+        Err(errors) => {
+            eprintln!("Spike in {} is not the pinned build:", dir.display());
+            for e in errors {
+                eprintln!("  {e}");
+            }
+            false
+        }
+    }
+}
+
+fn spike_diff(dir: &Path) -> ExitCode {
+    // A Spike from a cache or elsewhere is checked before anything is compared with it.
+    if !spike_verify(dir) {
+        return ExitCode::FAILURE;
+    }
+    let report = match spike::run_differential(&root(), &spike_binary(dir), SPIKE_LOGS) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("cannot run the differential: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    for result in &report.results {
+        println!("{}", result.line());
+    }
+    println!(
+        "selected {}, run by SystemScope {}, run by Spike {}, matched {}, retirements          compared {}",
+        report.selected,
+        report.systemscope_executed(),
+        report.spike_executed(),
+        report.passed(),
+        report.compared()
+    );
+    match report.accept(SELECTED.len()) {
+        Ok(()) => {
+            println!(
+                "M1-A3: every selected rv32ui test retires exactly as on Spike {SPIKE_COMMIT}"
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("M1-A3 fails: {e}");
+            ExitCode::FAILURE
+        }
     }
 }

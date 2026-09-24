@@ -1,6 +1,6 @@
 [package]
 name = "xtask"
-description = "SystemScope workspace tasks: cargo xtask bless, cargo xtask rv32-fixtures"
+description = "SystemScope workspace tasks: cargo xtask bless, m1-golden, rv32-fixtures, spike"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
