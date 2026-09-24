@@ -1,5 +1,5 @@
-//! The M2 privileged subset: Zicsr decoding, the eight machine CSRs, and `MRET`
-//! (`docs/m2-design.md` §4, §5.3).
+//! The M2 privileged subset: Zicsr decoding, the eight machine CSRs, `MRET`, and the
+//! machine external interrupt's eligibility and entry (`docs/m2-design.md` §4, §5).
 //!
 //! SystemScope M2 implements a documented subset of machine-level privileged architecture
 //! required for machine-external interrupts. It does not implement full Sm.
@@ -41,6 +41,8 @@ pub const MSTATUS_MPIE: u32 = 1 << 7;
 pub const MSTATUS_MPP: u32 = 0b11 << 11;
 /// `mie.MEIE` and `mip.MEIP`.
 pub const MEI_BIT: u32 = 1 << 11;
+/// `mcause` of the machine external interrupt: the interrupt bit and code 11 (§5.2).
+pub const MEI_CAUSE: u32 = 0x8000_000b;
 
 /// Whether `csr` is one of the eight whitelisted CSRs.
 pub fn is_supported(csr: u16) -> bool {
@@ -237,5 +239,25 @@ impl CsrFile {
         self.mie = self.mpie;
         self.mpie = true;
         self.mepc
+    }
+
+    /// Whether the machine external interrupt is eligible (§5.1): `mstatus.MIE`,
+    /// `mie.MEIE`, and `mip.MEIP` are all set.
+    pub fn mei_eligible(&self) -> bool {
+        self.mie && self.meie && self.irq_level
+    }
+
+    /// The machine external interrupt's CSR effects (§5.2) at a boundary whose next PC is
+    /// `next_pc`: `mepc` ← `next_pc`, `mcause` ← [`MEI_CAUSE`], `mtval` ← 0, MPIE ← MIE,
+    /// MIE ← 0, MPP stays `0b11`. Returns the new `pc`, `mtvec` BASE (MODE is always 0).
+    ///
+    /// `next_pc` is 4-byte aligned: a misaligned target traps before it retires.
+    pub fn take_mei(&mut self, next_pc: u32) -> u32 {
+        self.mepc = next_pc;
+        self.mcause = MEI_CAUSE;
+        self.mtval = 0;
+        self.mpie = self.mie;
+        self.mie = false;
+        self.mtvec
     }
 }

@@ -1,14 +1,17 @@
 //! `Rv32iCpu` in the `M2` profile, driven directly (`docs/m2-design.md` §4–§6, M2.2a):
 //! Zicsr and `MRET` at `Commit`, legality in both profiles, snapshot schema 2 and its
 //! restore checks, inspect and trace, and checked `TxnId` allocation. The expected values
-//! come from an oracle written from §4.3 and §5.3 that shares no code with the crate.
+//! come from an oracle written from §4.3 and §5.3 that shares no code with the crate,
+//! followed at the retirement boundary by the pure interrupt oracle of §5.8
+//! ([`common::mei`]); the interrupt itself is tested in `cpu_mei.rs`.
 
 mod common;
 
 use std::num::NonZeroU64;
 
-use common::MockCtx;
 use common::asm::*;
+use common::mei::{MEI_CAUSE, take_mei};
+use common::{MockCtx, Traced};
 use proptest::prelude::*;
 use systemscope_contracts::component::Component;
 use systemscope_contracts::error::SimError;
@@ -19,7 +22,7 @@ use systemscope_contracts::snapshot::{RestoreError, SnapshotReader, SnapshotWrit
 use systemscope_contracts::time::ClockDomainId;
 use systemscope_contracts::trace::Value;
 use systemscope_rv32i::cpu::{
-    COMMIT, COMMIT_KIND, FETCH, SNAPSHOT_SCHEMA, SNAPSHOT_SCHEMA_M2, TRAP_KIND,
+    COMMIT, COMMIT_KIND, FETCH, INTERRUPT_KIND, SNAPSHOT_SCHEMA, SNAPSHOT_SCHEMA_M2, TRAP_KIND,
 };
 use systemscope_rv32i::{Halt, Reg, Rv32iConfig, Rv32iCpu, Rv32iProfile, RvTrap, TrapCause};
 
@@ -98,18 +101,14 @@ fn fetch_word(cpu: &mut Rv32iCpu, ctx: &mut MockCtx, insn: u32) -> u64 {
     wake.token
 }
 
-/// Runs `insn`, which must not touch memory, through its commit; returns the one trace
-/// record it made.
-fn run(
-    cpu: &mut Rv32iCpu,
-    ctx: &mut MockCtx,
-    insn: u32,
-) -> (&'static str, Vec<(&'static str, Value)>) {
+/// Runs `insn`, which must not touch memory, through its commit; returns every trace
+/// record the commit made: one, or a retirement and an interrupt entry.
+fn run_all(cpu: &mut Rv32iCpu, ctx: &mut MockCtx, insn: u32) -> Vec<Traced> {
     assert_eq!(fetch_word(cpu, ctx, insn), COMMIT);
     ctx.wake(cpu, COMMIT, Phase::Commit).unwrap();
-    assert_eq!(ctx.traced.len(), 1, "{:?}", ctx.traced);
-    let record = ctx.traced.pop().unwrap();
-    if record.0 == COMMIT_KIND {
+    let records = std::mem::take(&mut ctx.traced);
+    assert!(!records.is_empty());
+    if records[0].0 == COMMIT_KIND {
         let next = ctx.take_wake();
         assert_eq!(next.token, FETCH);
         assert_eq!(
@@ -125,7 +124,19 @@ fn run(
     } else {
         assert!(ctx.woke.is_empty());
     }
-    record
+    records
+}
+
+/// Runs `insn`, which must not touch memory, through its commit; returns the one trace
+/// record it made.
+fn run(
+    cpu: &mut Rv32iCpu,
+    ctx: &mut MockCtx,
+    insn: u32,
+) -> (&'static str, Vec<(&'static str, Value)>) {
+    let mut records = run_all(cpu, ctx, insn);
+    assert_eq!(records.len(), 1, "{records:?}");
+    records.pop().unwrap()
 }
 
 /// Runs `insn` and requires it to retire; returns its `rv32.commit` fields.
@@ -1175,8 +1186,10 @@ fn any_word() -> impl Strategy<Value = u32> {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(4_000))]
 
-    /// One CSR instruction or `MRET` from any CSR and register state: the M2 CPU retires or
-    /// traps exactly as the oracle says, and the M1 CPU always traps.
+    /// One CSR instruction or `MRET` from any CSR and register state and any `irq` level:
+    /// the M2 CPU retires or traps exactly as the oracle says, then at the retirement
+    /// boundary takes the interrupt exactly as `take_mei` says for the CSRs after the
+    /// instruction (§5.1, §5.5, §5.8); a trap never samples. The M1 CPU always traps.
     #[test]
     fn one_instruction_matches_the_oracle(
         m in any_model(),
@@ -1189,9 +1202,11 @@ proptest! {
         prop_assert_eq!(Model::read_from(&cpu.inspect()), m);
         let mut ctx = MockCtx::new();
         let expected = oracle(&m, &regs, pc, word);
-        let (kind, fields) = run(&mut cpu, &mut ctx, word);
+        let records = run_all(&mut cpu, &mut ctx, word);
+        let (kind, fields) = records[0].clone();
         match expected {
             Expect::Illegal => {
+                prop_assert_eq!(records.len(), 1);
                 prop_assert_eq!(kind, TRAP_KIND);
                 prop_assert_eq!(&fields[3], &("tval", u(word)));
                 prop_assert_eq!(Model::read_from(&cpu.inspect()), m);
@@ -1199,9 +1214,30 @@ proptest! {
             }
             Expect::Retire { pc: next, rd, csrs, csr_value } => {
                 prop_assert_eq!(kind, COMMIT_KIND);
-                prop_assert_eq!(cpu.pc(), next);
+                let mei = take_mei(next, csrs.mstatus, csrs.mie, csrs.mip, csrs.mtvec);
+                let mut after = csrs;
+                after.mstatus = mei.new_mstatus;
+                after.mepc = mei.mepc.unwrap_or(after.mepc);
+                after.mcause = mei.mcause.unwrap_or(after.mcause);
+                after.mtval = mei.mtval.unwrap_or(after.mtval);
+                prop_assert_eq!(cpu.pc(), mei.new_pc);
                 prop_assert_eq!(cpu.instret(), 1);
-                prop_assert_eq!(Model::read_from(&cpu.inspect()), csrs);
+                prop_assert_eq!(Model::read_from(&cpu.inspect()), after);
+                if mei.taken {
+                    prop_assert_eq!(
+                        &records[1..],
+                        &[(
+                            INTERRUPT_KIND,
+                            vec![
+                                ("mepc", u(next)),
+                                ("mcause", u(MEI_CAUSE)),
+                                ("handler", u(mei.new_pc)),
+                            ],
+                        )][..]
+                    );
+                } else {
+                    prop_assert_eq!(records.len(), 1);
+                }
                 let mut want = regs;
                 if let Some((rd, v)) = rd {
                     want[rd as usize - 1] = v;

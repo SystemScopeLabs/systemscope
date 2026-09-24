@@ -11,7 +11,8 @@
 //! a [`PendingTrap`].
 //!
 //! The `M2` profile ([`Rv32iProfile`]) adds the privileged subset of `docs/m2-design.md`
-//! §4 in [`csr`]: the Zicsr instructions on eight machine CSRs ([`CsrFile`]) and `MRET`.
+//! §4 in [`csr`]: the Zicsr instructions on eight machine CSRs ([`CsrFile`]) and `MRET`,
+//! and the machine external interrupt of §5, taken from its `irq.v0` port.
 
 pub mod cpu;
 pub mod csr;

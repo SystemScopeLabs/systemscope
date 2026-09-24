@@ -13,7 +13,8 @@
 //! MemIssue ──Wake(MEMORY)──▶ send ReadReq / WriteReq ──▶ MemWait { txn }
 //! MemWait ──Read/WriteResp @ COMPLETE──▶ complete_memory ──▶ CommitPending
 //! CommitPending ──Wake(COMMIT)──▶ retire: x[rd], pc, instret ──▶ FetchIssue (next cycle)
-//!                              └▶ trap: nothing changes ──▶ Halted
+//!                              ├▶ trap: nothing changes ──▶ Halted
+//!                              └▶ retire, then MEI entry (M2) ──▶ FetchIssue at mtvec
 //! ```
 //!
 //! # Ownership
@@ -47,6 +48,20 @@
 //! reads and writes the CSRs only in `Commit` (§6.3); snapshot schema 2 (§6.4); the CSRs
 //! in `inspect` and `csr`/`csr_value` in CSR commits (§6.5); and checked `TxnId`
 //! allocation (§6.2). A synchronous trap still halts and writes no CSR (§5.6).
+//!
+//! # Machine external interrupt (`M2`)
+//!
+//! The `M2` profile has a second port, `irq`, an `irq.v0` target. A `Level` delivered on
+//! it in `Complete` sets the `irq` input level, which `mip.MEIP` reads, in any state,
+//! `Halted` included; a repeated level changes nothing (§6.2, §7.1). The interrupt is
+//! sampled at exactly one point: in the `Commit` handler that retires an instruction,
+//! after its effects, `pc`, and `instret`, and after the instruction limit, which takes
+//! priority (§5.1). If `mstatus.MIE`, `mie.MEIE`, and `mip.MEIP` are all set, the CPU
+//! enters the handler right there (§5.2): the entry is not an instruction, does not
+//! retire, and leaves the CPU in `FetchIssue` at `mtvec`, scheduled like any retirement,
+//! so there is no interrupt state to snapshot (§6.4). A trapping instruction does not
+//! retire, so no interrupt is sampled after it. The entry traces `rv32.interrupt` after
+//! the retirement's `rv32.commit` (§6.5).
 
 use std::fmt;
 use std::num::NonZeroU64;
@@ -59,6 +74,7 @@ use systemscope_contracts::error::SimError;
 use systemscope_contracts::event::{Phase, ScheduleWhen};
 use systemscope_contracts::observe::StateView;
 use systemscope_contracts::protocol::Message;
+use systemscope_contracts::protocol::irq_v0::{self, IrqMsg};
 use systemscope_contracts::protocol::mem_v1::{self, MemFault, MemMsg, ReadOutcome, TxnId};
 use systemscope_contracts::snapshot::{RestoreError, SnapshotReader, SnapshotWriter};
 use systemscope_contracts::time::ClockDomainId;
@@ -76,8 +92,12 @@ use crate::memory::{
 };
 use crate::regfile::RegisterFile;
 
-/// The CPU's only port: a `mem.v1` initiator named `mem`, for fetches and data alike.
+/// The `mem` port: a `mem.v1` initiator, for fetches and data alike. It is the CPU's only
+/// port in the `M1` profile.
 pub const PORT: PortId = PortId(0);
+
+/// The `irq` port of the `M2` profile: an `irq.v0` target (`docs/m2-design.md` §6.1).
+pub const IRQ_PORT: PortId = PortId(1);
 
 /// Wake token that sends the next fetch.
 pub const FETCH: u64 = 0;
@@ -103,13 +123,16 @@ pub const TRAP_KIND: &str = "rv32.trap";
 /// Trace kind of an instruction-limit halt.
 pub const HALT_KIND: &str = "rv32.halt";
 
+/// Trace kind of a machine external interrupt entry (`M2`).
+pub const INTERRUPT_KIND: &str = "rv32.interrupt";
+
 /// Which CPU an [`Rv32iCpu`] is (`docs/m2-design.md` §6.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Rv32iProfile {
     /// The M1 CPU, unchanged: RV32I only, snapshot schema 1.
     M1,
-    /// The M1 CPU plus the M2 privileged subset (Zicsr on eight CSRs, `MRET`), snapshot
-    /// schema 2.
+    /// The M1 CPU plus the M2 privileged subset (Zicsr on eight CSRs, `MRET`), the `irq`
+    /// port and the machine external interrupt, snapshot schema 2.
     M2,
 }
 
@@ -607,11 +630,37 @@ impl Rv32iCpu {
         if self.instret >= self.config.max_instructions.get() {
             ctx.trace(HALT_KIND, vec![("instret", Value::U64(self.instret))]);
             self.state = State::Halted(Halt::InstructionLimit);
-            Ok(())
-        } else {
-            self.state = State::FetchIssue;
-            self.wake_next_cycle(ctx, FETCH)
+            return Ok(());
         }
+        // The only interrupt sampling point (m2-design §5.1): after the retirement, with
+        // its CSR effects and pc applied.
+        if self.config.profile == Rv32iProfile::M2 && self.csrs.mei_eligible() {
+            self.pc = self.csrs.take_mei(self.pc);
+            ctx.trace(
+                INTERRUPT_KIND,
+                vec![
+                    ("mepc", Value::U64(u64::from(self.csrs.mepc))),
+                    ("mcause", Value::U64(u64::from(self.csrs.mcause))),
+                    ("handler", Value::U64(u64::from(self.pc))),
+                ],
+            );
+        }
+        self.state = State::FetchIssue;
+        self.wake_next_cycle(ctx, FETCH)
+    }
+
+    /// Takes an `irq.v0` level on the `irq` port (`M2`): valid only in `Complete`, in any
+    /// execution state. It changes the level and nothing else; the interrupt is sampled
+    /// only when an instruction retires.
+    fn irq(&mut self, msg: &IrqMsg, ctx: &mut dyn SimContext) -> Result<(), SimError> {
+        if ctx.phase() != Phase::Complete {
+            return Err(SimError::ComponentFault(
+                "rv32 cpu: irq.v0 level arrived outside COMPLETE",
+            ));
+        }
+        let IrqMsg::Level { asserted } = *msg;
+        self.csrs.irq_level = asserted;
+        Ok(())
     }
 
     /// Applies a CSR instruction (§6.3): reads the CSR, writes the new value under the
@@ -965,12 +1014,21 @@ impl Component for Rv32iCpu {
         "rv32i.cpu"
     }
 
+    /// `mem` in both profiles; `irq` too in the `M2` profile.
     fn ports(&self) -> Vec<PortSpec> {
-        vec![PortSpec {
+        let mut ports = vec![PortSpec {
             name: "mem",
             protocol: mem_v1::PROTOCOL,
             role: Role::Initiator,
-        }]
+        }];
+        if self.config.profile == Rv32iProfile::M2 {
+            ports.push(PortSpec {
+                name: "irq",
+                protocol: irq_v0::PROTOCOL,
+                role: Role::Target,
+            });
+        }
+        ports
     }
 
     /// Schedules the first fetch at the first clock edge, in `Request`.
@@ -983,15 +1041,31 @@ impl Component for Rv32iCpu {
     }
 
     fn handle_event(&mut self, ev: &Delivered, ctx: &mut dyn SimContext) -> Result<(), SimError> {
-        match ev {
-            Delivered::Wake { token } => self.wake(*token, ctx),
-            Delivered::Message {
-                msg: Message::MemV1(msg),
-                ..
-            } => self.response(msg, ctx),
-            Delivered::Message { .. } => {
+        match (self.config.profile, ev) {
+            (_, Delivered::Wake { token }) => self.wake(*token, ctx),
+            (
+                Rv32iProfile::M1,
+                Delivered::Message {
+                    msg: Message::MemV1(msg),
+                    ..
+                },
+            ) => self.response(msg, ctx),
+            (Rv32iProfile::M1, Delivered::Message { .. }) => {
                 Err(SimError::ComponentFault("rv32 cpu: message is not mem.v1"))
             }
+            (Rv32iProfile::M2, Delivered::Message { port, msg }) => match (*port, msg) {
+                (PORT, Message::MemV1(msg)) => self.response(msg, ctx),
+                (PORT, _) => Err(SimError::ComponentFault(
+                    "rv32 cpu: message on mem is not mem.v1",
+                )),
+                (IRQ_PORT, Message::Irq(msg)) => self.irq(msg, ctx),
+                (IRQ_PORT, _) => Err(SimError::ComponentFault(
+                    "rv32 cpu: message on irq is not irq.v0",
+                )),
+                _ => Err(SimError::ComponentFault(
+                    "rv32 cpu: message on an unknown port",
+                )),
+            },
         }
     }
 

@@ -4,8 +4,11 @@
 //!   from the ISA manual's formats, independently of the crate's decoder.
 //! - [`MockCtx`] drives the CPU directly, recording what it sends, wakes, and traces, so
 //!   protocol tests can deliver responses no real memory would produce.
+//! - [`mei`] is the pure machine-external-interrupt oracle (`docs/m2-design.md` §5.8).
 
 #![allow(dead_code)]
+
+pub mod mei;
 
 use systemscope_contracts::component::{
     Component, ComponentId, Delivered, InitContext, PortId, SimContext,
@@ -13,6 +16,7 @@ use systemscope_contracts::component::{
 use systemscope_contracts::error::SimError;
 use systemscope_contracts::event::{Phase, ScheduleWhen};
 use systemscope_contracts::protocol::Message;
+use systemscope_contracts::protocol::irq_v0::IrqMsg;
 use systemscope_contracts::protocol::mem_v1::MemMsg;
 use systemscope_contracts::rng::SimRng;
 use systemscope_contracts::time::Tick;
@@ -190,6 +194,29 @@ impl MockCtx {
             msg: msg.into(),
         };
         component.handle_event(&ev, self)
+    }
+
+    /// Delivers `msg` on `port` of `component`, in `phase`.
+    pub fn deliver(
+        &mut self,
+        component: &mut dyn Component,
+        port: PortId,
+        msg: Message,
+        phase: Phase,
+    ) -> Result<(), SimError> {
+        self.phase = phase;
+        component.handle_event(&Delivered::Message { port, msg }, self)
+    }
+
+    /// Delivers `irq.v0` `Level { asserted }` on port 1 of `component` (the `M2` CPU's
+    /// `irq`), in `Complete`.
+    pub fn level(&mut self, component: &mut dyn Component, asserted: bool) -> Result<(), SimError> {
+        self.deliver(
+            component,
+            PortId(1),
+            Message::Irq(IrqMsg::Level { asserted }),
+            Phase::Complete,
+        )
     }
 
     /// Delivers the wake `token` to `component`, in the phase it was scheduled for.

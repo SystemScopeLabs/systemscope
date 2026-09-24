@@ -14,6 +14,12 @@
 //! soc.uart  SimpleUart    base 0x1000_0000, 8 bytes, responds Cycles { cpu, 0 }
 //! ```
 //!
+//! The `M2` CPU profile runs the same programs on the same platform. Its second port,
+//! `irq`, is linked (`Cycles { cpu, 1 }`) to `soc.irq_low`, a [`TiedLowIrq`] added last:
+//! a test-only `irq.v0` source that never asserts its line and never sends, so the CPU
+//! executes exactly as without it (`docs/m2-design.md` §6.1, §7.1). The runtime requires
+//! every port to be linked.
+//!
 //! **Pass rule:** the CPU halts with `Trap(EnvironmentCall)`, `gp == 1`, and `a0 == 0`.
 //! Anything else fails, including the instruction limit, a runtime fault, or a run that
 //! ends without a halt.
@@ -24,8 +30,13 @@ use std::num::NonZeroU64;
 use std::path::Path;
 use std::rc::Rc;
 
-use systemscope_contracts::component::ComponentId;
+use systemscope_contracts::component::{
+    Component, ComponentId, Delivered, InitContext, PortSpec, Role, SimContext,
+};
+use systemscope_contracts::error::SimError;
 use systemscope_contracts::observe::{Control, EventView, Observer, StateView, WorldView};
+use systemscope_contracts::protocol::irq_v0;
+use systemscope_contracts::snapshot::{RestoreError, SnapshotReader, SnapshotWriter};
 use systemscope_contracts::time::{Frequency, Rounding, SimulationClock, Tick};
 use systemscope_contracts::topology::LinkLatency;
 use systemscope_contracts::trace::Value;
@@ -61,6 +72,50 @@ pub const BUS: ComponentId = ComponentId(1);
 pub const RAM: ComponentId = ComponentId(2);
 /// `soc.uart`, on a platform with the UART.
 pub const UART: ComponentId = ComponentId(3);
+
+/// A test-only `irq.v0` source whose line is always deasserted: it never sends, since a
+/// source sends no initial `Level { asserted: false }` (`docs/m2-design.md` §7.1). It
+/// only lets an `M2` CPU's `irq` port be linked where no interrupt source exists. It has
+/// no state; any event it receives faults the session.
+pub struct TiedLowIrq;
+
+impl Component for TiedLowIrq {
+    fn type_name(&self) -> &'static str {
+        "test.irq_tied_low"
+    }
+
+    fn ports(&self) -> Vec<PortSpec> {
+        vec![PortSpec {
+            name: "irq",
+            protocol: irq_v0::PROTOCOL,
+            role: Role::Initiator,
+        }]
+    }
+
+    fn init(&mut self, _: &mut dyn InitContext) -> Result<(), SimError> {
+        Ok(())
+    }
+
+    fn handle_event(&mut self, _: &Delivered, _: &mut dyn SimContext) -> Result<(), SimError> {
+        Err(SimError::ComponentFault(
+            "tied-low irq: a source receives nothing",
+        ))
+    }
+
+    fn snapshot_schema_version(&self) -> u32 {
+        1
+    }
+
+    fn snapshot(&self, _: &mut SnapshotWriter) {}
+
+    fn restore(&mut self, _: &mut SnapshotReader<'_>, schema: u32) -> Result<(), RestoreError> {
+        if schema == 1 {
+            Ok(())
+        } else {
+            Err(RestoreError::InvalidState("tied-low irq: unknown schema"))
+        }
+    }
+}
 
 /// How the run ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -142,7 +197,7 @@ impl Observer for Probe {
     fn on_after_dispatch(&mut self, _: &EventView<'_>, world: &WorldView<'_>) -> Control {
         *self.0.borrow_mut() = (0..world.component_count())
             .map(|i| {
-                let id = ComponentId(u32::try_from(i).expect("four components at most"));
+                let id = ComponentId(u32::try_from(i).expect("five components at most"));
                 world.inspect(id).unwrap_or_default()
             })
             .collect();
@@ -166,7 +221,8 @@ pub fn platform_with_seed(image: &LoadImage, uart: bool, seed: u64) -> Runtime {
 
 /// [`platform_with_seed`] with the CPU in `profile`. `m1-reference` is the `M1` profile;
 /// the `M2` profile runs the same RV32I programs on the same platform
-/// (`docs/m2-design.md` §6.1, §15.4).
+/// (`docs/m2-design.md` §6.1, §15.4), with its `irq` port linked to a [`TiedLowIrq`]
+/// added after the other components.
 pub fn platform_with_profile(
     image: &LoadImage,
     uart: bool,
@@ -230,6 +286,10 @@ pub fn platform_with_profile(
         });
         let device = t.add_component("soc.uart", Box::new(device));
         t.connect((bus, "uart"), (device, "mem"), Some(link));
+    }
+    if profile == Rv32iProfile::M2 {
+        let irq = t.add_component("soc.irq_low", Box::new(TiedLowIrq));
+        t.connect((irq, "irq"), (cpu, "irq"), Some(link));
     }
     t.elaborate(SessionConfig {
         seed,
