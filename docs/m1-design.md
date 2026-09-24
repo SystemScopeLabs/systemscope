@@ -426,7 +426,7 @@ Implemented in M1.4a.
 
 ### 7.3 SimpleUart (F1)
 
-Implemented in M1.7a (`components/platform/src/uart.rs`), as a standalone component; wiring it into a CPU platform and `hello.elf` are M1.7b.
+Implemented in M1.7a (`components/platform/src/uart.rs`), as a standalone component. M1.7b wires it into the CPU platform of §9 and prints `hello.elf` through it (§10.7), with no change to the component.
 
 A minimal, SystemScope-specific device. It is not a 16550: no receive path, FIFO, baud rate, timing model, or interrupts. It has one `mem.v1` target port, `mem`, and a window of 8 bytes. Offsets are UART-relative, as the bus forwards them.
 
@@ -499,6 +499,8 @@ soc.bus   AddressBus
 - **`max_instructions`:** 10,000,000.
 
 A 100 MHz clock is 10,000 ticks per cycle at the default 1 ps resolution. It is chosen only to keep tick values readable, and carries no performance meaning (§5.4).
+
+**Status (M1.7b):** the test crate builds this topology in `tests/rv32/src/runner.rs` (`runner::platform`), with component ids `soc.cpu0` = 0, `soc.bus` = 1, `soc.ram` = 2, and `soc.uart` = 3. It is a small helper for the test runs, not the reference builder: the `rv32ui` runs leave out the UART region, which none of them touches, and `hello.elf` runs include it. The named reference builder, the golden file, and the portable snapshot are M1.8.
 
 ---
 
@@ -632,7 +634,7 @@ ACT4 builds self-checking ELFs: it runs each test on the Sail reference model, c
 
 The toolchain needed to build ELFs (a RISC-V GCC or Clang), Spike, Sail, and ACT4 run only on Linux. So ELFs are built once and committed:
 
-- **Contents:** `tests/rv32/fixtures/` holds the 40 `rv32ui` ELFs (`rv32ui-<test>.elf`) and, from later steps, the ACT4 ELFs, `hello.elf`, and the dedicated trap programs.
+- **Contents:** `tests/rv32/fixtures/` holds the 40 `rv32ui` ELFs (`rv32ui-<test>.elf`) and, from later steps, the ACT4 ELFs and the dedicated trap programs. `hello.elf` lives in `tests/rv32/hello/` with its own manifest (§10.7), since `verify` requires the `rv32ui` directory to hold exactly the selection.
 - **`manifest.json`** records, for each fixture, its name, BLAKE3, and source. It also records the pinned versions of the toolchain, `riscv-tests`, ACT4, Sail, and Spike, plus the exclusions with their reasons. It is the acceptance contract: the runner takes the selection from it.
 - **Rebuilding** is a deliberate, Linux-only step, handled like `cargo xtask bless`:
   - a script rebuilds everything from the pinned versions and rewrites the manifest;
@@ -674,6 +676,28 @@ The toolchain needed to build ELFs (a RISC-V GCC or Clang), Spike, Sail, and ACT
   - The CI rebuild job repeats the build on a clean machine.
 - `.gitattributes` marks `*.elf` as binary; the manifest is LF text.
 
+### 10.7 `hello.elf` (M1-A5, M1.7b)
+
+- **Source:** `tests/rv32/hello/hello.S`, RV32I assembly with no C, libc, or runtime. It:
+  - loads the UART base `0x1000_0000`;
+  - copies the 20 bytes of `Hello, SystemScope!
+` from `.rodata` with `LBU` and `SB`, one store to TX (offset 0) per byte, without polling STATUS and without a terminating NUL;
+  - ends with the §10.2 convention: `gp = 1`, `a0 = 0`, then `ECALL`.
+- **Build:** `tests/rv32/hello/build-hello.sh`, which `cargo xtask rv32-fixtures build` runs after the `rv32ui` build:
+  - the same pinned toolchain and flags as the `rv32ui` fixtures (§10.6), and the same `env/linker.ld`;
+  - compiles to a fixed object name and links separately, twice in different directories, and requires identical bytes;
+  - checks the ELF: ELF32 RISC-V `ET_EXEC`, entry and `_start` at `0x8000_0000`, attributes `rv32i2p1`, and a code section holding only RV32I, with exactly one `sb`, no `sh` or `sw`, and exactly one `ecall`;
+  - installs it with mode `0644`.
+- **Manifest:** `tests/rv32/hello/manifest.json` records the toolchain, flags, and RAM, the BLAKE3 of `linker.ld`, the build script, and `hello.S`, and the ELF's BLAKE3, `image_hash`, and entry. `cargo xtask rv32-fixtures verify` checks it next to the `rv32ui` manifest, and that the directory holds nothing else. The CI rebuild job rebuilds `hello.elf` too and requires no difference.
+- **Run:** the ELF is loaded by `systemscope-elf` into the §9 topology with the UART. The output is read from the UART's inspect view, not from the trace. A run passes only if:
+  - it halts with `EnvironmentCall` and the §10.2 PASS convention (`gp = 1`, `a0 = 0`);
+  - the output is exactly `Hello, SystemScope!
+`, 20 bytes;
+  - the bytes in the UART's `platform.uart.tx` trace records equal the output;
+  - on a fresh run, the UART received exactly 20 one-byte `WriteReq`s at offset 0, all from CPU stores to `0x1000_0000`, and answered each.
+- **Result:** 87 instructions retire (the trapping `ECALL` does not), in 728 events. Observation does not change the output or the digests.
+- **Checkpoints:** resuming from the snapshot after every event but the last, including before the first UART write, with a `WriteResp` pending, after ten bytes, and after the last byte before `ECALL`, gives the same output, trace bytes, final state, and `StateDigest`, `ExecutionDigest`, and `TraceDigest`, and replays exactly the remaining events. The portable snapshot and the full M1-A6 list are M1.8.
+
 ---
 
 ## 11. M1 Exit Criteria
@@ -690,7 +714,7 @@ The toolchain needed to build ELFs (a RISC-V GCC or Clang), Spike, Sail, and ACT
 
 ## 12. Implementation Order
 
-Status: M1.0 through M1.5 are complete. M1.6, the `rv32ui` fixtures and runner, is implemented, and all 40 selected tests pass. M1.7a, the standalone `SimpleUart`, is implemented; M1.7b is not started.
+Status: M1.0 through M1.5 are complete. M1.6, the `rv32ui` fixtures and runner, is implemented, and all 40 selected tests pass. M1.7a, the standalone `SimpleUart`, is complete. M1.7b, `hello.elf` printing through the CPU, bus, and UART, is complete (§10.7). M1.8 is not started.
 
 1. **M1.0:** this document; the `plan.md` M1 update; in `contracts`, the compatibility id (§4.5) and the `mem.v1` contract, followed by a pin bump in `systemscope`, with the M0 golden digests unchanged.
 2. **M1.1:** `decode`, the immediate extractors, and the register file, with `IllegalInstruction` from the start.
@@ -719,4 +743,3 @@ The tag follows the M0 convention: a SemVer prerelease identifier marking a mile
 - **ACT4 prerequisites.** With `include_priv_tests: false`, do `rvmodel_macros.h` or any remaining RV32I test still need Zicsr or a trap handler (§10.4)?
 - **Spike configuration.** Which ISA string does the pinned Spike accept for RV32I, and does it exit cleanly on the `tohost` store under the §10.2 environment? To be verified at M1.9 and pinned in the manifest.
 - **Spike job placement.** M1-A3 is planned as a blocking Linux job. If building Spike makes CI too slow even with caching, it could move to a prebuilt, pinned binary, but not to nightly-only, since M1-A3 is an exit criterion.
-- **`hello.elf` source.** C, which needs the pinned toolchain's libc-free build, or assembly?
