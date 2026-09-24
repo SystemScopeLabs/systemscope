@@ -1,0 +1,12 @@
+# ACT4 DUT configuration for SystemScope's M1 CPU (docs/m1-design.md §10.4).
+# SPDX-License-Identifier: Apache-2.0
+name: systemscope-rv32i
+# The pinned riscv64-unknown-elf-gcc, built in two stages for reproducible ELFs; see the script.
+compiler_exe: systemscope-act4-gcc
+objdump_exe: riscv64-unknown-elf-objdump
+ref_model_exe: sail_riscv_sim
+udb_config: systemscope-rv32i.yaml
+linker_script: link.ld
+dut_include_dir: .
+# SystemScope implements no privilege modes, so no privileged tests.
+include_priv_tests: False

@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# The compiler ACT4 runs for the systemscope-rv32i configuration (test_config.yaml's
+# compiler_exe; docs/m1-design.md §10.4). It is riscv64-unknown-elf-gcc with one change:
+# a build of an ELF from one assembly source runs in two stages, compile then link,
+# through an object file with a fixed name, instead of gcc's one-shot build.
+#
+# Why: the one-shot build assembles into a random temporary object, /tmp/ccXXXXXX.o, and
+# the linker records that name as the ELF's STT_FILE symbol in .symtab/.strtab. Nothing
+# else in the ELF differs between two builds, and no loaded byte does. With the object
+# named after the output (I-add-00.elf is linked from I-add-00.o), the ELF is the same
+# byte for byte on every build.
+#
+# Every argument ACT4 passes reaches gcc unchanged and in order, in both stages: defines,
+# include paths, -march/-mabi, optimisation, assembler and linker flags, and the linker
+# script. The link stage takes the object where the one-shot build took the source.
+#
+# It fails closed. It accepts exactly the invocations ACT4 makes at the pinned commit:
+#   - the probes `-dumpversion`, `-print-prog-name=as` and `-march=help`, passed through;
+#   - a build: options from the list below, one `-o <file>.elf`, one `<file>.S` source.
+# Anything else, such as another option, a second input, or -c/-S/-E, is an error, so a
+# change in how ACT4 calls the compiler cannot go around this wrapper unnoticed.
+
+set -euo pipefail
+
+gcc=riscv64-unknown-elf-gcc
+
+die() {
+    echo "systemscope-act4-gcc: $*" >&2
+    exit 2
+}
+
+case "$*" in
+-dumpversion | -print-prog-name=as | -march=help)
+    [ $# -eq 1 ] || die "unexpected probe: $*"
+    exec "$gcc" "$1"
+    ;;
+esac
+
+out=
+src=
+src_index=-1
+args=("$@")
+i=0
+while [ $i -lt ${#args[@]} ]; do
+    arg=${args[$i]}
+    case "$arg" in
+    -o)
+        [ -z "$out" ] || die "more than one -o"
+        i=$((i + 1))
+        [ $i -lt ${#args[@]} ] || die "-o without a file"
+        out=${args[$i]}
+        case "$out" in
+        *.elf) ;;
+        *) die "output $out is not an .elf" ;;
+        esac
+        ;;
+    -Xassembler)
+        i=$((i + 1))
+        [ $i -lt ${#args[@]} ] || die "-Xassembler without an argument"
+        case "${args[$i]}" in
+        -march=*) ;;
+        *) die "unexpected assembler option ${args[$i]}" ;;
+        esac
+        ;;
+    -I?* | -T?* | -D?* | -O0 | -g | -mcmodel=medany | -nostdlib | -march=* | -mabi=* | -Wl,*) ;;
+    -*) die "unexpected option $arg" ;;
+    *.S)
+        [ -z "$src" ] || die "more than one source: $src and $arg"
+        src=$arg
+        src_index=$i
+        ;;
+    *) die "unexpected input $arg" ;;
+    esac
+    i=$((i + 1))
+done
+[ -n "$out" ] || die "no -o"
+[ -n "$src" ] || die "no .S source"
+
+obj=${out%.elf}.o
+# Every argument but `-o <out>` and the source, in order, for both stages.
+flags=()
+link=()
+i=0
+while [ $i -lt ${#args[@]} ]; do
+    if [ "${args[$i]}" = -o ]; then
+        i=$((i + 2))
+        continue
+    fi
+    if [ $i -eq $src_index ]; then
+        link+=("$obj")
+    else
+        flags+=("${args[$i]}")
+        link+=("${args[$i]}")
+    fi
+    i=$((i + 1))
+done
+
+trap 'rm -f "$obj"' EXIT
+"$gcc" "${flags[@]}" -c -o "$obj" "$src"
+"$gcc" "${link[@]}" -o "$out"

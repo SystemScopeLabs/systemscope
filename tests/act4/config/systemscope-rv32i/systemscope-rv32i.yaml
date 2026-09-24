@@ -1,0 +1,69 @@
+# UDB architecture configuration: the ACT4 adapter for SystemScope's M1 CPU
+# (docs/m1-design.md §10.4).
+#
+# SystemScope's architectural capability is RV32I and nothing else: no CSRs, no
+# privilege modes, no interrupts.
+#
+# Sm is declared only because this pinned ACT4/UDB schema requires Sm-owned MXLEN for an
+# RV32I DUT configuration. SystemScope does not implement Sm or privileged architecture.
+# Privileged ACT tests remain disabled.
+#
+# UDB defines MXLEN only under Sm, and ACT4 reads MXLEN to pick the XLEN of every test;
+# riscv/riscv-arch-test#2069 gives Sm with placeholder parameters and
+# include_priv_tests: False as the way to configure a DUT without privilege modes. The
+# Sm parameters below take the least-claiming values UDB accepts. test_config.yaml sets
+# include_priv_tests: False, and `cargo xtask act4` checks that every final ELF holds
+# RV32I instructions only, plus the ECALL that ends it.
+---
+$schema: config_schema.json#
+kind: architecture configuration
+type: fully configured
+name: systemscope-rv32i
+description: >-
+  ACT4 adapter for SystemScope's M1 CPU. Capability RV32I only; Sm is a schema shim
+  that carries MXLEN = 32.
+implemented_extensions:
+  - { name: I, version: "= 2.1" }
+  # Schema shim, not a capability: see the header.
+  - { name: Sm, version: "= 1.12.0" }
+
+params:
+  # The only Sm parameter ACT4 uses: the XLEN of the tests.
+  MXLEN: 32
+  # Required by the schema once Sm is declared. SystemScope has none of these
+  # mechanisms; each takes the least-claiming value the schema accepts.
+  PRECISE_SYNCHRONOUS_EXCEPTIONS: true
+  TRAP_ON_ECALL_FROM_M: true
+  TRAP_ON_EBREAK: true
+  MARCHID_IMPLEMENTED: false
+  MIMPID_IMPLEMENTED: false
+  VENDOR_ID_BANK: 0x0
+  VENDOR_ID_OFFSET: 0x0
+  MISALIGNED_LDST: false
+  MISALIGNED_LDST_EXCEPTION_PRIORITY: high
+  TRAP_ON_ILLEGAL_WLRL: false
+  TRAP_ON_UNIMPLEMENTED_INSTRUCTION: true
+  TRAP_ON_RESERVED_INSTRUCTION: true
+  TRAP_ON_UNIMPLEMENTED_CSR: true
+  REPORT_VA_IN_MTVAL_ON_BREAKPOINT: true
+  REPORT_VA_IN_MTVAL_ON_LOAD_MISALIGNED: true
+  REPORT_VA_IN_MTVAL_ON_STORE_AMO_MISALIGNED: true
+  REPORT_VA_IN_MTVAL_ON_INSTRUCTION_MISALIGNED: true
+  REPORT_VA_IN_MTVAL_ON_LOAD_ACCESS_FAULT: true
+  REPORT_VA_IN_MTVAL_ON_STORE_AMO_ACCESS_FAULT: true
+  REPORT_VA_IN_MTVAL_ON_INSTRUCTION_ACCESS_FAULT: true
+  REPORT_ENCODING_IN_MTVAL_ON_ILLEGAL_INSTRUCTION: true
+  MTVAL_WIDTH: 32
+  CONFIG_PTR_ADDRESS: 0
+  PMA_GRANULARITY: 3
+  PHYS_ADDR_WIDTH: 32
+  M_MODE_ENDIANNESS: little
+  MISA_CSR_IMPLEMENTED: false
+  MTVEC_ACCESS: rw
+  MTVEC_MODES: [0]
+  MTVEC_BASE_ALIGNMENT_DIRECT: 4
+  MTVEC_ILLEGAL_WRITE_BEHAVIOR: retain
+  HPM_COUNTER_EN: [false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false]
+  MCOUNTINHIBIT_IMPLEMENTED: false
+  NUM_PMP_ENTRIES: 0
+  MCOUNTENABLE_EN: [false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false]
