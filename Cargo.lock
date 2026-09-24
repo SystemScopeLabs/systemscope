@@ -490,6 +490,7 @@ dependencies = [
  "blake3",
  "serde_json",
  "systemscope-elf",
+ "systemscope-rv32i",
 ]
 
 [[package]]

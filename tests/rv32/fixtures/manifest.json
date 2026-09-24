@@ -1,0 +1,409 @@
+{
+  "schema": 1,
+  "riscv_tests": {
+    "repository": "https://github.com/riscv-software-src/riscv-tests.git",
+    "commit": "793a5ff2d99a6d9fbd91e84c34b9a0437e313b88",
+    "env_commit": "6de71edb142be36319e380ce782c3d1830c65d68"
+  },
+  "toolchain": {
+    "distro": "Ubuntu 24.04 (noble)",
+    "packages": [
+      {
+        "name": "gcc-riscv64-unknown-elf",
+        "version": "13.2.0-11ubuntu1+12",
+        "deb_sha256": "47d4670801c391c65513e2002a19280c6bbdba158f5a467ac5100bff813de0e3",
+        "version_line": "riscv64-unknown-elf-gcc (13.2.0-11ubuntu1+12) 13.2.0"
+      },
+      {
+        "name": "binutils-riscv64-unknown-elf",
+        "version": "2.42-1ubuntu1+6",
+        "deb_sha256": "d42d42efdaa0563155d0e1263675852255b20864cc525db9265247a5dec2ce30",
+        "version_line": "GNU assembler (2.42-1ubuntu1+6) 2.42"
+      }
+    ]
+  },
+  "flags": [
+    "-march=rv32i",
+    "-mabi=ilp32",
+    "-static",
+    "-mcmodel=medany",
+    "-fvisibility=hidden",
+    "-nostdlib",
+    "-nostartfiles",
+    "-Wl,--build-id=none"
+  ],
+  "ram": { "base": "0x80000000", "size": "0x01000000" },
+  "inputs": [
+    { "path": "tests/rv32/build-fixtures.sh", "blake3": "e0f96e1674a96ebdeca4fe99306d12674ae13518df130a4f94d4dd5991cdce94" },
+    { "path": "tests/rv32/env/LICENSE.riscv-test-env", "blake3": "45c7921da19cd12bd59ed3cab7bf0860727debf292f9624544964f14191be844" },
+    { "path": "tests/rv32/env/linker.ld", "blake3": "1747fc515d091319e0ba703d5800f11d745bf9f722f9a00f88996fcd4d534032" },
+    { "path": "tests/rv32/env/riscv_test.h", "blake3": "8ea148e1343dbdadf0050f15a3031c3ec29315e3bcbb419eca242bbeeefdc631" },
+    { "path": "tests/rv32/fixtures/LICENSE.riscv-tests", "blake3": "45c7921da19cd12bd59ed3cab7bf0860727debf292f9624544964f14191be844" }
+  ],
+  "selected": [
+    {
+      "name": "add",
+      "source": "isa/rv32ui/add.S",
+      "body": "isa/rv64ui/add.S",
+      "elf": "rv32ui-add.elf",
+      "blake3": "3f4d3526c4a8a93b70ca379a59ab21b097825907fbaf1e1136eda32fd057093d",
+      "image_hash": "3f4d3526c4a8a93b70ca379a59ab21b097825907fbaf1e1136eda32fd057093d",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "addi",
+      "source": "isa/rv32ui/addi.S",
+      "body": "isa/rv64ui/addi.S",
+      "elf": "rv32ui-addi.elf",
+      "blake3": "561c960eed3195a3b6602b358c2deb2c10d443235ac3e2134820ba2438359737",
+      "image_hash": "561c960eed3195a3b6602b358c2deb2c10d443235ac3e2134820ba2438359737",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "and",
+      "source": "isa/rv32ui/and.S",
+      "body": "isa/rv64ui/and.S",
+      "elf": "rv32ui-and.elf",
+      "blake3": "185293b2b1e649ece8dd43edd8401e5c0c6510bf598b636b149a4bbdcaa08d93",
+      "image_hash": "185293b2b1e649ece8dd43edd8401e5c0c6510bf598b636b149a4bbdcaa08d93",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "andi",
+      "source": "isa/rv32ui/andi.S",
+      "body": "isa/rv64ui/andi.S",
+      "elf": "rv32ui-andi.elf",
+      "blake3": "9a033cba00b485f1fec964d71f504155ad2dfeee5ad1579f29e84b06442dbd61",
+      "image_hash": "9a033cba00b485f1fec964d71f504155ad2dfeee5ad1579f29e84b06442dbd61",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "auipc",
+      "source": "isa/rv32ui/auipc.S",
+      "body": "isa/rv64ui/auipc.S",
+      "elf": "rv32ui-auipc.elf",
+      "blake3": "7fdf1242e0decd45309f5bf0723937507a4eaef7d6d626e4ec9b24dfa343fe5c",
+      "image_hash": "7fdf1242e0decd45309f5bf0723937507a4eaef7d6d626e4ec9b24dfa343fe5c",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "beq",
+      "source": "isa/rv32ui/beq.S",
+      "body": "isa/rv64ui/beq.S",
+      "elf": "rv32ui-beq.elf",
+      "blake3": "28fa2436edb0212a59e412c40f98f59136f51565197a915b48d02beeefbde7de",
+      "image_hash": "28fa2436edb0212a59e412c40f98f59136f51565197a915b48d02beeefbde7de",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "bge",
+      "source": "isa/rv32ui/bge.S",
+      "body": "isa/rv64ui/bge.S",
+      "elf": "rv32ui-bge.elf",
+      "blake3": "5338086245e91fe1f285bd8287cfbcfa7ac24fe9d245559342e9aa4888df1c1f",
+      "image_hash": "5338086245e91fe1f285bd8287cfbcfa7ac24fe9d245559342e9aa4888df1c1f",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "bgeu",
+      "source": "isa/rv32ui/bgeu.S",
+      "body": "isa/rv64ui/bgeu.S",
+      "elf": "rv32ui-bgeu.elf",
+      "blake3": "336ced9080087298df4ef23c8b3dfcc8980c1bc587c15ebc32d46b31eabdc27d",
+      "image_hash": "336ced9080087298df4ef23c8b3dfcc8980c1bc587c15ebc32d46b31eabdc27d",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "blt",
+      "source": "isa/rv32ui/blt.S",
+      "body": "isa/rv64ui/blt.S",
+      "elf": "rv32ui-blt.elf",
+      "blake3": "e09c9b94ff51e8ad0bbbfacc8f5915d944c52632d812c3765f778d9ea7f7a945",
+      "image_hash": "e09c9b94ff51e8ad0bbbfacc8f5915d944c52632d812c3765f778d9ea7f7a945",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "bltu",
+      "source": "isa/rv32ui/bltu.S",
+      "body": "isa/rv64ui/bltu.S",
+      "elf": "rv32ui-bltu.elf",
+      "blake3": "67c4713a9e3ecd8559121b7b1040ee7f13cfe2895834d69295990f7df661de3b",
+      "image_hash": "67c4713a9e3ecd8559121b7b1040ee7f13cfe2895834d69295990f7df661de3b",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "bne",
+      "source": "isa/rv32ui/bne.S",
+      "body": "isa/rv64ui/bne.S",
+      "elf": "rv32ui-bne.elf",
+      "blake3": "c47be961bb68a2cbb229499ea201fb1c5579edb16ff40635a355cc3e62daadcf",
+      "image_hash": "c47be961bb68a2cbb229499ea201fb1c5579edb16ff40635a355cc3e62daadcf",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "jal",
+      "source": "isa/rv32ui/jal.S",
+      "body": "isa/rv64ui/jal.S",
+      "elf": "rv32ui-jal.elf",
+      "blake3": "83fc5517861597224cf01bedc4912eb4704e8f4d924c28bc0515b7e6eb9fe626",
+      "image_hash": "83fc5517861597224cf01bedc4912eb4704e8f4d924c28bc0515b7e6eb9fe626",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "jalr",
+      "source": "isa/rv32ui/jalr.S",
+      "body": "isa/rv64ui/jalr.S",
+      "elf": "rv32ui-jalr.elf",
+      "blake3": "db74d9f0b15db96f1a7a4007000bb7c641eb9ed28d67cd3060d4abcf14e34922",
+      "image_hash": "db74d9f0b15db96f1a7a4007000bb7c641eb9ed28d67cd3060d4abcf14e34922",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "lb",
+      "source": "isa/rv32ui/lb.S",
+      "body": "isa/rv64ui/lb.S",
+      "elf": "rv32ui-lb.elf",
+      "blake3": "112398b2180d5ec531f9da8a889858e41563001971f41f9ce388bb24e03cb343",
+      "image_hash": "112398b2180d5ec531f9da8a889858e41563001971f41f9ce388bb24e03cb343",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "lbu",
+      "source": "isa/rv32ui/lbu.S",
+      "body": "isa/rv64ui/lbu.S",
+      "elf": "rv32ui-lbu.elf",
+      "blake3": "fd229558766d2b49d276482ca61d40a53dff3c71c7b4b6ab21dadbe9a392a71b",
+      "image_hash": "fd229558766d2b49d276482ca61d40a53dff3c71c7b4b6ab21dadbe9a392a71b",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "ld_st",
+      "source": "isa/rv32ui/ld_st.S",
+      "body": "isa/rv64ui/ld_st.S",
+      "elf": "rv32ui-ld_st.elf",
+      "blake3": "aa5b5b2a853ca2b0c9b4518a2d68c0b30975d9a21a3a80425e35f1b3caee2ecd",
+      "image_hash": "aa5b5b2a853ca2b0c9b4518a2d68c0b30975d9a21a3a80425e35f1b3caee2ecd",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "lh",
+      "source": "isa/rv32ui/lh.S",
+      "body": "isa/rv64ui/lh.S",
+      "elf": "rv32ui-lh.elf",
+      "blake3": "43a65804003b2bed7baf09d35a294ea16b011107876cfad282ccd487bb49422e",
+      "image_hash": "43a65804003b2bed7baf09d35a294ea16b011107876cfad282ccd487bb49422e",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "lhu",
+      "source": "isa/rv32ui/lhu.S",
+      "body": "isa/rv64ui/lhu.S",
+      "elf": "rv32ui-lhu.elf",
+      "blake3": "f573b0208803583dbbaae48240ae7a9fd3dec8678d5cca608fead754515b4b63",
+      "image_hash": "f573b0208803583dbbaae48240ae7a9fd3dec8678d5cca608fead754515b4b63",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "lui",
+      "source": "isa/rv32ui/lui.S",
+      "body": "isa/rv64ui/lui.S",
+      "elf": "rv32ui-lui.elf",
+      "blake3": "240225608adfb4a39063162f1ea481843d39909436cbd583ff86182a5f40ee4a",
+      "image_hash": "240225608adfb4a39063162f1ea481843d39909436cbd583ff86182a5f40ee4a",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "lw",
+      "source": "isa/rv32ui/lw.S",
+      "body": "isa/rv64ui/lw.S",
+      "elf": "rv32ui-lw.elf",
+      "blake3": "88858ffa73e059b542434637459a9f68a816b9cf127ff3dd1d88bfe434e66234",
+      "image_hash": "88858ffa73e059b542434637459a9f68a816b9cf127ff3dd1d88bfe434e66234",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "or",
+      "source": "isa/rv32ui/or.S",
+      "body": "isa/rv64ui/or.S",
+      "elf": "rv32ui-or.elf",
+      "blake3": "e57847682df678c827ceba089cc05120415d5dfa76073b9110d882435014818f",
+      "image_hash": "e57847682df678c827ceba089cc05120415d5dfa76073b9110d882435014818f",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "ori",
+      "source": "isa/rv32ui/ori.S",
+      "body": "isa/rv64ui/ori.S",
+      "elf": "rv32ui-ori.elf",
+      "blake3": "66c45958e47cb99789d9165b7bd16fcbb04408237da9b88c6eee6e9a2e6adc71",
+      "image_hash": "66c45958e47cb99789d9165b7bd16fcbb04408237da9b88c6eee6e9a2e6adc71",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "sb",
+      "source": "isa/rv32ui/sb.S",
+      "body": "isa/rv64ui/sb.S",
+      "elf": "rv32ui-sb.elf",
+      "blake3": "cb924164d1721fa3e62e7b5ae95f54574322df048378fbd2a2dd09ae2a67b11a",
+      "image_hash": "cb924164d1721fa3e62e7b5ae95f54574322df048378fbd2a2dd09ae2a67b11a",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "sh",
+      "source": "isa/rv32ui/sh.S",
+      "body": "isa/rv64ui/sh.S",
+      "elf": "rv32ui-sh.elf",
+      "blake3": "057c8efbd8647dce5b8b9fbd3f48aa9d021cc5a556fd0a492ed0e10708666a54",
+      "image_hash": "057c8efbd8647dce5b8b9fbd3f48aa9d021cc5a556fd0a492ed0e10708666a54",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "simple",
+      "source": "isa/rv32ui/simple.S",
+      "body": "isa/rv64ui/simple.S",
+      "elf": "rv32ui-simple.elf",
+      "blake3": "2d906cc09a516d27544ed07ce46b583555daf4a2fb1757da8b8ec670bd33e4ba",
+      "image_hash": "2d906cc09a516d27544ed07ce46b583555daf4a2fb1757da8b8ec670bd33e4ba",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "sll",
+      "source": "isa/rv32ui/sll.S",
+      "body": "isa/rv64ui/sll.S",
+      "elf": "rv32ui-sll.elf",
+      "blake3": "e1ae928ec9157d3760ae3f2d09ad78529f5f0158080c305754d80c7a19452a83",
+      "image_hash": "e1ae928ec9157d3760ae3f2d09ad78529f5f0158080c305754d80c7a19452a83",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "slli",
+      "source": "isa/rv32ui/slli.S",
+      "body": "isa/rv64ui/slli.S",
+      "elf": "rv32ui-slli.elf",
+      "blake3": "be04e38744c574ef5b161560f4efb9c4abe7a62af0d510f2f2c0c857ccd36206",
+      "image_hash": "be04e38744c574ef5b161560f4efb9c4abe7a62af0d510f2f2c0c857ccd36206",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "slt",
+      "source": "isa/rv32ui/slt.S",
+      "body": "isa/rv64ui/slt.S",
+      "elf": "rv32ui-slt.elf",
+      "blake3": "2981ba534481c84f1f45d50c6fe6f6b4ee201ab2a3c9fcf19cd48faa23226284",
+      "image_hash": "2981ba534481c84f1f45d50c6fe6f6b4ee201ab2a3c9fcf19cd48faa23226284",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "slti",
+      "source": "isa/rv32ui/slti.S",
+      "body": "isa/rv64ui/slti.S",
+      "elf": "rv32ui-slti.elf",
+      "blake3": "03cad1961b289c1c858e41862528345bc4ba532353ac9d9b4b1bd1c088ff0435",
+      "image_hash": "03cad1961b289c1c858e41862528345bc4ba532353ac9d9b4b1bd1c088ff0435",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "sltiu",
+      "source": "isa/rv32ui/sltiu.S",
+      "body": "isa/rv64ui/sltiu.S",
+      "elf": "rv32ui-sltiu.elf",
+      "blake3": "1306f6a4c8e8d5e75ced85b96e753d74163e829294b5dab402fd1f4d13e59ba2",
+      "image_hash": "1306f6a4c8e8d5e75ced85b96e753d74163e829294b5dab402fd1f4d13e59ba2",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "sltu",
+      "source": "isa/rv32ui/sltu.S",
+      "body": "isa/rv64ui/sltu.S",
+      "elf": "rv32ui-sltu.elf",
+      "blake3": "f581a365f34ff9c5b24bba3952ae7485df054b309ad9dfeafbe4e4145cc31109",
+      "image_hash": "f581a365f34ff9c5b24bba3952ae7485df054b309ad9dfeafbe4e4145cc31109",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "sra",
+      "source": "isa/rv32ui/sra.S",
+      "body": "isa/rv64ui/sra.S",
+      "elf": "rv32ui-sra.elf",
+      "blake3": "665d3a2a01b5ef0025589efaf2ef6c1291c1ec0b088eb600750502ca1a1cd408",
+      "image_hash": "665d3a2a01b5ef0025589efaf2ef6c1291c1ec0b088eb600750502ca1a1cd408",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "srai",
+      "source": "isa/rv32ui/srai.S",
+      "body": "isa/rv64ui/srai.S",
+      "elf": "rv32ui-srai.elf",
+      "blake3": "c16dbf98276865c716e360763f4758f82e1df680b14a24df0634d5a373dad97e",
+      "image_hash": "c16dbf98276865c716e360763f4758f82e1df680b14a24df0634d5a373dad97e",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "srl",
+      "source": "isa/rv32ui/srl.S",
+      "body": "isa/rv64ui/srl.S",
+      "elf": "rv32ui-srl.elf",
+      "blake3": "c4a9d0ddaa462f821efbd4664f6663559ad80383e3786167cc86b2feba435ba0",
+      "image_hash": "c4a9d0ddaa462f821efbd4664f6663559ad80383e3786167cc86b2feba435ba0",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "srli",
+      "source": "isa/rv32ui/srli.S",
+      "body": "isa/rv64ui/srli.S",
+      "elf": "rv32ui-srli.elf",
+      "blake3": "584fffb8eb1d5598b992cbb167e219e8555d4a3cb3eecd2a953772603d57bede",
+      "image_hash": "584fffb8eb1d5598b992cbb167e219e8555d4a3cb3eecd2a953772603d57bede",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "st_ld",
+      "source": "isa/rv32ui/st_ld.S",
+      "body": "isa/rv64ui/st_ld.S",
+      "elf": "rv32ui-st_ld.elf",
+      "blake3": "3a328f1ed74487f0aa8d4384190aec3f5e57a6ccbf6a344dd6cf42b7c9af4287",
+      "image_hash": "3a328f1ed74487f0aa8d4384190aec3f5e57a6ccbf6a344dd6cf42b7c9af4287",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "sub",
+      "source": "isa/rv32ui/sub.S",
+      "body": "isa/rv64ui/sub.S",
+      "elf": "rv32ui-sub.elf",
+      "blake3": "9649c8a7783e2ec0dd50a7730752b24a30549af05523dbb701f5e2bbf291242e",
+      "image_hash": "9649c8a7783e2ec0dd50a7730752b24a30549af05523dbb701f5e2bbf291242e",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "sw",
+      "source": "isa/rv32ui/sw.S",
+      "body": "isa/rv64ui/sw.S",
+      "elf": "rv32ui-sw.elf",
+      "blake3": "10c4a239a545b37faf4f274dcaaa2a52b0cf55a0eda95f279f8c53e6f544b62a",
+      "image_hash": "10c4a239a545b37faf4f274dcaaa2a52b0cf55a0eda95f279f8c53e6f544b62a",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "xor",
+      "source": "isa/rv32ui/xor.S",
+      "body": "isa/rv64ui/xor.S",
+      "elf": "rv32ui-xor.elf",
+      "blake3": "96fa124214a76050e09cbdcdec53d575ee3a363862d6ef770ed2a84a9526f717",
+      "image_hash": "96fa124214a76050e09cbdcdec53d575ee3a363862d6ef770ed2a84a9526f717",
+      "entry": "0x80000000"
+    },
+    {
+      "name": "xori",
+      "source": "isa/rv32ui/xori.S",
+      "body": "isa/rv64ui/xori.S",
+      "elf": "rv32ui-xori.elf",
+      "blake3": "33547a5c33f456db84a21412d7347420ebd3131b3db3035329c319df578343ae",
+      "image_hash": "33547a5c33f456db84a21412d7347420ebd3131b3db3035329c319df578343ae",
+      "entry": "0x80000000"
+    }
+  ],
+  "excluded": [
+    { "name": "fence_i", "reason": "needs Zifencei (FENCE.I), which M1 does not implement" },
+    { "name": "ma_data", "reason": "requires misaligned loads and stores to return data; SystemScope traps on them (§6)" }
+  ]
+}
