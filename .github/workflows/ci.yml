@@ -97,6 +97,14 @@ jobs:
         run: cargo nextest run -p systemscope-rv32 --locked --profile ci --no-fail-fast --lib --test rv32ui --test fixtures
       - name: M1-A5 hello.elf through the CPU and SimpleUart (output, checkpoints)
         run: cargo nextest run -p systemscope-rv32 --locked --profile ci --no-fail-fast --test hello
+      # docs/m1-design.md §10.4: the committed ACT4 corpus, generated with Sail on Linux by
+      # the act4 job, run from the same bytes on both operating systems.
+      - name: ACT4 corpus matches its manifest (pins, config, audit)
+        run: cargo xtask act4 verify
+      - name: M1-A4 ACT4 RV32I (Sail-generated, self-checking)
+        run: cargo nextest run -p systemscope-rv32 --locked --profile ci --no-fail-fast --test act4
+      - name: M1-A4 ACT4 RV32I summary
+        run: cargo xtask act4 run
       # docs/m1-design.md §10.1: the M1 acceptance tests on m1-reference. Both operating
       # systems check the same committed golden file and portable snapshot.
       - name: M1-A6 snapshot/restore (named checkpoints, portable snapshot, rejections)
@@ -107,9 +115,9 @@ jobs:
         run: cargo nextest run -p systemscope-acceptance --locked --profile ci --no-fail-fast --test m1_a8
       - name: M1 golden verify
         run: cargo xtask m1-golden verify
-      - name: rv32ui fixtures and hello.elf unchanged
+      - name: rv32ui fixtures, hello.elf, and the ACT4 corpus unchanged
         shell: bash
-        run: git diff --exit-code -- tests/rv32/fixtures tests/rv32/hello
+        run: git diff --exit-code -- tests/rv32/fixtures tests/rv32/hello tests/act4
       # Only `cargo xtask bless` writes golden files; a test that wrote one would show here.
       - name: Golden files unchanged
         shell: bash
@@ -247,4 +255,60 @@ jobs:
         with:
           name: spike-logs
           path: systemscope/target/spike-logs
+          if-no-files-found: ignore
+
+  # docs/m1-design.md §10.4, M1-A4: generates the ACT4 RV32I corpus twice from the pinned
+  # ACT4, Sail, and GCC at the canonical path, requires the two generations to be
+  # byte-identical and to reproduce the committed ELFs and manifest, then runs the corpus.
+  # The only job that runs ACT4 or Sail. The build script checks every download, binary,
+  # and version against the pins on every run, cached or not.
+  act4:
+    name: ACT4/Sail external validation (Ubuntu)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: systemscope
+      # systemscope depends on `../contracts` by path (plan.md §10), so reproduce the
+      # sibling layout, with contracts pinned to a pushed revision (bump it deliberately).
+      - uses: actions/checkout@v4
+        with:
+          repository: SystemScopeLabs/contracts
+          ref: 4d6e912a7ccffb676d0f95ff523c553fe3048c47
+          path: contracts
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: systemscope
+      - uses: actions/cache@v4
+        with:
+          path: ~/act4-cache
+          key: act4-${{ runner.os }}-${{ hashFiles('systemscope/tests/act4/build-act4.sh') }}
+      - name: Generate the corpus (A)
+        run: bash tests/act4/build-act4.sh ~/act4-cache target/act4/gen-a
+      - name: Generate the corpus again from scratch (B)
+        run: bash tests/act4/build-act4.sh ~/act4-cache target/act4/gen-b
+      - name: Generations A and B are byte-identical
+        run: |
+          diff -r target/act4/gen-a target/act4/gen-b
+          test -z "$(find target/act4/gen-a/elfs -type f ! -perm 0644)"
+      - name: The generations reproduce the committed ELFs and manifest
+        run: |
+          cargo xtask act4 check target/act4/gen-a
+          cargo xtask act4 check target/act4/gen-b
+      - name: M1-A4 ACT4 RV32I on m1-reference
+        run: cargo xtask act4 run
+      - name: Committed files unchanged
+        run: |
+          git diff --exit-code
+          test -z "$(git status --porcelain)"
+      - name: Keep the generation
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: act4-generation
+          path: |
+            systemscope/target/act4
+            /tmp/systemscope-act4/make.log
           if-no-files-found: ignore
