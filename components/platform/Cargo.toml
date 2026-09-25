@@ -1,6 +1,6 @@
 [package]
 name = "systemscope-platform"
-description = "Platform components for SystemScope: address bus, multi-master bus, sparse RAM, a simple UART, a simple IRQ controller, and a simple block media"
+description = "Platform components for SystemScope: address bus, multi-master bus, sparse RAM, a simple UART, a simple IRQ controller, a simple block media, and a block DMA controller"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

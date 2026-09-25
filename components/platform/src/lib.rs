@@ -10,11 +10,14 @@
 //! aggregator of `irq.v0` lines with a `PENDING` and an `ENABLE` register, and
 //! [`MultiMasterBus`] (`docs/m2-design.md` §10), which arbitrates several initiators onto
 //! the same kind of memory map. `AddressBus` stays the M1 interconnect, unchanged.
-//! [`SimpleBlockMedia`] (`docs/m2-design.md` §8.2) is a sparse `block.v0` disk.
+//! [`SimpleBlockMedia`] (`docs/m2-design.md` §8.2) is a sparse `block.v0` disk, and
+//! [`DmaBlockController`] (`docs/m2-design.md` §9) is the control plane of a block DMA
+//! controller: its registers, lifecycle, validation, and interrupt line.
 //!
 //! Like the M0 toy components, they depend only on `systemscope-contracts`.
 
 pub mod bus;
+pub mod dma;
 pub mod irqc;
 pub mod media;
 pub mod mmbus;
@@ -22,6 +25,7 @@ pub mod ram;
 pub mod uart;
 
 pub use bus::{AddressBus, BusConfigError, Region};
+pub use dma::{DmaBlockController, DmaBlockControllerConfig, DmaBlockControllerConfigError};
 pub use irqc::{IrqControllerConfig, IrqControllerConfigError, SimpleIrqController};
 pub use media::{BlockMediaConfig, BlockMediaConfigError, MediaImage, SimpleBlockMedia};
 pub use mmbus::{MultiMasterBus, MultiMasterBusConfig, MultiMasterBusConfigError};
