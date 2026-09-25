@@ -1,8 +1,8 @@
 # M3 Design: Modeled OS Backend
 
-> Status: Design draft (M3.0), review 1 applied; frozen once §19.1 is accepted · Parent: [plan.md](../plan.md) · Builds on: [m2-design.md](m2-design.md), [m1-design.md](m1-design.md), [m0-design.md](m0-design.md)
+> Status: Design frozen (M3.0) · Parent: [plan.md](../plan.md) · Builds on: [m2-design.md](m2-design.md), [m1-design.md](m1-design.md), [m0-design.md](m0-design.md)
 
-This document is the architecture contract for M3. It fixes the decisions the M3 implementation steps (§17) depend on, and lists the ones that still need a decision before M3.1 starts (§19.1). Nothing in it is implemented yet: M3.0 changes documentation only. The M2 reference platform is frozen, and nothing here changes it.
+This document is the architecture contract for M3. It fixes the decisions the M3 implementation steps (§17) depend on. §19.1 records the design choices accepted at the freeze and the alternatives considered. Nothing in it is implemented yet: M3.0 changes documentation only. The M2 reference platform is frozen, and nothing here changes it.
 
 ---
 
@@ -86,9 +86,9 @@ M3 does **not** include, and nothing in this document may be read as promising:
 
 ---
 
-## 3. Decisions Fixed at M3.0
+## 3. M3.0 Design Decisions
 
-Decisions marked **(R)** are this draft's recommendation and are also listed in §19.1. They become fixed only when the draft is accepted; the rest follow from plan.md and the M2 freeze.
+Decisions marked **(R)** were settled in the M3.0 review and accepted at the freeze; §19.1 records the alternatives considered for each. The rest follow from plan.md and the M2 freeze.
 
 | Topic | Decision | Section |
 |---|---|---|
@@ -103,7 +103,7 @@ Decisions marked **(R)** are this draft's recommendation and are also listed in 
 | TLB **(R)** | None at F2: every translated access walks; `SFENCE.VMA` is a legal no-op in S and M | §5.4 |
 | Walk transport | Each PTE read is a `mem.v1` `ReadReq { len: 4 }` on the CPU's `mem` port, one outstanding, scheduled like a data access | §5.4 |
 | Exception priority | M1's order is kept: alignment is checked before translation, translation before the access; confirmed against the specification text and Spike at M3.3 before it is relied on | §5.3 |
-| M6 CPU contract | The `M3` profile is the CPU a native tiny kernel must run on at M6 (plan.md §11); nothing a native kernel needs for the M3 scenario may be deferred to a later CPU change | §5, §16 |
+| M6 CPU contract | The `M3` profile defines the architectural surface intended for the M6 native backend scenario (plan.md §11); nothing a native kernel needs for the M3 scenario may be deferred to a later CPU change. M3 does not prove M6 correctness (§16 risk 4) | §5, §16 |
 | Storage | The M2 `SimpleBlockMedia` and `DmaBlockController`, unchanged; the kernel programs them over MMIO as bus master 2 | §8 |
 | DMA wait **(R)** | The kernel polls `STATUS` and keeps `IRQ_ENABLE = 0`; device interrupts are not used by the modeled kernel | §8.2 |
 | Disk layout **(R)** | Executable table at LBA 0 (`SSX0`), up to 8 entries, each a contiguous ELF file | §8.1 |
@@ -211,7 +211,7 @@ A pure function `sv32_translate(satp, priv, sum, mxr, access, va, read_pte) -> R
 | 13 | `LoadPageFault` (`tval` = VA) | yes |
 | 15 | `StorePageFault` (`tval` = VA) | yes |
 
-**Order within one access**, keeping M1's order. This draft's reading is that the privileged specification lets address-misaligned exceptions take either priority relative to page and access faults. M3.3 confirms that reading against the specification text and the pinned Spike before implementing it, and records the result in the Spike appendix (§15.3):
+**Order within one access**, keeping M1's order. This design's reading is that the privileged specification lets address-misaligned exceptions take either priority relative to page and access faults. M3.3 confirms that reading against the specification text and the pinned Spike before implementing it, and records the result in the Spike appendix (§15.3):
 
 1. alignment;
 2. translation (page fault);
@@ -722,11 +722,16 @@ A run passes only if:
 | Kernel core | the pure kernel oracle over an in-memory RAM/disk model | boot, create, yield, exit, fault kill, frame accounting, every syscall and error | M3.4b, M3.5 |
 | Kernel walk | the CPU's `sv32_translate` | random address spaces, the kernel's user-copy walk vs the oracle | M3.5 |
 | End to end | §12.3 | the M3 scenario on `m3-reference` | M3.6 |
-| M6 feasibility | §16 risk 4 | a small native S-mode kernel (assembly, §5 only) runs `hello` from the M3 disk image to its expected output on the unchanged `M3` profile | M3.6 |
+| M6 feasibility (optional, non-blocking) | §16 risk 4 | if executed: a small native S-mode kernel (assembly, §5 only) runs `hello` from the M3 disk image to its expected output on the unchanged `M3` profile | M3.6 or later |
 | Snapshot/restore | resume equivalence | every event, the §9.2 stress points, the portable snapshot | M3.7 |
 | Observation invariance | M0 O0–O5 | on `m3-reference` | M3.7 |
 | Golden | `tests/golden/m3-reference.json` | Linux and Windows, cross-OS | M3.7 |
 | M0/M1/M2 regressions | §15.5 | every step | all |
+
+**The M6 feasibility check is a non-blocking architectural validation. It is not required to complete the M3 backend acceptance.** It checks one thing: whether the M3 CPU contract (§5) exposes the architectural surface a native backend needs. It is not an M3 acceptance gate. A failure is classified before anything changes:
+
+- **The native kernel is incomplete or wrong:** this is M6 work. M3 is unaffected.
+- **The `M3` profile lacks something the M3 scenario needs from a native kernel:** this is an M3 design issue. It is recorded in this document and resolved under §16 risk 4.
 
 ### 15.2 Syscall Trace Check
 
@@ -767,10 +772,11 @@ Every M3 step must keep all of these passing, unchanged:
 3. **Walk traffic without a TLB.** Every U-mode fetch costs two extra round trips, roughly tripling events per instruction. That affects trace volume, run time, and snapshot queue size.
    - It is accepted at F2.
    - A TLB is an F3 decision. It must keep `SFENCE.VMA` semantics exact, and it changes digests, so it would be a new profile or backend, never an edit to the `M3` profile.
-4. **Partial privileged architecture versus M6.** M-mode synchronous traps halt, and several CSRs are missing. plan.md §11 requires M6's C/assembly tiny kernel to run the M3 scenario "with no changes to CPU code", so the `M3` profile **is** the M6 CPU contract.
+4. **Partial privileged architecture versus M6.** M-mode synchronous traps halt, and several CSRs are missing. plan.md §11 requires M6's C/assembly tiny kernel to run the M3 scenario "with no changes to CPU code". The `M3` profile therefore defines the architectural surface intended for the M6 native backend scenario. This does not mean that M6 implementation correctness is proven by M3. The optional feasibility check only validates that the declared surface is sufficient for a minimal native kernel.
    - A native kernel for the M3 scenario needs S-mode, `medeleg`, `stvec`/`sepc`/`scause`/`stval`/`sscratch`/`satp`, Sv32, `SRET`, and the SBI shutdown halt (§7.4). All of these are in §5, and none needs `misa`, `mhartid`, counters, or a timer.
    - A kernel that wants more, such as a Linux-class kernel, preemption, or SBI services beyond `SRST`, is outside the M3 scenario. It would be a new CPU profile and a new scenario, never a change to `M3`.
-   - M3.6 checks this with a small native S-mode kernel written in assembly. It uses only §5, implements `write`, `getpid`, and `exit` and runs `hello` (entry 0) from the same disk image, and runs with the same CPU profile (§15.1). It is a feasibility check, not the M6 backend.
+   - This can be checked as an optional validation, at M3.6 or later, to confirm M6 readiness. A small native S-mode kernel written in assembly uses only §5, implements `write`, `getpid`, and `exit`, and runs `hello` (entry 0) from the same disk image on the same CPU profile (§15.1).
+   - It is separate from M3 acceptance: M3 completes without it (§18). **M6 feasibility validation does not require implementing the M6 backend. It only verifies that the M3 CPU contract exposes the required architectural surface.**
    - The wording of §2.2 and §15.4 must stay precise.
 5. **Spike divergence on WARL and A/D.** Where Spike's choices differ from §5, directed tests could be tempted to match Spike silently. Measure first (§15.3) and record every divergence in this document.
 6. **Snapshot growth.** Page-table and stack frames add RAM pages, and the kernel adds a 384-byte frame bitmap. The disk is 256 blocks, but only its non-zero blocks are stored. Sizes are measured at M3.7 and recorded, as in m2-design §13.3.
@@ -782,14 +788,14 @@ Every M3 step must keep all of these passing, unchanged:
 
 | Step | Content | Merge unit | Exit criteria |
 |---|---|---|---|
-| **M3.0** | This design | docs only | Draft reviewed; §19.1 decisions accepted or changed; status set to "Design frozen" |
+| **M3.0** | This design | docs only | Design reviewed; §19.1 decisions accepted; status set to "Design frozen" |
 | **M3.1** | ELF user-image loader and executable table: `parse_user_elf32`, table validation, pure mapping plan (segments → pages + perms) | `elf` | §8.1 and §8.3 rules each tested at their boundaries; property and arbitrary-byte tests; M1 loader tests unchanged; no runtime change |
 | **M3.2** | Privilege and trap boundary: `M3` profile, `priv`, the §5.1 CSRs and access rule, `MRET`/`SRET`, `medeleg` delivery, M3 cause names, MEI with modes, schema 3 (no walk yet; `satp` accepts only `MODE = Bare` until M3.3) | CPU | Spike-directed privilege tests pass; `take_mei` extended; 40 `rv32ui` + 39 ACT4 on M3; every-event snapshot of a mode-switching program; M1/M2 profiles and goldens unchanged |
 | **M3.3** | Sv32 MMU: `sv32.rs`, `satp` Sv32, walk states, permissions, A/D, page faults, `SFENCE.VMA`, walk snapshot | CPU | Spike-directed Sv32 tests; oracle property tests; resume from every event including mid-walk; regressions unchanged |
 | **M3.4a** | Kernel gate prototype: `systemscope-os` skeleton, `gate` and `mem` ports, held `ENTER`, the `Issue`/`Wait` state engine with a scripted operation (read the trap frame, write it back with `sepc + 4`, write one UART byte), schema 1 for that state, the access whitelist; the firmware stub and trampoline fixture; a three-master bus configuration | os + tests | On a minimal platform, a bare-metal U-mode loop of `ecall`s round-trips through the trampoline and the scripted gate with registers preserved; resume from every event, including every held-`ENTER` state; a kernel access to `kgate` faults the session before sending; no `rv32.exception` from S; regressions unchanged |
 | **M3.4b** | Process model: frame allocator, page-table builder, boot from the executable table through the block controller, user ELF mapping (M3.1), dispatch, sequential processes on `exit`, shutdown reasons | os + tests | A minimal platform boots two processes from a disk that `exit` in order; kernel oracle tests; frame accounting (all free after shutdown); every-event snapshot through boot, including DMA in flight |
 | **M3.5** | Syscall and output: the full §6.5 ABI, user-copy walk, `write` to UART, `sched_yield` context switch, errors, fault kill (§6.7) | os | Every syscall and error path by the kernel oracle and in the runtime; kernel walk vs `sv32_translate`; UART output exact |
-| **M3.6** | `m3-reference` and the M3 reference workload: the five programs, the disk fixture, manifests, expected output and syscall trace, the native-kernel feasibility check (§16 risk 4) | tests | §12.3 acceptance on Linux and Windows |
+| **M3.6** | `m3-reference` and the M3 reference workload: the five programs, the disk fixture, manifests, expected output and syscall trace; optionally, the non-blocking native-kernel feasibility check (§15.1, §16 risk 4) | tests | §12.3 acceptance on Linux and Windows |
 | **M3.7** | Snapshot stress (§9.2), observation invariance, `m3-reference.json` and `m3-reference.mid.snap`, cross-OS, CI | tests + CI | Golden blessed once; every stress point; M0/M1/M2 goldens byte-identical |
 | **M3.8** | Release documentation and exit audit | docs | §18 checked with evidence; tag and release left to the maintainer |
 
@@ -808,25 +814,27 @@ Each step follows the M1/M2 discipline: a feature branch, the full local gate, o
 - [ ] Every fixture (firmware, user programs, disk image) is pinned by a manifest.
 - [ ] Decisions and contract changes discovered during M3 are reflected back into this document.
 
+The M6 feasibility check (§15.1) is not an exit criterion. **The M6 feasibility check, if executed, is a validation of the CPU contract surface and is not a requirement to implement the M6 backend.**
+
 ---
 
-## 19. Open Questions
+## 19. Decisions and Open Questions
 
-### 19.1 Decisions Required Before M3.1
+### 19.1 Decisions Accepted at the M3.0 Freeze
 
-These are the **(R)** rows of §3. The draft recommends each one, and the implementation depends on them.
+These are the **(R)** rows of §3, accepted at the M3.0 freeze. Each entry records the chosen option and the alternatives considered. Reopening one is a change to this frozen design: it is made in this document first, before any implementation that depends on it.
 
-1. **Kernel realization.** Recommended: a Rust `ModeledKernel` behind a guest trampoline and a held `ENTER` store. The alternatives:
+1. **Kernel realization.** Chosen: a Rust `ModeledKernel` behind a guest trampoline and a held `ENTER` store. The alternatives:
    - a CPU-level trap protocol to the kernel: simpler, but it puts OS knowledge into the CPU and breaks the M6 no-CPU-change rule;
    - a kernel written as RV32 guest code: that is the M6 native backend, not a modeled one.
-2. **Kernel privilege.** Recommended: an S-mode kernel boundary with an M-mode boot stub. The alternative is M + U only, with no S-mode. It is smaller, but a native kernel at M6 would then need S-mode added to the CPU after all.
+2. **Kernel privilege.** Chosen: an S-mode kernel boundary with an M-mode boot stub. The alternative is M + U only, with no S-mode. It is smaller, but a native kernel at M6 would then need S-mode added to the CPU after all.
 3. **M-mode synchronous traps keep halting,** and the run ends with an SBI `SRST` `ecall` from S. The alternative is full M-mode delivery to `mtvec`, with an M-mode SBI firmware that then needs its own halt convention.
-4. **A/D policy.** Recommended: Svade (page fault). The alternative is hardware A/D update: the CPU would write PTEs, so walks would need writes.
+4. **A/D policy.** Chosen: Svade (page fault). The alternative is hardware A/D update: the CPU would write PTEs, so walks would need writes.
 5. **No TLB at F2.**
 6. **Disk layout:** the `SSX0` executable table. The alternative is a single executable at a fixed LBA, which is less general and makes multi-process runs impossible.
 7. **DMA completion by polling `STATUS`** rather than interrupts. The alternative is to route the controller's line to the kernel, which needs a new link or an IRQ fan-out that M2 does not have.
 8. **Syscall ABI:** the Linux RV32 asm-generic subset (write/exit/exit_group/sched_yield/getpid), so M6 user programs stay valid.
-9. **No timer or preemption in M3.** m2-design §19 recorded "timer interrupts … needed for preemption in M3". This draft moves them to a later milestone, keeping M3 to cooperative scheduling. Confirm or reverse; reversing adds a CLINT-like timer, `mtime`/`mtimecmp`, and S-level timer forwarding.
+9. **No timer or preemption in M3.** m2-design §19 recorded "timer interrupts … needed for preemption in M3". M3 moves them to a later milestone and keeps to cooperative scheduling, superseding that note. Adding them later means a CLINT-like timer, `mtime`/`mtimecmp`, and S-level timer forwarding, in a new profile and scenario (§16 risk 4).
 
 ### 19.2 Later
 
