@@ -1,6 +1,6 @@
 # M3 Design: Modeled OS Backend
 
-> Status: Design draft (M3.0), under review · Parent: [plan.md](../plan.md) · Builds on: [m2-design.md](m2-design.md), [m1-design.md](m1-design.md), [m0-design.md](m0-design.md)
+> Status: Design draft (M3.0), review 1 applied; frozen once §19.1 is accepted · Parent: [plan.md](../plan.md) · Builds on: [m2-design.md](m2-design.md), [m1-design.md](m1-design.md), [m0-design.md](m0-design.md)
 
 This document is the architecture contract for M3. It fixes the decisions the M3 implementation steps (§17) depend on, and lists the ones that still need a decision before M3.1 starts (§19.1). Nothing in it is implemented yet: M3.0 changes documentation only. The M2 reference platform is frozen, and nothing here changes it.
 
@@ -102,7 +102,8 @@ Decisions marked **(R)** are this draft's recommendation and are also listed in 
 | A/D bits **(R)** | Svade behavior: a clear `A`, or a clear `D` on a store, raises a page fault; the CPU never writes a PTE | §5.2 |
 | TLB **(R)** | None at F2: every translated access walks; `SFENCE.VMA` is a legal no-op in S and M | §5.4 |
 | Walk transport | Each PTE read is a `mem.v1` `ReadReq { len: 4 }` on the CPU's `mem` port, one outstanding, scheduled like a data access | §5.4 |
-| Exception priority | M1's order is kept: alignment is checked before translation, translation before the access | §5.3 |
+| Exception priority | M1's order is kept: alignment is checked before translation, translation before the access; confirmed against the specification text and Spike at M3.3 before it is relied on | §5.3 |
+| M6 CPU contract | The `M3` profile is the CPU a native tiny kernel must run on at M6 (plan.md §11); nothing a native kernel needs for the M3 scenario may be deferred to a later CPU change | §5, §16 |
 | Storage | The M2 `SimpleBlockMedia` and `DmaBlockController`, unchanged; the kernel programs them over MMIO as bus master 2 | §8 |
 | DMA wait **(R)** | The kernel polls `STATUS` and keeps `IRQ_ENABLE = 0`; device interrupts are not used by the modeled kernel | §8.2 |
 | Disk layout **(R)** | Executable table at LBA 0 (`SSX0`), up to 8 entries, each a contiguous ELF file | §8.1 |
@@ -210,7 +211,7 @@ A pure function `sv32_translate(satp, priv, sum, mxr, access, va, read_pte) -> R
 | 13 | `LoadPageFault` (`tval` = VA) | yes |
 | 15 | `StorePageFault` (`tval` = VA) | yes |
 
-**Order within one access**, keeping M1's order, which the privileged specification permits:
+**Order within one access**, keeping M1's order. This draft's reading is that the privileged specification lets address-misaligned exceptions take either priority relative to page and access faults. M3.3 confirms that reading against the specification text and the pinned Spike before implementing it, and records the result in the Spike appendix (§15.3):
 
 1. alignment;
 2. translation (page fault);
@@ -237,6 +238,10 @@ A misaligned access never walks.
   - `WalkWait { txn, purpose, level, table }`
 
   `purpose` is `Fetch`, or `Data { insn }` for a load or store whose plan is already prepared. The raw instruction bits are stored, never the decoded plan (m1-design §5.6).
+- **The translated address is CPU state.** The last PTE read determines the physical address, and the CPU does not read it again. In the `M3` profile, therefore:
+  - `FetchIssue`, `FetchWait`, `MemIssue`, and `MemWait` carry `pa: Option<u64>`. `None` means untranslated (the access goes to the address itself); `Some` holds the result of a completed walk.
+  - After a walk completes, the CPU is in `FetchIssue { pa: Some }` or `MemIssue { insn, pa: Some }`, and the access is issued at the next cycle's `Request`.
+  - A page fault found by the walk goes straight to `CommitPending` with the pending trap, like any other trap.
 - **Timing** follows the M0 phase rules like any memory access. A PTE `ReadReq` is sent in `Request` of the next CPU cycle, and its response arrives in `Complete`. The next level, or the translated access itself, is issued in `Request` of the following cycle. A 4 KiB translation therefore adds two PTE round trips per access, and a megapage adds one.
 - **Satp sampling:** `satp`, `priv`, `SUM`, and `MXR` are read when the walk starts. They can change only in `Commit`, and a walk never spans a `Commit` of its own instruction, so they cannot change mid-walk.
 
@@ -246,13 +251,15 @@ Schema 3 is schema 2 (m2-design §6.4) followed by:
 
 - `priv` (`u8`: 0 U, 1 S, 3 M);
 - the new CSRs in the whitelist order of §5.1;
-- for `WalkIssue` and `WalkWait`: `purpose`, the raw instruction for `Data`, `level`, `table`, and `txn` for `WalkWait`.
+- for `WalkIssue` and `WalkWait`: `purpose`, the raw instruction for `Data`, `level`, `table`, and `txn` for `WalkWait`;
+- for `FetchIssue`, `FetchWait`, `MemIssue`, and `MemWait`: the `pa` option (§5.4).
 
 Restore also rejects:
 
 - a `priv` of 2;
 - CSR values their write rules cannot produce (for example `MPP = 0b10`, a set bit outside the `medeleg` mask, or a non-zero `ASID`);
-- a walk state that the recorded `satp`, `priv`, registers, and instruction cannot reach: a walk while translation is off, a `level` above 1, or a `table` that is not `satp.PPN` at level 1.
+- a walk state that the recorded `satp`, `priv`, registers, and instruction cannot reach: a walk while translation is off, a `level` above 1, or a `table` that is not `satp.PPN` at level 1;
+- a `pa` of `Some` while translation is off, a `pa` of `None` while it is on, and a `pa` whose low 12 bits differ from the virtual address's. Restore cannot check the rest of `pa` without reading RAM, and it never reads RAM.
 
 ### 5.6 Inspect and Trace
 
@@ -273,7 +280,7 @@ There are no walk records: the runtime's `runtime.dispatch` records already show
 
 ### 6.1 Role and Boundary
 
-`ModeledKernel` (crate `systemscope-os`, `components/os`, created at M3.4) is the Modeled OS Backend. It is an **architectural state machine**. It holds OS state and changes it only in response to architectural events that reach it through memory. It never reads or writes CPU state directly.
+`ModeledKernel` (crate `systemscope-os`, `components/os`, created at M3.4a) is the Modeled OS Backend. It is an **architectural state machine**. It holds OS state and changes it only in response to architectural events that reach it through memory. It never reads or writes CPU state directly.
 
 - **What it can see:** the trap frame in RAM (written by the trampoline), page tables and user memory in RAM, the block controller's registers, and the disk contents that DMA delivers into RAM.
 - **What it can change:** RAM (page tables, user frames, the trap frame), the block controller's registers, and the UART's output, all through its bus master port. It also controls when the held `ENTER` store completes.
@@ -298,7 +305,7 @@ The builder checks that the frame pool, the staging area, and the trap frame lie
 
 ### 6.3 Kernel Execution Model
 
-- **Entry.** The `ENTER` write is accepted when it is dispatched, as at every target. The kernel records the held request's `TxnId` and starts an **operation**: `Boot` on the first entry, `Trap` on every later one. The write's value must equal the configured trap frame address. Anything else is a guest bug: the kernel shuts down with the failure reason (§7.4).
+- **Entry.** The `ENTER` write is accepted when it is dispatched, as at every target. The kernel records the held request's `TxnId` and starts an **operation**. The recorded `TxnId` is the downstream one the bus assigned on its `kgate` port (m2-design §10.2), not the CPU's; the bus maps the response back to the CPU. An operation is one of: `Boot` on the first entry, `Trap` on every later one. The write's value must equal the configured trap frame address. Anything else is a guest bug: the kernel shuts down with the failure reason (§7.4).
 - **Work.** An operation is a sequence of single bus accesses on `mem`, one outstanding, each sent in `Request` of a kernel clock cycle, like the DMA engine (m2-design §9.6). The accesses are:
   - reads and writes of up to 16 bytes that do not cross a 4 KiB page;
   - 1-byte UART writes;
@@ -306,6 +313,14 @@ The builder checks that the frame pool, the staging area, and the trap frame lie
 
   Kernel computation between accesses takes no simulated time. Its cost is the bus traffic it generates (§10).
 - **Exit.** When the operation finishes, the kernel sends `WriteResp(Done)` for the held `TxnId` in `Complete`. The CPU's store then commits, and the trampoline continues.
+- **Kernel states.** Like the CPU (m1-design §5.3) and the DMA engine, every kernel state but `AwaitBoot` and `Idle` waits for exactly one runtime-owned event:
+  - `Issue { op, step }` waits for the kernel's own wake, scheduled for the next `Request`;
+  - `Wait { op, step, txn }` waits for the response to its one outstanding `mem` request.
+
+  A wake or response that does not match the state faults the session. Neither the wake nor the request is ever a copy in the kernel's snapshot. **Restore resumes by waiting, never by reissuing.** A kernel write in flight at a checkpoint (a PTE, a trap-frame word, a UART byte, a `COMMAND`) therefore reaches its target exactly once, as a CPU store does (m1-design §5.6).
+- **Access whitelist.** Before sending, the kernel checks every physical address against the ranges its configuration grants: the trap frame, staging, the frame pool, the block controller window, and UART TX. The firmware range and `kgate` are not granted. An address outside them is a kernel bug and faults the session before anything is sent, so the kernel can never deadlock on its own held gate (§16 risk 2).
+  - User-supplied addresses never reach this check unvalidated. They are translated through the caller's page table first (§6.5), and a PTE can only point into the frame pool or the two megapages, because the kernel wrote every PTE.
+  - A user buffer that resolves into a megapage is refused with `-EFAULT` by the `U = 1` rule before any physical access.
 - **Pure core.** The kernel's decision logic is a pure step function, `kernel_step(state, completion) -> (state, next access | respond)`, over an abstract memory interface. The component only moves messages. The pure core is tested against an in-memory model with no runtime (§15.1), as `take_mei` was in M2.
 - **Session faults** (`ComponentFault`) are the model bugs of m1-design §5.3 and m2-design §9.8:
   - a response with the wrong `TxnId`, or while nothing is outstanding;
@@ -375,26 +390,46 @@ Every transition is traced (§6.8), so the full process history can be reconstru
 The kernel is entered for every delegated exception (§7.1 sets `medeleg = 0xB1FF`).
 
 - **From U-mode (`SPP = U`), any cause but 8:** the process becomes `Faulted { cause: scause, epc: sepc, tval: stval }` and is killed (§6.6). This covers the page faults 12, 13, and 15, illegal instructions, misalignment, access faults, and breakpoints. The kernel never resumes a faulting instruction: M3 has no demand paging.
-- **From S-mode (`SPP = S`):** a fault in the trampoline is a bug in the guest glue. The kernel shuts down with reason 1 and traces `os.shutdown` with the cause.
+- **From S-mode (`SPP = S`):** the kernel cannot be relied on to see it. `medeleg` delegates traps from S as well as from U, so a fault inside the trampoline re-enters the trampoline. By then `sscratch` may already hold the user's `t6` instead of the frame address, and the frame cannot be trusted.
+  - The trampoline therefore **must never fault**. It runs from the identity-mapped kernel megapage, touches only the frame, `kgate`, and CSRs its mode may access, and is fixed, manifest-pinned code.
+  - This is a verified property, not a runtime check. Every M3 test asserts that no `rv32.exception` has `from = S`.
+  - If the kernel does see `SPP = S`, it shuts down with reason 1 and traces `os.shutdown` with the cause. That is a best-effort diagnostic, not a recovery path.
 
 ### 6.8 Snapshot, Inspect, Trace
 
 **Snapshot (schema 1)** holds only kernel-owned state:
 
 - the configuration;
-- the operation phase: `AwaitBoot`, `Idle`, or a running operation with its step, cursor, and the partial data it has read, such as frame words or parsed program headers;
+- the kernel state (§6.3): `AwaitBoot`, `Idle`, `Issue`, or `Wait`, with the operation, its step and cursor, and the operation's working data;
 - the held `ENTER` `TxnId`, if any;
 - the outstanding `mem` `TxnId` and the next one;
-- the PCBs in PID order, the run queue, and the running PID;
-- the frame bitmap;
-- the executable table as validated at boot.
+- the PCBs in PID order, the run queue, and the running PID. The `Running` process's `context` is encoded as absent, because the hart and the trap frame own it; restore rejects a `Running` PCB that carries one;
+- the frame bitmap.
+
+**Working data is not a cache.** Some bytes the kernel read from RAM are part of its snapshot while an operation runs: trap-frame words, the executable table during `Boot`, ELF and program headers during a load. That is kernel-owned state, like the DMA controller's buffered beat (m2-design §9.9). The rules are:
+
+- it exists only for the operation that read it, and is dropped when that operation ends;
+- a later operation always reads RAM again;
+- in particular the executable table is not kept after `Boot`.
+
+Across operations the kernel keeps only what RAM does not hold: PCBs, the run queue, and the frame bitmap.
 
 It never holds page tables, user memory, the trap frame, or disk contents: those belong to the RAM and the media, whose snapshots hold them. It never holds a message in flight either: those live in the runtime's queue.
+
+**The held entry spans three snapshots.** Each component owns one part and restores it independently, as in M2:
+
+- the CPU holds `MemWait { txn, insn: the ENTER store }`;
+- the bus holds the active `kgate` transaction and its `(master, txn)` mapping;
+- the kernel holds the downstream `TxnId` and its operation.
+
+None of them copies another's part. A checkpoint taken between the `ENTER` request's dispatch and its acceptance is ordinary: the request is an event in the runtime's queue, and the kernel is still `Idle`.
 
 **Restore rejects:**
 
 - a different configuration;
 - a held `ENTER` with an idle phase, or an operation without a held `ENTER`;
+- a `Wait` whose `txn` is not the latest issued (next `TxnId` − 1), or an `Issue` or `Idle` state that still has an outstanding request;
+- working data that does not belong to the recorded operation and step;
 - a frame that is marked allocated but owned by no live process, or the reverse;
 - two `Running` processes, or a `Running` one while `Idle`;
 - a run queue entry that is not `Ready`, or a `Ready` process missing from the queue.
@@ -668,7 +703,7 @@ A run passes only if:
 - **`COMPATIBILITY_ID` stays `"0.0.0"`.** Every existing snapshot and trace decodes and restores as before.
 - **Component schemas:** CPU schema 3 (M3 profile) and `ModeledKernel` schema 1 are new. Every existing schema is unchanged.
 - **Trace:** `rv32.exception` and the `os.*` kinds are new, and `rv32.commit` gains fields only in the M3 profile. Adding kinds and fields is not a format change (m2-design §14).
-- **Crates and Cargo:** `components/os` (`systemscope-os`) is added at M3.4. `systemscope-elf` gains `parse_user_elf32` at M3.1, and `systemscope-rv32i` gains `sv32.rs` at M3.3. M3.0 changes no Cargo file.
+- **Crates and Cargo:** `components/os` (`systemscope-os`) is added at M3.4a. `systemscope-elf` gains `parse_user_elf32` at M3.1, and `systemscope-rv32i` gains `sv32.rs` at M3.3. M3.0 changes no Cargo file.
 
 ---
 
@@ -683,9 +718,11 @@ A run passes only if:
 | MEI with modes | the M2 pure oracle `take_mei`, extended with `priv` | property tests; entry from U and S | M3.2 |
 | Sv32 | pinned Spike, directed; the pure `sv32_translate` | leaf and megapage, every permission and fault case, `SUM`/`MXR`, A/D, PTE access fault, PA beyond the bus; property tests with random page tables, CPU vs oracle | M3.3 |
 | M3 CPU on RV32I | M1 oracles | 40 `rv32ui` and 39 ACT4 on the M3 profile (M-mode, bare) | M3.2 |
-| Kernel core | the pure kernel oracle over an in-memory RAM/disk model | boot, create, yield, exit, fault kill, frame accounting, every syscall and error | M3.4, M3.5 |
+| Gate and held entry | a scripted gate operation with a known effect on the trap frame and UART | ecall round trips from U, register preservation, every-event resume including held `ENTER`, kernel access to `kgate` refused before sending, three-master bus contention | M3.4a |
+| Kernel core | the pure kernel oracle over an in-memory RAM/disk model | boot, create, yield, exit, fault kill, frame accounting, every syscall and error | M3.4b, M3.5 |
 | Kernel walk | the CPU's `sv32_translate` | random address spaces, the kernel's user-copy walk vs the oracle | M3.5 |
 | End to end | §12.3 | the M3 scenario on `m3-reference` | M3.6 |
+| M6 feasibility | §16 risk 4 | a small native S-mode kernel (assembly, §5 only) runs `hello` from the M3 disk image to its expected output on the unchanged `M3` profile | M3.6 |
 | Snapshot/restore | resume equivalence | every event, the §9.2 stress points, the portable snapshot | M3.7 |
 | Observation invariance | M0 O0–O5 | on `m3-reference` | M3.7 |
 | Golden | `tests/golden/m3-reference.json` | Linux and Windows, cross-OS | M3.7 |
@@ -721,16 +758,20 @@ Every M3 step must keep all of these passing, unchanged:
 
 1. **The kernel boundary leaking into the CPU.** A modeled kernel invites shortcuts, such as a CPU hook on `ecall` or a direct register read. Any shortcut breaks plan.md's M6 promise.
    - Mitigation: the `rv32i` crate never depends on `os`, and the kernel's only inputs are memory accesses (§6.1).
-   - M3.6 adds a test that runs the M3 CPU profile with the kernel replaced by a scripted gate target. This shows that the CPU works against any backend.
+   - M3.4a runs the M3 CPU profile against a scripted gate target before any real kernel exists. This shows that the CPU works against any backend, and it keeps doing so from then on.
 2. **Held MMIO response.** The CPU stalls for a whole kernel operation, which can be thousands of cycles during boot, and the `kgate` bus region stays busy throughout.
-   - The kernel must never address its own gate window: that would deadlock. It is a configuration check and a session fault.
+   - The kernel must never address its own gate window: that would deadlock. The access whitelist (§6.3) excludes `kgate` and is checked before every send, and the builder checks that `kgate` lies outside every granted range.
+   - No other agent can block on `kgate`. The DMA aperture excludes it (§11.1), user code cannot reach the MMIO megapage (`U = 0`), and the CPU is the only master whose requests reach the gate.
+   - M3.4a proves the held entry works, including snapshots taken while an entry is held, before any OS logic depends on it.
    - Any future device that expects the CPU to make progress during a syscall would need a different entry mechanism. That is recorded, not solved.
 3. **Walk traffic without a TLB.** Every U-mode fetch costs two extra round trips, roughly tripling events per instruction. That affects trace volume, run time, and snapshot queue size.
    - It is accepted at F2.
    - A TLB is an F3 decision. It must keep `SFENCE.VMA` semantics exact, and it changes digests, so it would be a new profile or backend, never an edit to the `M3` profile.
-4. **Partial privileged architecture.** M-mode synchronous traps halt, and several CSRs are missing. A real kernel at M6 will need more (`misa`, `mhartid`, counters, a timer, M-mode delivery for SBI).
+4. **Partial privileged architecture versus M6.** M-mode synchronous traps halt, and several CSRs are missing. plan.md §11 requires M6's C/assembly tiny kernel to run the M3 scenario "with no changes to CPU code", so the `M3` profile **is** the M6 CPU contract.
+   - A native kernel for the M3 scenario needs S-mode, `medeleg`, `stvec`/`sepc`/`scause`/`stval`/`sscratch`/`satp`, Sv32, `SRET`, and the SBI shutdown halt (§7.4). All of these are in §5, and none needs `misa`, `mhartid`, counters, or a timer.
+   - A kernel that wants more, such as a Linux-class kernel, preemption, or SBI services beyond `SRST`, is outside the M3 scenario. It would be a new CPU profile and a new scenario, never a change to `M3`.
+   - M3.6 checks this with a small native S-mode kernel written in assembly. It uses only §5, implements `write`, `getpid`, and `exit` and runs `hello` (entry 0) from the same disk image, and runs with the same CPU profile (§15.1). It is a feasibility check, not the M6 backend.
    - The wording of §2.2 and §15.4 must stay precise.
-   - M6 extends the same CSR file again, as M3 extends M2's.
 5. **Spike divergence on WARL and A/D.** Where Spike's choices differ from §5, directed tests could be tempted to match Spike silently. Measure first (§15.3) and record every divergence in this document.
 6. **Snapshot growth.** Page-table and stack frames add RAM pages, and the kernel adds a 384-byte frame bitmap. The disk is 256 blocks, but only its non-zero blocks are stored. Sizes are measured at M3.7 and recorded, as in m2-design §13.3.
 7. **Contention changes timing.** A third master changes grant sequences relative to M2. This cannot affect `m2-reference`, which has two masters, but `m3-reference` goldens depend on it. Any arbitration change is a platform change and needs a new reference.
@@ -745,9 +786,10 @@ Every M3 step must keep all of these passing, unchanged:
 | **M3.1** | ELF user-image loader and executable table: `parse_user_elf32`, table validation, pure mapping plan (segments → pages + perms) | `elf` | §8.1 and §8.3 rules each tested at their boundaries; property and arbitrary-byte tests; M1 loader tests unchanged; no runtime change |
 | **M3.2** | Privilege and trap boundary: `M3` profile, `priv`, the §5.1 CSRs and access rule, `MRET`/`SRET`, `medeleg` delivery, M3 cause names, MEI with modes, schema 3 (no walk yet; `satp` accepts only `MODE = Bare` until M3.3) | CPU | Spike-directed privilege tests pass; `take_mei` extended; 40 `rv32ui` + 39 ACT4 on M3; every-event snapshot of a mode-switching program; M1/M2 profiles and goldens unchanged |
 | **M3.3** | Sv32 MMU: `sv32.rs`, `satp` Sv32, walk states, permissions, A/D, page faults, `SFENCE.VMA`, walk snapshot | CPU | Spike-directed Sv32 tests; oracle property tests; resume from every event including mid-walk; regressions unchanged |
-| **M3.4** | Process model: `systemscope-os`, `ModeledKernel` ports, operation engine, frame allocator, page-table builder, boot from the executable table through the block controller, dispatch, context switch, `exit`; firmware stub and trampoline fixture | os + tests | A minimal platform boots two processes that `exit`; kernel oracle tests; frame accounting; every-event snapshot including held `ENTER` |
-| **M3.5** | Syscall and output: the full §6.5 ABI, user-copy walk, `write` to UART, errors, fault kill (§6.7), shutdown reasons | os | Every syscall and error path by the kernel oracle and in the runtime; kernel walk vs `sv32_translate`; UART output exact |
-| **M3.6** | `m3-reference` and the M3 reference workload: the five programs, the disk fixture, manifests, expected output and syscall trace, the scripted-gate CPU test (§16 risk 1) | tests | §12.3 acceptance on Linux and Windows |
+| **M3.4a** | Kernel gate prototype: `systemscope-os` skeleton, `gate` and `mem` ports, held `ENTER`, the `Issue`/`Wait` state engine with a scripted operation (read the trap frame, write it back with `sepc + 4`, write one UART byte), schema 1 for that state, the access whitelist; the firmware stub and trampoline fixture; a three-master bus configuration | os + tests | On a minimal platform, a bare-metal U-mode loop of `ecall`s round-trips through the trampoline and the scripted gate with registers preserved; resume from every event, including every held-`ENTER` state; a kernel access to `kgate` faults the session before sending; no `rv32.exception` from S; regressions unchanged |
+| **M3.4b** | Process model: frame allocator, page-table builder, boot from the executable table through the block controller, user ELF mapping (M3.1), dispatch, sequential processes on `exit`, shutdown reasons | os + tests | A minimal platform boots two processes from a disk that `exit` in order; kernel oracle tests; frame accounting (all free after shutdown); every-event snapshot through boot, including DMA in flight |
+| **M3.5** | Syscall and output: the full §6.5 ABI, user-copy walk, `write` to UART, `sched_yield` context switch, errors, fault kill (§6.7) | os | Every syscall and error path by the kernel oracle and in the runtime; kernel walk vs `sv32_translate`; UART output exact |
+| **M3.6** | `m3-reference` and the M3 reference workload: the five programs, the disk fixture, manifests, expected output and syscall trace, the native-kernel feasibility check (§16 risk 4) | tests | §12.3 acceptance on Linux and Windows |
 | **M3.7** | Snapshot stress (§9.2), observation invariance, `m3-reference.json` and `m3-reference.mid.snap`, cross-OS, CI | tests + CI | Golden blessed once; every stress point; M0/M1/M2 goldens byte-identical |
 | **M3.8** | Release documentation and exit audit | docs | §18 checked with evidence; tag and release left to the maintainer |
 
@@ -788,7 +830,7 @@ These are the **(R)** rows of §3. The draft recommends each one, and the implem
 
 ### 19.2 Later
 
-- `misa`, `mhartid`, the counters, and M-mode exception delivery, needed by a native kernel (M6).
+- `misa`, `mhartid`, the counters, a timer, and M-mode exception delivery. The M3 scenario does not need them, so they belong to a later profile and scenario, not to M6's run of the M3 scenario (§16 risk 4).
 - A TLB and `SFENCE.VMA` precision (F3).
 - `brk`/`mmap`, `exec` from user space, `wait`, and a real filesystem.
 - Snapshot compaction for large disks and RAM (m2-design §16 risk 3).
