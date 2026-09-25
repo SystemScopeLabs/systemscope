@@ -41,9 +41,9 @@ is `SNAPSHOT_FORMAT_VERSION = 1` (`runtime/src/snapshot.rs`).
 | MultiMasterBus | `components/platform/src/mmbus.rs` | `components/platform/tests/mmbus.rs`; `tests/rv32/tests/block_irq.rs` (contention, renaming) | 1 | `soc.bus` in the mid snapshot; state digest | M2.4 5/5 |
 | SimpleBlockMedia | `components/platform/src/media.rs` | `components/platform/tests/media.rs` | 1 | `disk_blake3`, disk blocks, `soc.disk` | M2.5 5/5 |
 | DMA controller (registers, command, IRQ) | `components/platform/src/dma.rs` | `components/platform/tests/dma.rs` | 1 | disk ops, `soc.blk` | M2.6 5/5 |
-| DMA READ engine | `components/platform/src/dma.rs` | `components/platform/tests/dma_read.rs` | 1 (shared) | read LBA 0, read LBA 1, 64 beats | M2.7a 7/7, M2.7b 8/8 |
-| DMA WRITE engine | `components/platform/src/dma.rs` | `components/platform/tests/dma_write.rs` | 1 (shared) | write LBA 1, 32 beats, LBA 1 bytes | M2.7c 11/11 |
-| DMA fault semantics | `components/platform/src/dma.rs` | `components/platform/tests/dma_faults.rs`, `dma_snapshot.rs` | 1 (shared) | `ERROR 0` checked by `the_golden_is_the_frozen_baseline` | M2.7d 12/12 |
+| DMA READ engine | `components/platform/src/dma.rs` | `components/platform/tests/dma_read.rs` | 1 (shared) | read LBA 0, read LBA 1, 64 beats | M2.7a 7/7 |
+| DMA WRITE engine | `components/platform/src/dma.rs` | `components/platform/tests/dma_write.rs` | 1 (shared) | write LBA 1, 32 beats, LBA 1 bytes | M2.7b 8/8 |
+| DMA fault semantics | `components/platform/src/dma.rs` | `components/platform/tests/dma_faults.rs`, `dma_snapshot.rs` | 1 (shared) | `ERROR 0` checked by `the_golden_is_the_frozen_baseline` | M2.7c 11/11, M2.7d 12/12 (snapshot state space) |
 | Snapshot system | `runtime/src/snapshot.rs`, `tests/acceptance/src/m2/checkpoint.rs` | `tests/acceptance/tests/m2_snapshot.rs`, `m2_observation.rs` | container 1 | `m2-reference.mid.snap` | M2.9 11/11 |
 | `m2-reference` platform | `tests/rv32/src/m2ref.rs` | `tests/rv32/tests/block_irq.rs` (topology, wiring, builder) | n/a | `image_hash`, platform in the golden | M2.8 5/5 |
 | `block_irq.elf`, `disk.img` | `tests/rv32/block_irq/` | `tests/rv32/tests/block_irq.rs`, `cargo xtask rv32-fixtures verify` | n/a | `elf_blake3 39f23b9f…88bc8`, `disk_blake3 ffcfaec0…83b43` | M2.8 5/5 |
@@ -170,9 +170,9 @@ runs themselves are not stored in the repository.
 | M2.5 SimpleBlockMedia | 5 | 5 | 0 |
 | M2.6 DMA controller | 5 | 5 | 0 |
 | M2.7a DMA READ | 7 | 7 | 0 |
-| M2.7b DMA READ completion | 8 | 8 | 0 |
-| M2.7c DMA WRITE | 11 | 11 | 0 |
-| M2.7d DMA faults | 12 | 12 | 0 |
+| M2.7b DMA WRITE engine | 8 | 8 | 0 |
+| M2.7c DMA fault semantics | 11 | 11 | 0 |
+| M2.7d DMA snapshot state space | 12 | 12 | 0 |
 | M2.8 reference platform | 5 | 5 | 0 |
 | M2.9 snapshot / observation | 11 | 11 | 0 |
 | **Total** | **84** | **84** | **0** |
