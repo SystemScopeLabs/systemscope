@@ -1,6 +1,6 @@
 [package]
 name = "systemscope-platform"
-description = "Platform components for SystemScope: address bus, multi-master bus, sparse RAM, a simple UART, and a simple IRQ controller"
+description = "Platform components for SystemScope: address bus, multi-master bus, sparse RAM, a simple UART, a simple IRQ controller, and a simple block media"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,8 @@ rust-version.workspace = true
 systemscope-contracts.workspace = true
 
 [dev-dependencies]
+# Tests compute the image hash a builder would pass in.
+blake3 = "1"
 proptest = "1"
 # Tests drive the components through the real runtime; the library itself never
 # depends on it.

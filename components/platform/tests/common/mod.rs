@@ -1,9 +1,9 @@
 //! Test harnesses shared by the platform tests. Test-only: nothing here is part of the
 //! crate.
 //!
-//! - [`MockCtx`] drives one component directly, recording what it sends (`mem.v1` and
-//!   `irq.v0`), the wakes it schedules, and what it traces, so unit and property tests run
-//!   without a runtime.
+//! - [`MockCtx`] drives one component directly, recording what it sends (`mem.v1`,
+//!   `irq.v0`, and `block.v0`), the wakes it schedules, and what it traces, so unit and
+//!   property tests run without a runtime.
 //! - [`Script`] is a stateless `mem.v1` initiator for runtime tests: it schedules every
 //!   request during `init`, so its pending requests live in the runtime's queue and it
 //!   has nothing to snapshot. Responses show up in the runtime's dispatch records.
@@ -16,6 +16,7 @@ use systemscope_contracts::component::{
 use systemscope_contracts::error::SimError;
 use systemscope_contracts::event::{Phase, ScheduleWhen};
 use systemscope_contracts::protocol::Message;
+use systemscope_contracts::protocol::block_v0::BlockMsg;
 use systemscope_contracts::protocol::irq_v0::IrqMsg;
 use systemscope_contracts::protocol::mem_v1::{self, MemMsg, TxnId};
 use systemscope_contracts::rng::SimRng;
@@ -41,6 +42,15 @@ pub struct IrqSent {
     pub phase: Phase,
 }
 
+/// One `block.v0` `send` a component made.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockSent {
+    pub port: PortId,
+    pub msg: BlockMsg,
+    pub when: ScheduleWhen,
+    pub phase: Phase,
+}
+
 /// One `wake_self` a component made.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Wake {
@@ -54,6 +64,7 @@ pub struct Wake {
 pub enum SendKind {
     Mem,
     Irq,
+    Block,
     Wake,
 }
 
@@ -74,6 +85,7 @@ pub struct MockCtx {
     pub phase: Phase,
     pub sent: Vec<Sent>,
     pub irqs: Vec<IrqSent>,
+    pub blocks: Vec<BlockSent>,
     pub wakes: Vec<Wake>,
     pub order: Vec<SendKind>,
     pub traced: Vec<Traced>,
@@ -86,6 +98,7 @@ impl MockCtx {
             phase,
             sent: Vec::new(),
             irqs: Vec::new(),
+            blocks: Vec::new(),
             wakes: Vec::new(),
             order: Vec::new(),
             traced: Vec::new(),
@@ -160,7 +173,18 @@ impl InitContext for MockCtx {
                     phase,
                 });
             }
-            other => panic!("platform components speak mem.v1 and irq.v0 only: {other:?}"),
+            Message::Block(msg) => {
+                self.order.push(SendKind::Block);
+                self.blocks.push(BlockSent {
+                    port,
+                    msg,
+                    when,
+                    phase,
+                });
+            }
+            other => {
+                panic!("platform components speak mem.v1, irq.v0, and block.v0 only: {other:?}")
+            }
         }
         Ok(())
     }
