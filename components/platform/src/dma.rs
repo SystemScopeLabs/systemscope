@@ -1,14 +1,14 @@
-//! `DmaBlockController`: a block-device DMA controller (`docs/m2-design.md` §9). This is
-//! its control plane (M2.6): the MMIO register file, the command lifecycle, validation,
-//! `REJECTED`, and the interrupt line.
+//! `DmaBlockController`: a block-device DMA controller (`docs/m2-design.md` §9): the MMIO
+//! register file, the command lifecycle, validation, `REJECTED`, and the interrupt line
+//! (M2.6), and the engine's READ path (M2.7a).
 //!
 //! # Ports
 //!
 //! In [`ports()`](Component::ports) order: `mem`, a `mem.v1` target, the MMIO window;
 //! `dma`, a `mem.v1` initiator (bus master); `blk`, a `block.v0` initiator; and `irq`, an
-//! `irq.v0` initiator. `dma` and `blk` belong to the engine (§9.5–§9.7, M2.7): nothing is
-//! ever sent on them yet, and anything arriving on them faults the session, since no
-//! request is ever outstanding.
+//! `irq.v0` initiator. `dma` and `blk` carry the engine's requests (§9.5, §9.6); a message
+//! arriving on them that is not the result of the one outstanding request faults the
+//! session (§9.8).
 //!
 //! # Register map
 //!
@@ -44,19 +44,41 @@
 //!   validated against them in the fixed order of §9.4: command, count, LBA range,
 //!   alignment, DMA range. The first failing check completes the command at once (DONE,
 //!   `ERROR` = its code) with no other effect. A command that passes goes to BUSY with the
-//!   latched descriptor and the engine in `Issue`, at block 0, beat 0.
+//!   latched descriptor and the engine in `Issue`, at block 0, beat 0; a READ also
+//!   schedules `Wake(ISSUE)`.
 //! - A `COMMAND` write in BUSY or DONE is rejected: `REJECTED` is set and nothing else
 //!   changes. Only writing 1 to `STATUS` bit 2 clears `REJECTED`.
 //! - `ACK` in DONE clears `DONE` and `ERROR`, back to IDLE; elsewhere it does nothing.
 //! - The interrupt line is `DONE && IRQ_ENABLE.bit0`, sent on `irq` (`Now`, `Complete`)
 //!   only when it changes.
 //!
-//! # The engine boundary
+//! # Engine (READ)
 //!
-//! Issuing and completing transfers (§9.6, the `Wake(ISSUE)` that starts them, and §9.7)
-//! is the engine, M2.7. Here an accepted command stays BUSY, at block 0, beat 0, with no
-//! wake scheduled and nothing sent: it neither moves data nor completes. The snapshot
-//! already has the whole §9.9 layout, with the engine fields at those values.
+//! The engine mirrors the CPU's state machine (§9.6):
+//!
+//! ```text
+//! Idle ──valid READ @ Transfer──▶ Issue (Wake(ISSUE) @ Request, next controller cycle)
+//! Issue ──Wake(ISSUE)──▶ send ReadBlock or the next beat, Now ──▶ WaitMedia / WaitBeat { txn }
+//! WaitMedia / WaitBeat ──result @ Complete──▶ Issue (Wake(ISSUE), next cycle) | Done
+//! ```
+//!
+//! For block *i* of a READ, `Issue` with an empty block buffer sends
+//! `ReadBlock(LBA + i)`; its `Data` (exactly 512 bytes) fills the buffer, and `Issue` then
+//! sends beat *j* as a 16-byte `WriteReq` of `buffer[16j..16j + 16]` to
+//! `MEM_ADDR + 512i + 16j`, one beat at a time. After beat 31's `Done` the buffer is
+//! dropped and block *i* + 1 starts; after the last block's, the command completes with
+//! `ERROR = 0`. At most one request is outstanding in total, and each is sent under a
+//! fresh `TxnId` from its port's counter, which never wraps (§9.5, §6.2).
+//!
+//! A media `Error` ends the command with `ERROR = 7` (MEDIA_ERROR), and a beat's `Fault`
+//! with `ERROR = 6` (DMA_FAULT), as §9.7 and §9.8 require of a device error; nothing
+//! further is issued.
+//!
+//! # The WRITE boundary
+//!
+//! The WRITE engine is not implemented yet (M2.7b). An accepted WRITE goes to BUSY with
+//! the engine in `Issue` at block 0, beat 0, and schedules no wake: it sends nothing and
+//! never completes.
 
 use std::fmt;
 
@@ -67,7 +89,7 @@ use systemscope_contracts::error::SimError;
 use systemscope_contracts::event::{Phase, ScheduleWhen};
 use systemscope_contracts::observe::StateView;
 use systemscope_contracts::protocol::Message;
-use systemscope_contracts::protocol::block_v0;
+use systemscope_contracts::protocol::block_v0::{self, BlockMsg, BlockReadOutcome};
 use systemscope_contracts::protocol::irq_v0::{self, IrqMsg};
 use systemscope_contracts::protocol::mem_v1::{
     self, Access, MemFault, MemMsg, ReadOutcome, TxnId, WriteOutcome,
@@ -120,6 +142,10 @@ pub const LBA_RANGE: u8 = 3;
 pub const DMA_ALIGN: u8 = 4;
 /// `ERROR`: the transfer does not lie inside the DMA aperture.
 pub const DMA_RANGE: u8 = 5;
+/// `ERROR`: a DMA beat was answered with `Fault`.
+pub const DMA_FAULT: u8 = 6;
+/// `ERROR`: the media answered with `Error`.
+pub const MEDIA_ERROR: u8 = 7;
 
 /// The largest `capacity_blocks`: the controller's LBAs are 32 bits.
 pub const MAX_CAPACITY_BLOCKS: u64 = 1 << 32;
@@ -127,6 +153,11 @@ pub const MAX_CAPACITY_BLOCKS: u64 = 1 << 32;
 pub const ADDRESS_LIMIT: u64 = 1 << 32;
 /// `MEM_ADDR` alignment: one DMA beat.
 pub const BEAT_SIZE: u64 = 16;
+/// Beats per block: 512 / 16.
+pub const BEATS_PER_BLOCK: u8 = 32;
+
+/// Wake token that sends the engine's next request.
+pub const ISSUE: u64 = 0;
 
 /// Trace kind of a `COMMAND` written in IDLE.
 pub const COMMAND_KIND: &str = "platform.blk.command";
@@ -222,15 +253,21 @@ struct Latched {
     count: u32,
 }
 
-/// The engine's position (§9.6). The engine is M2.7; here it is only ever `Idle`, or
-/// `Issue` at block 0, beat 0 while BUSY.
+/// The engine's position (§9.6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Engine {
+    /// No command, or DONE.
     Idle,
+    /// The next request is due at `Wake(ISSUE)`: `ReadBlock` if the buffer is empty,
+    /// else beat *j*. An accepted WRITE waits here without a wake (M2.7b).
     Issue,
+    /// `ReadBlock { txn }` of block *i* is outstanding.
+    WaitMedia(TxnId),
+    /// Beat *j* of block *i*, `WriteReq { txn }`, is outstanding.
+    WaitBeat(TxnId),
 }
 
-/// The block-device DMA controller's control plane.
+/// The block-device DMA controller.
 pub struct DmaBlockController {
     config: DmaBlockControllerConfig,
     lba: u32,
@@ -245,9 +282,15 @@ pub struct DmaBlockController {
     /// Present exactly when BUSY.
     latched: Option<Latched>,
     engine: Engine,
-    /// Next `TxnId` on `dma`; nothing is sent there yet.
+    /// Block index *i* of the latched command; 0 when `Idle`.
+    block: u32,
+    /// Beat index *j* in block *i*, below [`BEATS_PER_BLOCK`]; 0 when `Idle`.
+    beat: u8,
+    /// Block *i*'s data, from its `Data` through its beat 31's `Done`; empty otherwise.
+    buffer: Vec<u8>,
+    /// Next `TxnId` on `dma`.
     dma_txn: TxnId,
-    /// Next `TxnId` on `blk`; nothing is sent there yet.
+    /// Next `TxnId` on `blk`.
     blk_txn: TxnId,
     /// The last level sent on `irq`; deasserted at reset.
     irq_level: bool,
@@ -285,6 +328,9 @@ impl DmaBlockController {
             error: 0,
             latched: None,
             engine: Engine::Idle,
+            block: 0,
+            beat: 0,
+            buffer: Vec::new(),
             dma_txn: TxnId(0),
             blk_txn: TxnId(0),
             irq_level: false,
@@ -379,15 +425,176 @@ impl DmaBlockController {
                     count,
                 });
                 self.engine = Engine::Issue;
-                Ok(())
+                match op {
+                    Operation::Read => self.wake_next_cycle(ctx),
+                    // The WRITE engine is M2.7b.
+                    Operation::Write => Ok(()),
+                }
             }
-            Err(code) => {
-                self.done = true;
-                self.error = code;
-                ctx.trace(DONE_KIND, vec![("error", Value::U64(u64::from(code)))]);
-                self.update_irq(ctx)
+            Err(code) => self.complete(code, ctx),
+        }
+    }
+
+    /// Wakes the engine at the next controller cycle's `Request`.
+    fn wake_next_cycle(&self, ctx: &mut dyn SimContext) -> Result<(), SimError> {
+        let when = ScheduleWhen::Cycles {
+            domain: self.config.clock,
+            k: 1,
+        };
+        ctx.wake_self(when, Phase::Request, ISSUE)
+    }
+
+    /// Ends the command, or a failed validation, with `code`: DONE, the engine `Idle`,
+    /// and the line recomputed.
+    fn complete(&mut self, code: u8, ctx: &mut dyn SimContext) -> Result<(), SimError> {
+        self.busy = false;
+        self.done = true;
+        self.error = code;
+        self.latched = None;
+        self.engine = Engine::Idle;
+        self.block = 0;
+        self.beat = 0;
+        self.buffer = Vec::new();
+        ctx.trace(DONE_KIND, vec![("error", Value::U64(u64::from(code)))]);
+        self.update_irq(ctx)
+    }
+
+    /// The value after `counter`, or a session fault with nothing sent and the counter
+    /// kept (§6.2). The caller stores it once the send succeeded.
+    fn next_txn(counter: TxnId) -> Result<u64, SimError> {
+        counter.0.checked_add(1).ok_or(SimError::ComponentFault(
+            "dma controller: TxnId space exhausted",
+        ))
+    }
+
+    /// `Wake(ISSUE)`: sends the next request of the latched READ, `Now` in `Request`.
+    fn issue(&mut self, ctx: &mut dyn SimContext) -> Result<(), SimError> {
+        let latched = match (self.engine, self.latched) {
+            (Engine::Issue, Some(latched)) if latched.op == Operation::Read => latched,
+            _ => {
+                return Err(SimError::ComponentFault(
+                    "dma controller: ISSUE wake with nothing to issue",
+                ));
+            }
+        };
+        let overflow = SimError::ComponentFault("dma controller: engine index overflow");
+        if self.buffer.is_empty() {
+            let lba = u64::from(latched.lba)
+                .checked_add(u64::from(self.block))
+                .ok_or(overflow)?;
+            let txn = self.blk_txn;
+            let next = Self::next_txn(txn)?;
+            ctx.send(
+                BLK_PORT,
+                BlockMsg::ReadBlock { txn, lba }.into(),
+                ScheduleWhen::Now,
+                Phase::Request,
+            )?;
+            self.blk_txn = TxnId(next);
+            self.engine = Engine::WaitMedia(txn);
+        } else {
+            let offset = u64::from(self.beat) * BEAT_SIZE;
+            let addr = u64::from(self.block)
+                .checked_mul(BLOCK_BYTES)
+                .and_then(|block| block.checked_add(offset))
+                .and_then(|delta| u64::from(latched.addr).checked_add(delta))
+                .ok_or(overflow)?;
+            let start = offset as usize;
+            let data = self.buffer[start..start + BEAT_SIZE as usize].to_vec();
+            let txn = self.dma_txn;
+            let next = Self::next_txn(txn)?;
+            ctx.send(
+                DMA_PORT,
+                MemMsg::WriteReq { txn, addr, data }.into(),
+                ScheduleWhen::Now,
+                Phase::Request,
+            )?;
+            self.dma_txn = TxnId(next);
+            self.engine = Engine::WaitBeat(txn);
+        }
+        Ok(())
+    }
+
+    /// A message on `blk`: the result of the outstanding `ReadBlock`, in `Complete`.
+    fn media_result(&mut self, msg: &BlockMsg, ctx: &mut dyn SimContext) -> Result<(), SimError> {
+        let Engine::WaitMedia(expected) = self.engine else {
+            return Err(SimError::ComponentFault(
+                "dma controller: block.v0 message with no request outstanding",
+            ));
+        };
+        let BlockMsg::ReadResult { txn, outcome } = msg else {
+            return Err(SimError::ComponentFault(
+                "dma controller: block.v0 message is not a ReadResult",
+            ));
+        };
+        if *txn != expected {
+            return Err(SimError::ComponentFault(
+                "dma controller: ReadResult for a txn that is not outstanding",
+            ));
+        }
+        if ctx.phase() != Phase::Complete {
+            return Err(SimError::ComponentFault(
+                "dma controller: result arrived outside COMPLETE",
+            ));
+        }
+        match outcome {
+            BlockReadOutcome::Data { data } => {
+                if data.len() != block_v0::BLOCK_SIZE {
+                    return Err(SimError::ComponentFault(
+                        "dma controller: block data is not 512 bytes",
+                    ));
+                }
+                self.buffer = data.clone();
+                self.engine = Engine::Issue;
+                self.wake_next_cycle(ctx)
+            }
+            BlockReadOutcome::Error { .. } => self.complete(MEDIA_ERROR, ctx),
+        }
+    }
+
+    /// A message on `dma`: the response to the outstanding beat, in `Complete`.
+    fn beat_result(&mut self, msg: &MemMsg, ctx: &mut dyn SimContext) -> Result<(), SimError> {
+        let Engine::WaitBeat(expected) = self.engine else {
+            return Err(SimError::ComponentFault(
+                "dma controller: mem.v1 message with no beat outstanding",
+            ));
+        };
+        let MemMsg::WriteResp { txn, outcome } = msg else {
+            return Err(SimError::ComponentFault(
+                "dma controller: mem.v1 message is not a WriteResp",
+            ));
+        };
+        if *txn != expected {
+            return Err(SimError::ComponentFault(
+                "dma controller: WriteResp for a txn that is not outstanding",
+            ));
+        }
+        if ctx.phase() != Phase::Complete {
+            return Err(SimError::ComponentFault(
+                "dma controller: result arrived outside COMPLETE",
+            ));
+        }
+        if let WriteOutcome::Fault { .. } = outcome {
+            return self.complete(DMA_FAULT, ctx);
+        }
+        let Some(latched) = self.latched else {
+            return Err(SimError::ComponentFault(
+                "dma controller: beat outstanding without a command",
+            ));
+        };
+        self.beat += 1;
+        if self.beat == BEATS_PER_BLOCK {
+            self.beat = 0;
+            self.buffer = Vec::new();
+            self.block = self.block.checked_add(1).ok_or(SimError::ComponentFault(
+                "dma controller: engine index overflow",
+            ))?;
+            if self.block == latched.count {
+                return self.complete(0, ctx);
             }
         }
+        self.engine = Engine::Issue;
+        self.wake_next_cycle(ctx)
     }
 
     /// The register at `offset` as a read sees it, or `None` if it cannot be read.
@@ -551,8 +758,10 @@ impl Component for DmaBlockController {
         Ok(())
     }
 
-    /// Serves MMIO requests on `mem`. Nothing else may arrive: no engine request is ever
-    /// outstanding on `dma` or `blk`, `irq` is an output, and no wake is scheduled.
+    /// Serves MMIO requests on `mem`, `Wake(ISSUE)`, and the results of the outstanding
+    /// engine request on `dma` and `blk`. Anything else faults the session: `irq` is an
+    /// output, and a message of the wrong protocol, kind, or `txn` is a protocol
+    /// violation (§9.8).
     fn handle_event(&mut self, ev: &Delivered, ctx: &mut dyn SimContext) -> Result<(), SimError> {
         match ev {
             Delivered::Message {
@@ -560,11 +769,14 @@ impl Component for DmaBlockController {
                 msg: Message::MemV1(msg),
             } => self.request(msg, ctx),
             Delivered::Message {
-                port: DMA_PORT | BLK_PORT,
-                ..
-            } => Err(SimError::ComponentFault(
-                "dma controller: engine message with no request outstanding",
-            )),
+                port: DMA_PORT,
+                msg: Message::MemV1(msg),
+            } => self.beat_result(msg, ctx),
+            Delivered::Message {
+                port: BLK_PORT,
+                msg: Message::Block(msg),
+            } => self.media_result(msg, ctx),
+            Delivered::Wake { token: ISSUE } => self.issue(ctx),
             _ => Err(SimError::ComponentFault(
                 "dma controller: unexpected delivery",
             )),
@@ -596,6 +808,8 @@ impl Component for DmaBlockController {
         let engine = match self.engine {
             Engine::Idle => "idle",
             Engine::Issue => "issue",
+            Engine::WaitMedia(_) => "wait_media",
+            Engine::WaitBeat(_) => "wait_beat",
         };
         StateView {
             fields: vec![
@@ -609,8 +823,8 @@ impl Component for DmaBlockController {
                 ("rejected", Value::Bool(self.rejected)),
                 ("command", Value::Str(command)),
                 ("engine", Value::Str(engine.to_string())),
-                ("block", Value::U64(0)),
-                ("beat", Value::U64(0)),
+                ("block", Value::U64(u64::from(self.block))),
+                ("beat", Value::U64(u64::from(self.beat))),
                 ("irq", Value::Bool(self.irq_level)),
             ],
         }
@@ -628,8 +842,8 @@ impl Component for DmaBlockController {
     /// 3. `BUSY`, `DONE`, `REJECTED` (`bool`s), `ERROR` (`u8`);
     /// 4. when BUSY only: the latched operation (`u8` 1 or 2), `LBA`, `MEM_ADDR`,
     ///    `BLOCK_COUNT` (`u32`s);
-    /// 5. the engine state (`u8`: 0 `Idle`, 1 `Issue`; the engine adds 2 `WaitMedia` and
-    ///    3 `WaitBeat`, each followed by its `u64` txn), block index *i* (`u32`), beat
+    /// 5. the engine state (`u8`: 0 `Idle`, 1 `Issue`, 2 `WaitMedia`, 3 `WaitBeat`, the
+    ///    last two followed by the outstanding `u64` txn), block index *i* (`u32`), beat
     ///    index *j* (`u8`);
     /// 6. the block buffer (length-prefixed bytes);
     /// 7. the next `dma` and `blk` `TxnId`s (`u64`s);
@@ -650,13 +864,21 @@ impl Component for DmaBlockController {
             w.u32(l.addr);
             w.u32(l.count);
         }
-        w.u8(match self.engine {
-            Engine::Idle => 0,
-            Engine::Issue => 1,
-        });
-        w.u32(0);
-        w.u8(0);
-        w.bytes(&[]);
+        match self.engine {
+            Engine::Idle => w.u8(0),
+            Engine::Issue => w.u8(1),
+            Engine::WaitMedia(txn) => {
+                w.u8(2);
+                w.u64(txn.0);
+            }
+            Engine::WaitBeat(txn) => {
+                w.u8(3);
+                w.u64(txn.0);
+            }
+        }
+        w.u32(self.block);
+        w.u8(self.beat);
+        w.bytes(&self.buffer);
         w.u64(self.dma_txn.0);
         w.u64(self.blk_txn.0);
         w.bool(self.irq_level);
@@ -666,10 +888,12 @@ impl Component for DmaBlockController {
     ///
     /// Rejects a different configuration and every state no run can produce:
     /// `IRQ_ENABLE` bits other than bit 0; BUSY with DONE; an `ERROR` outside DONE, or in
-    /// DONE other than a validation code (1–5); a latched command that fails validation;
-    /// an engine state other than `Idle` without BUSY or other than `Issue` with it;
-    /// engine indices other than 0; a non-empty buffer; a used `TxnId`; and an IRQ level
-    /// other than `DONE && IRQ_ENABLE.bit0`.
+    /// DONE above 7; a latched command that fails validation; an engine state other than
+    /// `Idle` without BUSY, or `Idle` with it; engine indices or a buffer outside `Idle`'s
+    /// zeros and empty buffer; a WRITE anywhere but `Issue` at block 0, beat 0 (M2.7b); a
+    /// READ block index not below the latched count, or a buffer length other than the
+    /// one its engine position requires (§9.9); an outstanding `txn` that is not the
+    /// latest issued on its port; and an IRQ level other than `DONE && IRQ_ENABLE.bit0`.
     fn restore(&mut self, r: &mut SnapshotReader<'_>, _: u32) -> Result<(), RestoreError> {
         let invalid = RestoreError::InvalidState;
         let mut config = SnapshotWriter::new();
@@ -686,7 +910,7 @@ impl Component for DmaBlockController {
             return Err(invalid("dma controller: BUSY and DONE together"));
         }
         let error_ok = if done {
-            (BAD_COMMAND..=DMA_RANGE).contains(&error)
+            error <= MEDIA_ERROR
         } else {
             error == 0
         };
@@ -710,21 +934,44 @@ impl Component for DmaBlockController {
         let engine = match r.u8()? {
             0 => Engine::Idle,
             1 => Engine::Issue,
-            _ => return Err(invalid("dma controller: engine state not reachable")),
+            2 => Engine::WaitMedia(TxnId(r.u64()?)),
+            3 => Engine::WaitBeat(TxnId(r.u64()?)),
+            _ => return Err(invalid("dma controller: unknown engine state")),
         };
-        if (engine == Engine::Issue) != busy {
-            return Err(invalid("dma controller: engine state does not match BUSY"));
-        }
-        if r.u32()? != 0 || r.u8()? != 0 {
-            return Err(invalid("dma controller: engine has made progress"));
-        }
-        if !r.bytes()?.is_empty() {
-            return Err(invalid("dma controller: block buffer not empty"));
-        }
-        if r.u64()? != 0 || r.u64()? != 0 {
-            return Err(invalid("dma controller: a TxnId was used"));
-        }
+        let (block, beat) = (r.u32()?, r.u8()?);
+        let buffer = r.bytes()?.to_vec();
+        let (dma_txn, blk_txn) = (r.u64()?, r.u64()?);
         let irq_level = r.bool()?;
+        let full = buffer.len() == block_v0::BLOCK_SIZE;
+        let latest = |next: u64, txn: TxnId| next.checked_sub(1) == Some(txn.0);
+        let engine_ok = match latched {
+            None => engine == Engine::Idle && block == 0 && beat == 0 && buffer.is_empty(),
+            Some(Latched {
+                op: Operation::Write,
+                ..
+            }) => engine == Engine::Issue && block == 0 && beat == 0 && buffer.is_empty(),
+            Some(Latched {
+                op: Operation::Read,
+                count,
+                ..
+            }) => {
+                block < count
+                    && beat < BEATS_PER_BLOCK
+                    && match engine {
+                        Engine::Idle => false,
+                        Engine::Issue => full || (buffer.is_empty() && beat == 0),
+                        Engine::WaitMedia(txn) => {
+                            buffer.is_empty() && beat == 0 && latest(blk_txn, txn)
+                        }
+                        Engine::WaitBeat(txn) => full && latest(dma_txn, txn),
+                    }
+            }
+        };
+        if !engine_ok {
+            return Err(invalid(
+                "dma controller: engine position not reachable for the command",
+            ));
+        }
         if irq_level != (done && irq_enable & 1 != 0) {
             return Err(invalid(
                 "dma controller: IRQ level is not DONE && IRQ_ENABLE",
@@ -740,8 +987,11 @@ impl Component for DmaBlockController {
         self.error = error;
         self.latched = latched;
         self.engine = engine;
-        self.dma_txn = TxnId(0);
-        self.blk_txn = TxnId(0);
+        self.block = block;
+        self.beat = beat;
+        self.buffer = buffer;
+        self.dma_txn = TxnId(dma_txn);
+        self.blk_txn = TxnId(blk_txn);
         self.irq_level = irq_level;
         Ok(())
     }

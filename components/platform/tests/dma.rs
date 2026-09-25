@@ -6,8 +6,10 @@
 //! initiator, an interrupt sink, and tie-offs on `dma` and `blk` that fault on any
 //! message, for timing and every-event checkpoints.
 //!
-//! Every mock-context delivery also checks that nothing is sent on `dma` or `blk`: the
-//! engine is M2.7.
+//! Every mock-context MMIO delivery also checks that nothing is sent on `dma` or `blk`,
+//! and that exactly an accepted READ schedules one `Wake(ISSUE)` (M2.7a); the READ engine
+//! itself is tested in `dma_read.rs`. The runtime workload's accepted command is a WRITE,
+//! which stays at the M2.6 boundary until M2.7b.
 
 mod common;
 
@@ -32,8 +34,9 @@ use systemscope_contracts::topology::LinkLatency;
 use systemscope_contracts::trace::{TraceAt, TraceOrigin, Value};
 use systemscope_platform::dma::{
     ACK, ADDRESS_LIMIT, BAD_COMMAND, BAD_COUNT, BLK_PORT, BLOCK_COUNT, COMMAND, COMMAND_KIND,
-    DMA_ALIGN, DMA_PORT, DMA_RANGE, DONE_KIND, IRQ_ENABLE, IRQ_PORT, IRQ_STATUS, LBA, LBA_RANGE,
-    MAX_CAPACITY_BLOCKS, MEM_ADDR, MEM_PORT, REJECTED_KIND, SIZE, SNAPSHOT_SCHEMA, STATUS,
+    DMA_ALIGN, DMA_FAULT, DMA_PORT, DMA_RANGE, DONE_KIND, IRQ_ENABLE, IRQ_PORT, IRQ_STATUS, ISSUE,
+    LBA, LBA_RANGE, MAX_CAPACITY_BLOCKS, MEDIA_ERROR, MEM_ADDR, MEM_PORT, REJECTED_KIND, SIZE,
+    SNAPSHOT_SCHEMA, STATUS,
 };
 use systemscope_platform::{
     DmaBlockController, DmaBlockControllerConfig, DmaBlockControllerConfigError,
@@ -87,12 +90,33 @@ fn controller() -> DmaBlockController {
 
 /// Delivers one MMIO request on `mem` and returns the context, checking that exactly one
 /// response went back on `mem` after the latency in `Complete`, that every `Level` went
-/// on `irq` (`Now`, `Complete`), and that nothing was sent on `dma` or `blk`.
+/// on `irq` (`Now`, `Complete`), that nothing was sent on `dma` or `blk`, and that a wake
+/// was scheduled exactly when a READ was accepted: one `Wake(ISSUE)` at the next cycle's
+/// `Request`.
 fn mmio(c: &mut DmaBlockController, msg: MemMsg) -> (MemMsg, MockCtx) {
     let mut ctx = MockCtx::new(Phase::Transfer);
     ctx.deliver(c, MEM_PORT, msg).unwrap();
     assert!(ctx.blocks.is_empty(), "block.v0 sent: {:?}", ctx.blocks);
-    assert!(ctx.wakes.is_empty(), "wake scheduled: {:?}", ctx.wakes);
+    let read_accepted = ctx.traced.iter().any(|(kind, fields)| {
+        *kind == COMMAND_KIND
+            && fields.contains(&("op", Value::U64(1)))
+            && fields.contains(&("accepted", Value::Bool(true)))
+    });
+    let wakes: Vec<_> = ctx
+        .wakes
+        .iter()
+        .map(|w| (w.when, w.phase, w.token))
+        .collect();
+    let issue = (
+        ScheduleWhen::Cycles {
+            domain: CLOCK,
+            k: 1,
+        },
+        Phase::Request,
+        ISSUE,
+    );
+    let expected = if read_accepted { vec![issue] } else { vec![] };
+    assert_eq!(wakes, expected);
     assert_eq!(ctx.sent.len(), 1, "mem.v1 sends: {:?}", ctx.sent);
     let sent = ctx.sent.pop().unwrap();
     assert_eq!(
@@ -475,10 +499,28 @@ fn protocol_violations_fault_the_session() {
             assert_eq!(snapshot_of(&c), before);
         }
     }
-    let mut ctx = MockCtx::new(Phase::Request);
-    let result = c.handle_event(&Delivered::Wake { token: 0 }, &mut ctx);
-    assert!(matches!(result, Err(SimError::ComponentFault(_))));
-    assert_eq!(snapshot_of(&c), before);
+    // Only `Wake(ISSUE)` exists.
+    for token in [1, 2, u64::MAX] {
+        let mut ctx = MockCtx::new(Phase::Request);
+        let result = c.handle_event(&Delivered::Wake { token }, &mut ctx);
+        assert!(matches!(result, Err(SimError::ComponentFault(_))));
+        assert!(ctx.order.is_empty());
+        assert_eq!(snapshot_of(&c), before);
+    }
+    // `Wake(ISSUE)` with nothing to issue: IDLE, DONE, and an accepted WRITE (M2.7b).
+    let mut idle = controller();
+    let mut done = controller();
+    submit(&mut done, 1, 0, 0x1000, 0);
+    let mut write_busy = controller();
+    assert_eq!(submit(&mut write_busy, 2, 0, 0x1000, 1), 0);
+    for c in [&mut idle, &mut done, &mut write_busy] {
+        let before = snapshot_of(c);
+        let mut ctx = MockCtx::new(Phase::Request);
+        let result = c.handle_event(&Delivered::Wake { token: ISSUE }, &mut ctx);
+        assert!(matches!(result, Err(SimError::ComponentFault(_))));
+        assert!(ctx.order.is_empty());
+        assert_eq!(snapshot_of(c), before);
+    }
 }
 
 // --- Validation ---
@@ -1118,6 +1160,46 @@ fn hand_written_valid_snapshots_restore() {
             rejected: 1,
             ..Raw::busy()
         },
+        // Reachable since M2.7a: a successful completion, the engine's error codes, used
+        // counters, and every READ engine position.
+        Raw::done(0, true),
+        Raw::done(DMA_FAULT, false),
+        Raw::done(MEDIA_ERROR, true),
+        Raw {
+            dma_txn: 40,
+            blk_txn: 7,
+            ..Raw::idle()
+        },
+        Raw {
+            block: 2,
+            ..Raw::busy()
+        },
+        Raw {
+            engine: 2,
+            txn: Some(6),
+            block: 1,
+            blk_txn: 7,
+            ..Raw::busy()
+        },
+        Raw {
+            buffer: vec![0x5a; 512],
+            beat: 0,
+            ..Raw::busy()
+        },
+        Raw {
+            buffer: vec![0x5a; 512],
+            beat: 31,
+            block: 2,
+            ..Raw::busy()
+        },
+        Raw {
+            engine: 3,
+            txn: Some(39),
+            buffer: vec![0xa5; 512],
+            beat: 17,
+            dma_txn: 40,
+            ..Raw::busy()
+        },
     ] {
         let bytes = raw.encode();
         let mut c = controller();
@@ -1195,12 +1277,6 @@ fn restore_rejects_impossible_states() {
             }
             .encode(),
         ),
-        ("done without an error", Raw::done(0, false).encode()),
-        ("DMA_FAULT without an engine", Raw::done(6, false).encode()),
-        (
-            "MEDIA_ERROR without an engine",
-            Raw::done(7, false).encode(),
-        ),
         ("unused code", Raw::done(8, false).encode()),
         (
             "busy without a latched command",
@@ -1275,7 +1351,7 @@ fn restore_rejects_impossible_states() {
             .encode(),
         ),
         (
-            "waiting for media",
+            "waiting for media with no blk txn issued",
             Raw {
                 engine: 2,
                 txn: Some(0),
@@ -1284,7 +1360,7 @@ fn restore_rejects_impossible_states() {
             .encode(),
         ),
         (
-            "waiting for a beat",
+            "waiting for a beat with no buffer or dma txn",
             Raw {
                 engine: 3,
                 txn: Some(0),
@@ -1301,15 +1377,160 @@ fn restore_rejects_impossible_states() {
             .encode(),
         ),
         (
-            "block progress",
+            "block index at the latched count",
             Raw {
+                block: 3,
+                ..Raw::busy()
+            }
+            .encode(),
+        ),
+        (
+            "block progress on a WRITE",
+            Raw {
+                latched: Some((2, 2, 0x1100, 3)),
                 block: 1,
                 ..Raw::busy()
             }
             .encode(),
         ),
         (
-            "beat progress",
+            "a WRITE waiting for a beat",
+            Raw {
+                latched: Some((2, 2, 0x1100, 3)),
+                engine: 3,
+                txn: Some(0),
+                dma_txn: 1,
+                buffer: vec![0; 512],
+                ..Raw::busy()
+            }
+            .encode(),
+        ),
+        (
+            "a WRITE with a buffer",
+            Raw {
+                latched: Some((2, 2, 0x1100, 3)),
+                buffer: vec![0; 512],
+                ..Raw::busy()
+            }
+            .encode(),
+        ),
+        (
+            "waiting for media on a stale txn",
+            Raw {
+                engine: 2,
+                txn: Some(3),
+                blk_txn: 5,
+                ..Raw::busy()
+            }
+            .encode(),
+        ),
+        (
+            "waiting for media past beat 0",
+            Raw {
+                engine: 2,
+                txn: Some(0),
+                blk_txn: 1,
+                beat: 3,
+                ..Raw::busy()
+            }
+            .encode(),
+        ),
+        (
+            "waiting for media with a buffer",
+            Raw {
+                engine: 2,
+                txn: Some(0),
+                blk_txn: 1,
+                buffer: vec![0; 512],
+                ..Raw::busy()
+            }
+            .encode(),
+        ),
+        (
+            "waiting for a beat without a buffer",
+            Raw {
+                engine: 3,
+                txn: Some(0),
+                dma_txn: 1,
+                ..Raw::busy()
+            }
+            .encode(),
+        ),
+        (
+            "waiting for a beat on a stale txn",
+            Raw {
+                engine: 3,
+                txn: Some(0),
+                dma_txn: 2,
+                buffer: vec![0; 512],
+                ..Raw::busy()
+            }
+            .encode(),
+        ),
+        (
+            "waiting for a beat on the next txn",
+            Raw {
+                engine: 3,
+                txn: Some(2),
+                dma_txn: 2,
+                buffer: vec![0; 512],
+                ..Raw::busy()
+            }
+            .encode(),
+        ),
+        (
+            "beat index 32",
+            Raw {
+                beat: 32,
+                buffer: vec![0; 512],
+                ..Raw::busy()
+            }
+            .encode(),
+        ),
+        (
+            "a partial block buffer",
+            Raw {
+                buffer: vec![0; 511],
+                ..Raw::busy()
+            }
+            .encode(),
+        ),
+        (
+            "an oversized block buffer",
+            Raw {
+                buffer: vec![0; 513],
+                ..Raw::busy()
+            }
+            .encode(),
+        ),
+        (
+            "a buffer while idle",
+            Raw {
+                buffer: vec![0; 512],
+                ..Raw::idle()
+            }
+            .encode(),
+        ),
+        (
+            "progress while done",
+            Raw {
+                block: 1,
+                ..Raw::done(0, false)
+            }
+            .encode(),
+        ),
+        (
+            "waiting for media while idle",
+            Raw {
+                engine: 2,
+                txn: Some(0),
+                blk_txn: 1,
+                ..Raw::idle()
+            }
+            .encode(),
+        ),
+        (
+            "beat progress without a buffer",
             Raw {
                 beat: 1,
                 ..Raw::busy()
@@ -1321,22 +1542,6 @@ fn restore_rejects_impossible_states() {
             Raw {
                 buffer: vec![0; 16],
                 ..Raw::busy()
-            }
-            .encode(),
-        ),
-        (
-            "used dma txn",
-            Raw {
-                dma_txn: 1,
-                ..Raw::busy()
-            }
-            .encode(),
-        ),
-        (
-            "used blk txn",
-            Raw {
-                blk_txn: 1,
-                ..Raw::idle()
             }
             .encode(),
         ),
@@ -1773,7 +1978,8 @@ fn w32(offset: u64, value: u32) -> MemMsg {
 }
 
 /// Programming, a validation failure with the interrupt enabled, a rejection in DONE,
-/// ACK, clearing REJECTED, a valid command, a rejection in BUSY, reprogramming during
+/// ACK, clearing REJECTED, a valid WRITE (which stays BUSY at the M2.6 boundary until
+/// M2.7b, sending nothing), a rejection in BUSY, reprogramming during
 /// BUSY, reads, and bad accesses. Each request has its own txn.
 fn workload() -> Vec<(u64, MemMsg)> {
     let mut requests = vec![
@@ -1788,7 +1994,7 @@ fn workload() -> Vec<(u64, MemMsg)> {
         (6, read(0, R_IRQ_STATUS, 4)),
         (7, w32(R_STATUS, REJECTED)),
         (8, w32(R_BLOCK_COUNT, 4)),
-        (9, w32(R_COMMAND, 1)),
+        (9, w32(R_COMMAND, 2)),
         (10, w32(R_COMMAND, 1)),
         (11, w32(R_LBA, 7)),
         (12, read(0, R_STATUS, 4)),
@@ -1925,7 +2131,7 @@ fn the_runtime_workload_matches_the_model_and_the_frozen_timing() {
         ..config(CAPACITY, BASE, APERTURE)
     }));
     assert!(snap.windows(ours.len()).any(|w| w == ours));
-    assert!(m.busy && m.latched == Some((1, 2, 0x1000, 4)));
+    assert!(m.busy && m.latched == Some((2, 2, 0x1000, 4)));
 }
 
 #[test]
