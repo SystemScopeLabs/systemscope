@@ -197,7 +197,7 @@ impl Observer for Probe {
     fn on_after_dispatch(&mut self, _: &EventView<'_>, world: &WorldView<'_>) -> Control {
         *self.0.borrow_mut() = (0..world.component_count())
             .map(|i| {
-                let id = ComponentId(u32::try_from(i).expect("five components at most"));
+                let id = ComponentId(u32::try_from(i).expect("a handful of components"));
                 world.inspect(id).unwrap_or_default()
             })
             .collect();
@@ -352,7 +352,19 @@ pub struct Finished {
 
 /// Starts the elaborated `rt` as `start` says and runs it until it has no more events.
 /// `observers` are added after the runner's own, which only reads.
-pub fn execute(mut rt: Runtime, start: Start, observers: Vec<Box<dyn Observer>>) -> Finished {
+pub fn execute(rt: Runtime, start: Start, observers: Vec<Box<dyn Observer>>) -> Finished {
+    execute_bounded(rt, start, observers, None).0
+}
+
+/// [`execute`], stopped with [`End::Fault`] once `budget` events have run after the
+/// start, if a budget is given, and returning the session as well, so the caller can take
+/// its final snapshot. A budget bounds what a diverging program records.
+pub fn execute_bounded(
+    mut rt: Runtime,
+    start: Start,
+    observers: Vec<Box<dyn Observer>>,
+    budget: Option<u64>,
+) -> (Finished, Runtime) {
     let last = Rc::new(RefCell::new(Vec::new()));
     rt.add_observer(Box::new(Probe(Rc::clone(&last))));
     for observer in observers {
@@ -372,6 +384,10 @@ pub fn execute(mut rt: Runtime, start: Start, observers: Vec<Box<dyn Observer>>)
     };
     let mut dispatched = Vec::new();
     while fault.is_none() {
+        if let Some(budget) = budget.filter(|&b| dispatched.len() as u64 >= b) {
+            fault = Some(format!("stopped at the budget of {budget} events"));
+            break;
+        }
         match rt.step() {
             Ok(Some(ev)) => dispatched.push(ev),
             Ok(None) => break,
@@ -415,12 +431,13 @@ pub fn execute(mut rt: Runtime, start: Start, observers: Vec<Box<dyn Observer>>)
         instret: reg("instret"),
         events: dispatched.len() as u64,
     };
-    Finished {
+    let finished = Finished {
         outcome,
         views,
         dispatched,
         trace,
-    }
+    };
+    (finished, rt)
 }
 
 /// One fixture's result.

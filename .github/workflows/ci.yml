@@ -91,12 +91,17 @@ jobs:
       # docs/m1-design.md §10.2, §10.6: the committed rv32ui ELFs and hello.elf, run from
       # the same bytes on both operating systems. No step builds anything or uses the
       # network.
-      - name: rv32ui fixtures and hello.elf match their manifests
+      - name: rv32ui fixtures, hello.elf, and block_irq.elf match their manifests
         run: cargo xtask rv32-fixtures verify
       - name: M1-A2 rv32ui (40 selected tests)
         run: cargo nextest run -p systemscope-rv32 --locked --profile ci --no-fail-fast --lib --test rv32ui --test fixtures
       - name: M1-A5 hello.elf through the CPU and SimpleUart (output, checkpoints)
         run: cargo nextest run -p systemscope-rv32 --locked --profile ci --no-fail-fast --test hello
+      # docs/m2-design.md §11, §12: m2-reference and block_irq.elf with its disk fixture,
+      # end to end: DMA transfers, CPU/DMA RAM contention, the completion interrupt, the
+      # handler, and determinism.
+      - name: M2.8 m2-reference and block_irq.elf (builder, end to end, contention, determinism)
+        run: cargo nextest run -p systemscope-rv32 --locked --profile ci --no-fail-fast --test block_irq
       # docs/m1-design.md §10.4: the committed ACT4 corpus, generated with Sail on Linux by
       # the act4 job, run from the same bytes on both operating systems.
       - name: ACT4 corpus matches its manifest (pins, config, audit)
@@ -115,9 +120,9 @@ jobs:
         run: cargo nextest run -p systemscope-acceptance --locked --profile ci --no-fail-fast --test m1_a8
       - name: M1 golden verify
         run: cargo xtask m1-golden verify
-      - name: rv32ui fixtures, hello.elf, and the ACT4 corpus unchanged
+      - name: rv32ui fixtures, hello.elf, block_irq.elf, and the ACT4 corpus unchanged
         shell: bash
-        run: git diff --exit-code -- tests/rv32/fixtures tests/rv32/hello tests/act4
+        run: git diff --exit-code -- tests/rv32/fixtures tests/rv32/hello tests/rv32/block_irq tests/act4
       # Only `cargo xtask bless` writes golden files; a test that wrote one would show here.
       - name: Golden files unchanged
         shell: bash
@@ -171,9 +176,10 @@ jobs:
       - name: Check the ${{ matrix.from }} result and restore its snapshot
         run: cargo xtask m1-golden check target/m1-foreign
 
-  # docs/m1-design.md §10.6: rebuilds the rv32ui fixtures from the pinned riscv-tests, and
-  # hello.elf from tests/rv32/hello, with the pinned toolchain on a clean machine, and
-  # requires the committed bytes and manifests back. The only job that installs a RISC-V toolchain or fetches riscv-tests.
+  # docs/m1-design.md §10.6: rebuilds the rv32ui fixtures from the pinned riscv-tests,
+  # hello.elf from tests/rv32/hello, and block_irq.elf and its disk fixture from
+  # tests/rv32/block_irq (docs/m2-design.md §18), with the pinned toolchain on a clean
+  # machine, and requires the committed bytes and manifests back. The only job that installs a RISC-V toolchain or fetches riscv-tests.
   rv32-fixtures:
     name: rv32ui fixtures rebuild (Linux)
     runs-on: ubuntu-24.04

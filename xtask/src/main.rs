@@ -14,15 +14,17 @@
 //!   committed ones and this machine's, and restores and runs its snapshot here.
 //! - `rv32-fixtures build`: Linux only, with the pinned toolchain on `PATH`. Rebuilds the
 //!   40 `rv32ui` fixtures from the pinned `riscv-tests` with `tests/rv32/build-fixtures.sh`
-//!   (the only step that uses the network) and `hello.elf` with
-//!   `tests/rv32/hello/build-hello.sh`, then runs the `manifest` step. Tests never rebuild
-//!   fixtures; the commit that changes them must say why in its body.
+//!   (the only step that uses the network), `hello.elf` with
+//!   `tests/rv32/hello/build-hello.sh`, and `block_irq.elf` with
+//!   `tests/rv32/block_irq/build-block-irq.sh`, then runs the `manifest` step. Tests never
+//!   rebuild fixtures; the commit that changes them must say why in its body.
 //! - `rv32-fixtures manifest [<cache-dir>]`: the second half of `build`, for a build run
 //!   by hand. Checks the upstream checkout in the cache (default `target/rv32-fixtures`),
-//!   rewrites `tests/rv32/fixtures/manifest.json` and `tests/rv32/hello/manifest.json`, and
-//!   verifies.
-//! - `rv32-fixtures verify`: checks the committed fixtures and `hello.elf` against their
-//!   manifests, with no network and no compiler.
+//!   rewrites `tests/rv32/fixtures/manifest.json` and `tests/rv32/hello/manifest.json`,
+//!   writes the `block_irq.elf` disk fixture `tests/rv32/block_irq/disk.img` and rewrites
+//!   `tests/rv32/block_irq/manifest.json`, and verifies.
+//! - `rv32-fixtures verify`: checks the committed fixtures, `hello.elf`, `block_irq.elf`,
+//!   and its disk fixture against their manifests, with no network and no compiler.
 //! - `spike build [<dir>]`: Linux only, with git, a C++ compiler, make, and dtc. Fetches
 //!   and builds the pinned Spike into `<dir>` (default `target/spike`) with
 //!   `tests/rv32/build-spike.sh`, then runs `verify`.
@@ -64,6 +66,9 @@ use std::process::{Command, ExitCode};
 use systemscope_acceptance::golden::{GOLDEN_PATH, Golden, MID_SNAPSHOT_PATH, describe_changes};
 use systemscope_acceptance::m1::golden as m1;
 use systemscope_rv32::act4::{self, ACT4_MANIFEST, ACT4_SCRIPT};
+use systemscope_rv32::block_irq::{
+    self, BLOCK_IRQ_DIR, BLOCK_IRQ_MANIFEST, BLOCK_IRQ_SCRIPT, BlockIrqManifest,
+};
 use systemscope_rv32::csrgen;
 use systemscope_rv32::hello::{self, HELLO_DIR, HELLO_MANIFEST, HELLO_SCRIPT, HelloManifest};
 use systemscope_rv32::manifest::{Manifest, verify};
@@ -312,6 +317,7 @@ fn rv32_build() -> ExitCode {
     for (script, args) in [
         (BUILD_SCRIPT, rv32ui),
         (HELLO_SCRIPT, vec![RV32_CACHE, HELLO_DIR]),
+        (BLOCK_IRQ_SCRIPT, vec![RV32_CACHE, BLOCK_IRQ_DIR]),
     ] {
         match Command::new("bash")
             .arg(script)
@@ -371,6 +377,27 @@ fn rv32_manifest(cache: &Path) -> ExitCode {
     } else {
         println!("wrote {HELLO_MANIFEST}");
     }
+    if let Err(e) = block_irq::write_disk(&root) {
+        eprintln!("cannot write the block_irq disk fixture: {e}");
+        return ExitCode::FAILURE;
+    }
+    let old_block_irq = BlockIrqManifest::read(&root).ok();
+    let block_irq = match BlockIrqManifest::generate(&root) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("cannot generate the block_irq manifest: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = fs::write(root.join(BLOCK_IRQ_MANIFEST), block_irq.render()) {
+        eprintln!("cannot write {BLOCK_IRQ_MANIFEST}: {e}");
+        return ExitCode::FAILURE;
+    }
+    if old_block_irq.as_ref() == Some(&block_irq) {
+        println!("{BLOCK_IRQ_MANIFEST} is up to date");
+    } else {
+        println!("wrote {BLOCK_IRQ_MANIFEST}");
+    }
     match &old {
         None => println!("wrote a new {MANIFEST_PATH}"),
         Some(old) => {
@@ -415,6 +442,22 @@ fn rv32_verify() -> ExitCode {
         Err(errors) => {
             ok = false;
             eprintln!("hello.elf does not match {HELLO_MANIFEST}:");
+            for e in errors {
+                eprintln!("  {e}");
+            }
+        }
+    }
+    match block_irq::verify(&root) {
+        Ok(manifest) => println!(
+            "{} and {} match {BLOCK_IRQ_MANIFEST} (BLAKE3 {}, {})",
+            manifest.elf,
+            manifest.disk,
+            systemscope_rv32::hex(&manifest.blake3),
+            systemscope_rv32::hex(&manifest.disk_blake3)
+        ),
+        Err(errors) => {
+            ok = false;
+            eprintln!("block_irq.elf does not match {BLOCK_IRQ_MANIFEST}:");
             for e in errors {
                 eprintln!("  {e}");
             }

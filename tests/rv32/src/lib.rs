@@ -24,6 +24,12 @@
 //! - [`csrgen`] is the M2 part of the Spike differential: directed Zicsr, CSR, and `MRET`
 //!   programs run with the M2 CPU profile (`docs/m2-design.md` §4), and one program per
 //!   rejected CSR that must trap on both sides.
+//! - [`m2ref`] builds `m2-reference`, the M2 reference platform (`docs/m2-design.md`
+//!   §11): the `M2` CPU, the multi-master bus, the RAM, the UART, the IRQ controller, the
+//!   DMA block controller, and the block media.
+//! - [`block_irq`] is `block_irq.elf` (§12), built from `block_irq/block_irq.S` with the
+//!   same toolchain, with its disk fixture, pinned by `block_irq/manifest.json`, and run on
+//!   `m2-reference`.
 //!
 //! Tests only read the committed fixtures. `cargo xtask rv32-fixtures build` rebuilds
 //! them on Linux, and `cargo xtask rv32-fixtures verify` checks them without a network or
@@ -32,8 +38,10 @@
 use std::path::{Path, PathBuf};
 
 pub mod act4;
+pub mod block_irq;
 pub mod csrgen;
 pub mod hello;
+pub mod m2ref;
 pub mod manifest;
 pub mod progen;
 pub mod runner;
