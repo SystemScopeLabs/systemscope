@@ -2,7 +2,8 @@
 //! crate.
 //!
 //! - [`MockCtx`] drives one component directly, recording what it sends (`mem.v1` and
-//!   `irq.v0`) and traces, so unit and property tests run without a runtime.
+//!   `irq.v0`), the wakes it schedules, and what it traces, so unit and property tests run
+//!   without a runtime.
 //! - [`Script`] is a stateless `mem.v1` initiator for runtime tests: it schedules every
 //!   request during `init`, so its pending requests live in the runtime's queue and it
 //!   has nothing to snapshot. Responses show up in the runtime's dispatch records.
@@ -40,11 +41,20 @@ pub struct IrqSent {
     pub phase: Phase,
 }
 
-/// Which protocol a `send` used, in the order the component sent them.
+/// One `wake_self` a component made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Wake {
+    pub when: ScheduleWhen,
+    pub phase: Phase,
+    pub token: u64,
+}
+
+/// Which protocol a `send` used, or a wake, in the order the component made them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SendKind {
     Mem,
     Irq,
+    Wake,
 }
 
 /// One `trace` record a component made.
@@ -64,6 +74,7 @@ pub struct MockCtx {
     pub phase: Phase,
     pub sent: Vec<Sent>,
     pub irqs: Vec<IrqSent>,
+    pub wakes: Vec<Wake>,
     pub order: Vec<SendKind>,
     pub traced: Vec<Traced>,
     rng: NoRng,
@@ -75,6 +86,7 @@ impl MockCtx {
             phase,
             sent: Vec::new(),
             irqs: Vec::new(),
+            wakes: Vec::new(),
             order: Vec::new(),
             traced: Vec::new(),
             rng: NoRng,
@@ -153,8 +165,10 @@ impl InitContext for MockCtx {
         Ok(())
     }
 
-    fn wake_self(&mut self, _: ScheduleWhen, _: Phase, _: u64) -> Result<(), SimError> {
-        panic!("platform components never wake themselves")
+    fn wake_self(&mut self, when: ScheduleWhen, phase: Phase, token: u64) -> Result<(), SimError> {
+        self.order.push(SendKind::Wake);
+        self.wakes.push(Wake { when, phase, token });
+        Ok(())
     }
 
     fn rng(&mut self) -> &mut dyn SimRng {
