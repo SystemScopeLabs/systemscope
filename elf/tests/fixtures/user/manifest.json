@@ -1,0 +1,38 @@
+{
+  "schema": 1,
+  "toolchain": {
+    "distro": "Ubuntu 24.04 (noble)",
+    "packages": [
+      {
+        "name": "gcc-riscv64-unknown-elf",
+        "version": "13.2.0-11ubuntu1+12",
+        "deb_sha256": "47d4670801c391c65513e2002a19280c6bbdba158f5a467ac5100bff813de0e3",
+        "version_line": "riscv64-unknown-elf-gcc (13.2.0-11ubuntu1+12) 13.2.0"
+      },
+      {
+        "name": "binutils-riscv64-unknown-elf",
+        "version": "2.42-1ubuntu1+6",
+        "deb_sha256": "d42d42efdaa0563155d0e1263675852255b20864cc525db9265247a5dec2ce30",
+        "version_line": "GNU assembler (2.42-1ubuntu1+6) 2.42"
+      }
+    ]
+  },
+  "flags": [
+    "-march=rv32i",
+    "-mabi=ilp32",
+    "-static",
+    "-mcmodel=medany",
+    "-fvisibility=hidden",
+    "-nostdlib",
+    "-nostartfiles",
+    "-Wl,--build-id=none"
+  ],
+  "user_range": { "start": "0x00010000", "end": "0x7fffb000" },
+  "inputs": [
+    { "path": "elf/tests/fixtures/user/build-user.sh", "blake3": "8b35552da92806ba9a9f15435b3f47bc17cf660d683340852e9c92adc257b21a" },
+    { "path": "elf/tests/fixtures/user/user.S", "blake3": "978eca6676dd10e3188ba550ace37d738533ac1772d613bdcd04a44ad1e4fe1b" }
+  ],
+  "elf": "user.elf",
+  "blake3": "2f20d37e3e91734efab9aad5555a288dce467dd2bb4de23d489a34c9d33ac882",
+  "entry": "0x00010094"
+}

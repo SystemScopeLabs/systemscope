@@ -43,9 +43,18 @@
 //! bounded by `ram_size`, since segments are checked against the RAM before any is built.
 
 mod error;
+mod exec_table;
 mod parse;
+mod user;
 
 pub use error::{ElfError, SegmentError};
+pub use exec_table::{
+    BLOCK_SIZE, ExecEntry, ExecTable, ExecTableError, MAGIC, MAX_ENTRIES, VERSION, parse_exec_table,
+};
+pub use user::{
+    FileCopy, MAX_PHDRS, PAGE_SIZE, PagePlan, Perms, UserElfError, UserImage, UserSegment,
+    parse_user_elf32,
+};
 
 use parse::{PT_LOAD, file_len, header, program_header};
 
