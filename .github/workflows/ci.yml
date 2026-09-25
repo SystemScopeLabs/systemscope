@@ -351,9 +351,16 @@ jobs:
         with:
           path: ~/act4-cache
           key: act4-${{ runner.os }}-${{ hashFiles('systemscope/tests/act4/build-act4.sh') }}
+      # `mise install ruby` asks the GitHub API for Ruby releases on every run, cache or
+      # not; unauthenticated, the runner's shared 60 requests/hour can run out. mise reads
+      # MISE_GITHUB_TOKEN first, and no other tool in the build does.
       - name: Generate the corpus (A)
+        env:
+          MISE_GITHUB_TOKEN: ${{ github.token }}
         run: bash tests/act4/build-act4.sh ~/act4-cache target/act4/gen-a
       - name: Generate the corpus again from scratch (B)
+        env:
+          MISE_GITHUB_TOKEN: ${{ github.token }}
         run: bash tests/act4/build-act4.sh ~/act4-cache target/act4/gen-b
       - name: Generations A and B are byte-identical
         run: |
