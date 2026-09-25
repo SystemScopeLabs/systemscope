@@ -12,8 +12,8 @@
 //! received, reads the blocks back with a READ, and checks timing, every-event
 //! checkpoints, and determinism.
 //!
-//! The engine's failure paths (§9.7) belong to M2.7c; here they are only shown not to
-//! panic.
+//! The engine's failure paths (§9.7) are covered by `dma_faults.rs`; here they are only
+//! shown not to panic.
 
 mod common;
 
@@ -1068,7 +1068,7 @@ fn txn_counters_never_wrap() {
     assert!(w.media == media);
 }
 
-// --- Failure paths: M2.7c; here only shown not to panic ---
+// --- Failure paths: see `dma_faults.rs`; here only shown not to panic ---
 
 #[test]
 fn engine_failure_results_do_not_panic() {

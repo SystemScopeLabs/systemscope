@@ -78,9 +78,24 @@
 //! data. Only its `Done` starts block *i* + 1 at beat 0, or completes the command after
 //! the last block. No `WriteBlock` is sent before all 32 beats of its block were read.
 //!
-//! A media `Error` ends the command with `ERROR = 7` (MEDIA_ERROR), and a beat's `Fault`
-//! with `ERROR = 6` (DMA_FAULT), as §9.7 and §9.8 require of a device error; nothing
-//! further is issued. These failure paths are not yet closed (M2.7c).
+//! # Failures (§9.7, §9.8)
+//!
+//! A beat answered with `Fault` ends the command with `ERROR = 6` (DMA_FAULT), and a
+//! media `Error` with `ERROR = 7` (MEDIA_ERROR). Either is a device error, never a session
+//! fault: the command completes like a successful one (DONE, the interrupt if enabled,
+//! `REJECTED` untouched), the engine returns to `Idle` at block 0, beat 0 with an empty
+//! buffer, and nothing further is issued. There is no rollback:
+//!
+//! - READ: the blocks before the failing one are in RAM; after a media `Error` nothing of
+//!   the failing block is written; after a `Fault` on beat *j* its beats 0 … *j*−1 stay
+//!   in RAM and the faulting beat wrote nothing.
+//! - WRITE: the blocks before the failing one are committed on the media; the failing
+//!   block is not written, since its `WriteBlock` is sent only after all 32 of its beats
+//!   were read, and after a media `Error` the media wrote nothing (`block.v0`).
+//!
+//! A response that is not the outstanding request's result (a wrong `txn`, kind, port,
+//! protocol, or phase, or data of the wrong length) is a protocol violation and faults
+//! the session, whatever its outcome.
 
 use std::fmt;
 

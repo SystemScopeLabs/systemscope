@@ -13,8 +13,8 @@
 //! the final RAM. Then a real runtime with a bus, a RAM, and a `SimpleBlockMedia` checks
 //! the RAM bytes through the bus, the timing, every-event checkpoints, and determinism.
 //!
-//! The engine's failure paths (§9.7) belong to M2.7c; here they are only shown not to
-//! panic.
+//! The engine's failure paths (§9.7) are covered by `dma_faults.rs`; here they are only
+//! shown not to panic.
 
 mod common;
 
@@ -998,7 +998,7 @@ fn txn_counters_never_wrap() {
     assert_eq!((v.engine, v.beat, v.buffer.len()), (1, 0, 512));
 }
 
-// --- Failure paths: M2.7c; here only shown not to panic ---
+// --- Failure paths: see `dma_faults.rs`; here only shown not to panic ---
 
 #[test]
 fn engine_failure_results_do_not_panic() {
