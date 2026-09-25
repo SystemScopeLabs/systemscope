@@ -1,6 +1,6 @@
 //! `DmaBlockController`: a block-device DMA controller (`docs/m2-design.md` §9): the MMIO
 //! register file, the command lifecycle, validation, `REJECTED`, and the interrupt line
-//! (M2.6), and the engine's READ path (M2.7a).
+//! (M2.6), and the engine's READ (M2.7a) and WRITE (M2.7b) paths.
 //!
 //! # Ports
 //!
@@ -44,21 +44,21 @@
 //!   validated against them in the fixed order of §9.4: command, count, LBA range,
 //!   alignment, DMA range. The first failing check completes the command at once (DONE,
 //!   `ERROR` = its code) with no other effect. A command that passes goes to BUSY with the
-//!   latched descriptor and the engine in `Issue`, at block 0, beat 0; a READ also
-//!   schedules `Wake(ISSUE)`.
+//!   latched descriptor and the engine in `Issue`, at block 0, beat 0, and schedules
+//!   `Wake(ISSUE)`.
 //! - A `COMMAND` write in BUSY or DONE is rejected: `REJECTED` is set and nothing else
 //!   changes. Only writing 1 to `STATUS` bit 2 clears `REJECTED`.
 //! - `ACK` in DONE clears `DONE` and `ERROR`, back to IDLE; elsewhere it does nothing.
 //! - The interrupt line is `DONE && IRQ_ENABLE.bit0`, sent on `irq` (`Now`, `Complete`)
 //!   only when it changes.
 //!
-//! # Engine (READ)
+//! # Engine
 //!
 //! The engine mirrors the CPU's state machine (§9.6):
 //!
 //! ```text
-//! Idle ──valid READ @ Transfer──▶ Issue (Wake(ISSUE) @ Request, next controller cycle)
-//! Issue ──Wake(ISSUE)──▶ send ReadBlock or the next beat, Now ──▶ WaitMedia / WaitBeat { txn }
+//! Idle ──valid COMMAND @ Transfer──▶ Issue (Wake(ISSUE) @ Request, next controller cycle)
+//! Issue ──Wake(ISSUE)──▶ send the next block.v0 request or beat, Now ──▶ WaitMedia / WaitBeat { txn }
 //! WaitMedia / WaitBeat ──result @ Complete──▶ Issue (Wake(ISSUE), next cycle) | Done
 //! ```
 //!
@@ -70,15 +70,17 @@
 //! `ERROR = 0`. At most one request is outstanding in total, and each is sent under a
 //! fresh `TxnId` from its port's counter, which never wraps (§9.5, §6.2).
 //!
+//! For block *i* of a WRITE, `Issue` at beat *j* < 32 sends a 16-byte `ReadReq` of
+//! `MEM_ADDR + 512i + 16j`, and its `Data` (exactly 16 bytes) is appended to the buffer,
+//! which therefore holds 16 × *j* bytes while beat *j* is due or outstanding. After beat
+//! 31 the beat index is 32 and the buffer holds all 512 bytes; `Issue` then sends
+//! `WriteBlock(LBA + i, buffer)` and drops the buffer, since the request carries the
+//! data. Only its `Done` starts block *i* + 1 at beat 0, or completes the command after
+//! the last block. No `WriteBlock` is sent before all 32 beats of its block were read.
+//!
 //! A media `Error` ends the command with `ERROR = 7` (MEDIA_ERROR), and a beat's `Fault`
 //! with `ERROR = 6` (DMA_FAULT), as §9.7 and §9.8 require of a device error; nothing
-//! further is issued.
-//!
-//! # The WRITE boundary
-//!
-//! The WRITE engine is not implemented yet (M2.7b). An accepted WRITE goes to BUSY with
-//! the engine in `Issue` at block 0, beat 0, and schedules no wake: it sends nothing and
-//! never completes.
+//! further is issued. These failure paths are not yet closed (M2.7c).
 
 use std::fmt;
 
@@ -89,7 +91,9 @@ use systemscope_contracts::error::SimError;
 use systemscope_contracts::event::{Phase, ScheduleWhen};
 use systemscope_contracts::observe::StateView;
 use systemscope_contracts::protocol::Message;
-use systemscope_contracts::protocol::block_v0::{self, BlockMsg, BlockReadOutcome};
+use systemscope_contracts::protocol::block_v0::{
+    self, BlockMsg, BlockReadOutcome, BlockWriteOutcome,
+};
 use systemscope_contracts::protocol::irq_v0::{self, IrqMsg};
 use systemscope_contracts::protocol::mem_v1::{
     self, Access, MemFault, MemMsg, ReadOutcome, TxnId, WriteOutcome,
@@ -258,12 +262,14 @@ struct Latched {
 enum Engine {
     /// No command, or DONE.
     Idle,
-    /// The next request is due at `Wake(ISSUE)`: `ReadBlock` if the buffer is empty,
-    /// else beat *j*. An accepted WRITE waits here without a wake (M2.7b).
+    /// The next request is due at `Wake(ISSUE)`. READ: `ReadBlock` if the buffer is
+    /// empty, else beat *j*. WRITE: beat *j* below 32, else `WriteBlock`.
     Issue,
-    /// `ReadBlock { txn }` of block *i* is outstanding.
+    /// `ReadBlock { txn }` (READ) or `WriteBlock { txn }` (WRITE) of block *i* is
+    /// outstanding.
     WaitMedia(TxnId),
-    /// Beat *j* of block *i*, `WriteReq { txn }`, is outstanding.
+    /// Beat *j* of block *i* is outstanding: `WriteReq { txn }` (READ) or
+    /// `ReadReq { txn }` (WRITE).
     WaitBeat(TxnId),
 }
 
@@ -284,9 +290,11 @@ pub struct DmaBlockController {
     engine: Engine,
     /// Block index *i* of the latched command; 0 when `Idle`.
     block: u32,
-    /// Beat index *j* in block *i*, below [`BEATS_PER_BLOCK`]; 0 when `Idle`.
+    /// Beat index *j* in block *i*, below [`BEATS_PER_BLOCK`], or equal to it while a
+    /// WRITE's `WriteBlock` is due or outstanding; 0 when `Idle`.
     beat: u8,
-    /// Block *i*'s data, from its `Data` through its beat 31's `Done`; empty otherwise.
+    /// Block *i*'s data as §9.9 stores it. READ: from its `Data` through its beat 31's
+    /// `Done`. WRITE: the 16 × *j* bytes read so far, until the `WriteBlock` is sent.
     buffer: Vec<u8>,
     /// Next `TxnId` on `dma`.
     dma_txn: TxnId,
@@ -425,11 +433,7 @@ impl DmaBlockController {
                     count,
                 });
                 self.engine = Engine::Issue;
-                match op {
-                    Operation::Read => self.wake_next_cycle(ctx),
-                    // The WRITE engine is M2.7b.
-                    Operation::Write => Ok(()),
-                }
+                self.wake_next_cycle(ctx)
             }
             Err(code) => self.complete(code, ctx),
         }
@@ -467,69 +471,104 @@ impl DmaBlockController {
         ))
     }
 
-    /// `Wake(ISSUE)`: sends the next request of the latched READ, `Now` in `Request`.
+    /// `Wake(ISSUE)`: sends the latched command's next request, `Now` in `Request`.
     fn issue(&mut self, ctx: &mut dyn SimContext) -> Result<(), SimError> {
         let latched = match (self.engine, self.latched) {
-            (Engine::Issue, Some(latched)) if latched.op == Operation::Read => latched,
+            (Engine::Issue, Some(latched)) => latched,
             _ => {
                 return Err(SimError::ComponentFault(
                     "dma controller: ISSUE wake with nothing to issue",
                 ));
             }
         };
-        let overflow = SimError::ComponentFault("dma controller: engine index overflow");
-        if self.buffer.is_empty() {
-            let lba = u64::from(latched.lba)
-                .checked_add(u64::from(self.block))
-                .ok_or(overflow)?;
-            let txn = self.blk_txn;
-            let next = Self::next_txn(txn)?;
-            ctx.send(
-                BLK_PORT,
-                BlockMsg::ReadBlock { txn, lba }.into(),
-                ScheduleWhen::Now,
-                Phase::Request,
-            )?;
-            self.blk_txn = TxnId(next);
-            self.engine = Engine::WaitMedia(txn);
-        } else {
-            let offset = u64::from(self.beat) * BEAT_SIZE;
-            let addr = u64::from(self.block)
-                .checked_mul(BLOCK_BYTES)
-                .and_then(|block| block.checked_add(offset))
-                .and_then(|delta| u64::from(latched.addr).checked_add(delta))
-                .ok_or(overflow)?;
-            let start = offset as usize;
-            let data = self.buffer[start..start + BEAT_SIZE as usize].to_vec();
-            let txn = self.dma_txn;
-            let next = Self::next_txn(txn)?;
-            ctx.send(
-                DMA_PORT,
-                MemMsg::WriteReq { txn, addr, data }.into(),
-                ScheduleWhen::Now,
-                Phase::Request,
-            )?;
-            self.dma_txn = TxnId(next);
-            self.engine = Engine::WaitBeat(txn);
+        match latched.op {
+            Operation::Read if self.buffer.is_empty() => {
+                let lba = self.block_lba(latched)?;
+                self.send_block(
+                    BlockMsg::ReadBlock {
+                        txn: self.blk_txn,
+                        lba,
+                    },
+                    ctx,
+                )
+            }
+            Operation::Read => {
+                let addr = self.beat_addr(latched)?;
+                let start = usize::from(self.beat) * BEAT_SIZE as usize;
+                let data = self.buffer[start..start + BEAT_SIZE as usize].to_vec();
+                let txn = self.dma_txn;
+                self.send_beat(MemMsg::WriteReq { txn, addr, data }, ctx)
+            }
+            Operation::Write if self.beat == BEATS_PER_BLOCK => {
+                let lba = self.block_lba(latched)?;
+                let data = self.buffer.clone();
+                self.send_block(
+                    BlockMsg::WriteBlock {
+                        txn: self.blk_txn,
+                        lba,
+                        data,
+                    },
+                    ctx,
+                )?;
+                // The request carries the data: none is kept while it is outstanding.
+                self.buffer = Vec::new();
+                Ok(())
+            }
+            Operation::Write => {
+                let addr = self.beat_addr(latched)?;
+                let txn = self.dma_txn;
+                let len = BEAT_SIZE as u32;
+                self.send_beat(MemMsg::ReadReq { txn, addr, len }, ctx)
+            }
         }
+    }
+
+    /// The media block of block index *i*: `LBA + i`.
+    fn block_lba(&self, latched: Latched) -> Result<u64, SimError> {
+        u64::from(latched.lba)
+            .checked_add(u64::from(self.block))
+            .ok_or(SimError::ComponentFault(
+                "dma controller: engine index overflow",
+            ))
+    }
+
+    /// The address of beat *j* of block *i*: `MEM_ADDR + 512i + 16j`.
+    fn beat_addr(&self, latched: Latched) -> Result<u64, SimError> {
+        let offset = u64::from(self.beat) * BEAT_SIZE;
+        u64::from(self.block)
+            .checked_mul(BLOCK_BYTES)
+            .and_then(|block| block.checked_add(offset))
+            .and_then(|delta| u64::from(latched.addr).checked_add(delta))
+            .ok_or(SimError::ComponentFault(
+                "dma controller: engine index overflow",
+            ))
+    }
+
+    /// Sends `msg`, which carries the next `blk` txn, and waits for its result.
+    fn send_block(&mut self, msg: BlockMsg, ctx: &mut dyn SimContext) -> Result<(), SimError> {
+        let txn = self.blk_txn;
+        let next = Self::next_txn(txn)?;
+        ctx.send(BLK_PORT, msg.into(), ScheduleWhen::Now, Phase::Request)?;
+        self.blk_txn = TxnId(next);
+        self.engine = Engine::WaitMedia(txn);
         Ok(())
     }
 
-    /// A message on `blk`: the result of the outstanding `ReadBlock`, in `Complete`.
-    fn media_result(&mut self, msg: &BlockMsg, ctx: &mut dyn SimContext) -> Result<(), SimError> {
-        let Engine::WaitMedia(expected) = self.engine else {
+    /// Sends the beat `msg`, which carries the next `dma` txn, and waits for its response.
+    fn send_beat(&mut self, msg: MemMsg, ctx: &mut dyn SimContext) -> Result<(), SimError> {
+        let txn = self.dma_txn;
+        let next = Self::next_txn(txn)?;
+        ctx.send(DMA_PORT, msg.into(), ScheduleWhen::Now, Phase::Request)?;
+        self.dma_txn = TxnId(next);
+        self.engine = Engine::WaitBeat(txn);
+        Ok(())
+    }
+
+    /// Checks that a result for `txn` answers the outstanding `expected` in `Complete`.
+    fn check_result(txn: TxnId, expected: TxnId, ctx: &dyn SimContext) -> Result<(), SimError> {
+        if txn != expected {
             return Err(SimError::ComponentFault(
-                "dma controller: block.v0 message with no request outstanding",
-            ));
-        };
-        let BlockMsg::ReadResult { txn, outcome } = msg else {
-            return Err(SimError::ComponentFault(
-                "dma controller: block.v0 message is not a ReadResult",
-            ));
-        };
-        if *txn != expected {
-            return Err(SimError::ComponentFault(
-                "dma controller: ReadResult for a txn that is not outstanding",
+                "dma controller: result for a txn that is not outstanding",
             ));
         }
         if ctx.phase() != Phase::Complete {
@@ -537,61 +576,100 @@ impl DmaBlockController {
                 "dma controller: result arrived outside COMPLETE",
             ));
         }
-        match outcome {
-            BlockReadOutcome::Data { data } => {
-                if data.len() != block_v0::BLOCK_SIZE {
-                    return Err(SimError::ComponentFault(
-                        "dma controller: block data is not 512 bytes",
-                    ));
+        Ok(())
+    }
+
+    /// A message on `blk`: the result of the outstanding `ReadBlock` or `WriteBlock`, in
+    /// `Complete`.
+    fn media_result(&mut self, msg: &BlockMsg, ctx: &mut dyn SimContext) -> Result<(), SimError> {
+        let (Engine::WaitMedia(expected), Some(latched)) = (self.engine, self.latched) else {
+            return Err(SimError::ComponentFault(
+                "dma controller: block.v0 message with no request outstanding",
+            ));
+        };
+        match (latched.op, msg) {
+            (Operation::Read, BlockMsg::ReadResult { txn, outcome }) => {
+                Self::check_result(*txn, expected, ctx)?;
+                match outcome {
+                    BlockReadOutcome::Data { data } => {
+                        if data.len() != block_v0::BLOCK_SIZE {
+                            return Err(SimError::ComponentFault(
+                                "dma controller: block data is not 512 bytes",
+                            ));
+                        }
+                        self.buffer = data.clone();
+                        self.engine = Engine::Issue;
+                        self.wake_next_cycle(ctx)
+                    }
+                    BlockReadOutcome::Error { .. } => self.complete(MEDIA_ERROR, ctx),
                 }
-                self.buffer = data.clone();
-                self.engine = Engine::Issue;
-                self.wake_next_cycle(ctx)
             }
-            BlockReadOutcome::Error { .. } => self.complete(MEDIA_ERROR, ctx),
+            (Operation::Write, BlockMsg::WriteResult { txn, outcome }) => {
+                Self::check_result(*txn, expected, ctx)?;
+                match outcome {
+                    BlockWriteOutcome::Done => self.next_block(latched, ctx),
+                    BlockWriteOutcome::Error { .. } => self.complete(MEDIA_ERROR, ctx),
+                }
+            }
+            _ => Err(SimError::ComponentFault(
+                "dma controller: block.v0 message is not the outstanding request's result",
+            )),
         }
     }
 
     /// A message on `dma`: the response to the outstanding beat, in `Complete`.
     fn beat_result(&mut self, msg: &MemMsg, ctx: &mut dyn SimContext) -> Result<(), SimError> {
-        let Engine::WaitBeat(expected) = self.engine else {
+        let (Engine::WaitBeat(expected), Some(latched)) = (self.engine, self.latched) else {
             return Err(SimError::ComponentFault(
                 "dma controller: mem.v1 message with no beat outstanding",
             ));
         };
-        let MemMsg::WriteResp { txn, outcome } = msg else {
-            return Err(SimError::ComponentFault(
-                "dma controller: mem.v1 message is not a WriteResp",
-            ));
-        };
-        if *txn != expected {
-            return Err(SimError::ComponentFault(
-                "dma controller: WriteResp for a txn that is not outstanding",
-            ));
-        }
-        if ctx.phase() != Phase::Complete {
-            return Err(SimError::ComponentFault(
-                "dma controller: result arrived outside COMPLETE",
-            ));
-        }
-        if let WriteOutcome::Fault { .. } = outcome {
-            return self.complete(DMA_FAULT, ctx);
-        }
-        let Some(latched) = self.latched else {
-            return Err(SimError::ComponentFault(
-                "dma controller: beat outstanding without a command",
-            ));
-        };
-        self.beat += 1;
-        if self.beat == BEATS_PER_BLOCK {
-            self.beat = 0;
-            self.buffer = Vec::new();
-            self.block = self.block.checked_add(1).ok_or(SimError::ComponentFault(
-                "dma controller: engine index overflow",
-            ))?;
-            if self.block == latched.count {
-                return self.complete(0, ctx);
+        match (latched.op, msg) {
+            (Operation::Read, MemMsg::WriteResp { txn, outcome }) => {
+                Self::check_result(*txn, expected, ctx)?;
+                if let WriteOutcome::Fault { .. } = outcome {
+                    return self.complete(DMA_FAULT, ctx);
+                }
+                self.beat += 1;
+                if self.beat == BEATS_PER_BLOCK {
+                    return self.next_block(latched, ctx);
+                }
             }
+            (Operation::Write, MemMsg::ReadResp { txn, outcome }) => {
+                Self::check_result(*txn, expected, ctx)?;
+                let data = match outcome {
+                    ReadOutcome::Data { data } => data,
+                    ReadOutcome::Fault { .. } => return self.complete(DMA_FAULT, ctx),
+                };
+                if data.len() as u64 != BEAT_SIZE {
+                    return Err(SimError::ComponentFault(
+                        "dma controller: beat data is not 16 bytes",
+                    ));
+                }
+                // After beat 31, `Issue` at beat 32 sends the `WriteBlock`.
+                self.buffer.extend_from_slice(data);
+                self.beat += 1;
+            }
+            _ => {
+                return Err(SimError::ComponentFault(
+                    "dma controller: mem.v1 message is not the outstanding beat's response",
+                ));
+            }
+        }
+        self.engine = Engine::Issue;
+        self.wake_next_cycle(ctx)
+    }
+
+    /// Block *i* is done: starts block *i* + 1 at beat 0 with an empty buffer, or
+    /// completes the command after the last block.
+    fn next_block(&mut self, latched: Latched, ctx: &mut dyn SimContext) -> Result<(), SimError> {
+        self.beat = 0;
+        self.buffer = Vec::new();
+        self.block = self.block.checked_add(1).ok_or(SimError::ComponentFault(
+            "dma controller: engine index overflow",
+        ))?;
+        if self.block == latched.count {
+            return self.complete(0, ctx);
         }
         self.engine = Engine::Issue;
         self.wake_next_cycle(ctx)
@@ -890,10 +968,10 @@ impl Component for DmaBlockController {
     /// `IRQ_ENABLE` bits other than bit 0; BUSY with DONE; an `ERROR` outside DONE, or in
     /// DONE above 7; a latched command that fails validation; an engine state other than
     /// `Idle` without BUSY, or `Idle` with it; engine indices or a buffer outside `Idle`'s
-    /// zeros and empty buffer; a WRITE anywhere but `Issue` at block 0, beat 0 (M2.7b); a
-    /// READ block index not below the latched count, or a buffer length other than the
-    /// one its engine position requires (§9.9); an outstanding `txn` that is not the
-    /// latest issued on its port; and an IRQ level other than `DONE && IRQ_ENABLE.bit0`.
+    /// zeros and empty buffer; a block index not below the latched count; a beat index
+    /// past 31 (READ) or 32 (WRITE, its `WriteBlock`); a buffer length other than the one
+    /// its engine position requires (§9.9); an outstanding `txn` that is not the latest
+    /// issued on its port; and an IRQ level other than `DONE && IRQ_ENABLE.bit0`.
     fn restore(&mut self, r: &mut SnapshotReader<'_>, _: u32) -> Result<(), RestoreError> {
         let invalid = RestoreError::InvalidState;
         let mut config = SnapshotWriter::new();
@@ -948,8 +1026,23 @@ impl Component for DmaBlockController {
             None => engine == Engine::Idle && block == 0 && beat == 0 && buffer.is_empty(),
             Some(Latched {
                 op: Operation::Write,
+                count,
                 ..
-            }) => engine == Engine::Issue && block == 0 && beat == 0 && buffer.is_empty(),
+            }) => {
+                let read_so_far = buffer.len() == usize::from(beat) * BEAT_SIZE as usize;
+                block < count
+                    && beat <= BEATS_PER_BLOCK
+                    && match engine {
+                        Engine::Idle => false,
+                        Engine::Issue => read_so_far,
+                        Engine::WaitBeat(txn) => {
+                            beat < BEATS_PER_BLOCK && read_so_far && latest(dma_txn, txn)
+                        }
+                        Engine::WaitMedia(txn) => {
+                            beat == BEATS_PER_BLOCK && buffer.is_empty() && latest(blk_txn, txn)
+                        }
+                    }
+            }
             Some(Latched {
                 op: Operation::Read,
                 count,

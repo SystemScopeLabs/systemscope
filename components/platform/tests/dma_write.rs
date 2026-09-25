@@ -1,24 +1,23 @@
-//! `DmaBlockController` READ engine (`docs/m2-design.md` §9.5, §9.6, §9.9; M2.7a):
-//! `Wake(ISSUE)` scheduling, `ReadBlock`, the 512-byte block buffer, 16-byte RAM write
-//! beats, one outstanding request in total, multi-block progression, fresh checked
-//! `TxnId`s, completion and its interrupt, the descriptor latch while the engine runs,
-//! protocol violations, snapshots of the reachable READ positions, and checkpoints. The
-//! WRITE engine is tested in `dma_write.rs`.
+//! `DmaBlockController` WRITE engine (`docs/m2-design.md` §9.5, §9.6, §9.7, §9.9; M2.7b):
+//! 16-byte RAM read beats, 32 per block, the block buffer growing by 16 bytes per beat,
+//! `WriteBlock` only after all 32 beats with the buffer dropped once it is outstanding,
+//! one outstanding request in total, multi-block progression, fresh checked `TxnId`s,
+//! completion and its interrupt, the descriptor latch, protocol violations, snapshots of
+//! the reachable WRITE positions, and checkpoints.
 //!
-//! Most tests drive the controller through [`World`]: a mock media and RAM that answer
-//! the controller's one outstanding request at a time, standing in for the runtime's
-//! event queue. `World` checks every event: a wake sends exactly one request, `Now` in
-//! `Request`; a result sends nothing and schedules the next wake or completes; a wake and
-//! an outstanding request never coexist. An independent oracle predicts the requests and
-//! the final RAM. Then a real runtime with a bus, a RAM, and a `SimpleBlockMedia` checks
-//! the RAM bytes through the bus, the timing, every-event checkpoints, and determinism.
+//! As in `dma_read.rs`, most tests drive the controller through [`World`], a mock RAM and
+//! media answering the one outstanding request at a time, which checks every event; an
+//! independent oracle predicts the requests and the final media. Then a real runtime with
+//! a bus, a RAM, and a `SimpleBlockMedia` checks the `WriteBlock` payloads the media
+//! received, reads the blocks back with a READ, and checks timing, every-event
+//! checkpoints, and determinism.
 //!
 //! The engine's failure paths (§9.7) belong to M2.7c; here they are only shown not to
 //! panic.
 
 mod common;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use common::{MockCtx, Script, Traced, read, restore_into, snapshot_of, write};
 use proptest::prelude::*;
@@ -89,38 +88,38 @@ fn config() -> DmaBlockControllerConfig {
     }
 }
 
-/// Block `b`'s deterministic contents: every beat of every block differs.
-fn pattern(b: usize) -> Vec<u8> {
-    (0..BLOCK)
-        .map(|k| ((b * 97 + k * 31 + (k / BEAT) * 7) % 251) as u8 ^ (b as u8).rotate_left(3))
+/// The RAM: every 16-byte beat is distinguishable from every other, its first two bytes
+/// being its beat number in the whole RAM.
+fn ram() -> Vec<u8> {
+    (0..RAM_SIZE)
+        .map(|a| match a % BEAT {
+            0 => (a / BEAT) as u8,
+            1 => ((a / BEAT) >> 8) as u8,
+            k => (a / BEAT * 7 + k * 13) as u8 ^ 0x5a,
+        })
         .collect()
 }
 
-fn media() -> Vec<Vec<u8>> {
-    (0..CAPACITY as usize).map(pattern).collect()
+/// The media before the WRITE: every block filled with a marker of its own.
+fn old_media() -> Vec<Vec<u8>> {
+    (0..CAPACITY as usize)
+        .map(|b| vec![0xe0 | b as u8; BLOCK])
+        .collect()
 }
 
 /// One engine request, as the controller sent it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Req {
-    Read { txn: u64, lba: u64 },
-    Beat { txn: u64, addr: u64, data: Vec<u8> },
+    Beat { txn: u64, addr: u64 },
+    Write { txn: u64, lba: u64, data: Vec<u8> },
 }
 
-/// A request without its `txn`, as the oracle predicts it.
+/// A request without its `txn`, as the oracle predicts it: a beat with the bytes it
+/// read, or a `WriteBlock`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Op {
-    Read(u64),
     Beat(u64, Vec<u8>),
-}
-
-impl Req {
-    fn op(&self) -> Op {
-        match self {
-            Req::Read { lba, .. } => Op::Read(*lba),
-            Req::Beat { addr, data, .. } => Op::Beat(*addr, data.clone()),
-        }
-    }
+    Write(u64, Vec<u8>),
 }
 
 /// The snapshot's lifecycle and engine fields, decoded from the frozen layout (§9.9)
@@ -207,12 +206,12 @@ fn issue_wake() -> (ScheduleWhen, Phase, u64) {
     )
 }
 
-/// The controller, a perfect media and RAM, and the one pending wake or outstanding
+/// The controller, a perfect RAM and media, and the one pending wake or outstanding
 /// request the runtime's queue would hold.
 struct World {
     c: DmaBlockController,
-    media: Vec<Vec<u8>>,
     ram: Vec<u8>,
+    media: Vec<Vec<u8>>,
     wake: bool,
     outstanding: Option<Req>,
     log: Vec<Req>,
@@ -230,8 +229,8 @@ impl World {
     fn with(c: DmaBlockController) -> World {
         World {
             c,
-            media: media(),
-            ram: vec![0; RAM_SIZE],
+            ram: ram(),
+            media: old_media(),
             wake: false,
             outstanding: None,
             log: Vec::new(),
@@ -298,18 +297,19 @@ impl World {
         self.read_reg(R_STATUS)
     }
 
-    fn command(&mut self, command: u32, lba: u32, addr: u32, count: u32) {
-        for (offset, value) in [
-            (R_LBA, lba),
-            (R_MEM_ADDR, addr),
-            (R_BLOCK_COUNT, count),
-            (R_COMMAND, command),
-        ] {
+    fn registers(&mut self, lba: u32, addr: u32, count: u32) {
+        for (offset, value) in [(R_LBA, lba), (R_MEM_ADDR, addr), (R_BLOCK_COUNT, count)] {
             assert_eq!(self.write_reg(offset, value), WriteOutcome::Done);
         }
     }
 
-    /// Delivers the pending `Wake(ISSUE)`: exactly one request, `Now` in `Request`.
+    fn command(&mut self, command: u32, lba: u32, addr: u32, count: u32) {
+        self.registers(lba, addr, count);
+        assert_eq!(self.write_reg(R_COMMAND, command), WriteOutcome::Done);
+    }
+
+    /// Delivers the pending `Wake(ISSUE)`: exactly one request, `Now` in `Request`, and
+    /// never a READ's.
     fn issue(&mut self) {
         assert!(self.wake && self.outstanding.is_none());
         self.wake = false;
@@ -324,49 +324,51 @@ impl World {
                 (b.port, b.when, b.phase),
                 (BLK_PORT, ScheduleWhen::Now, Phase::Request)
             );
-            let BlockMsg::ReadBlock { txn, lba } = b.msg else {
+            let BlockMsg::WriteBlock { txn, lba, data } = b.msg else {
                 panic!("{:?}", b.msg)
             };
-            Req::Read { txn: txn.0, lba }
+            Req::Write {
+                txn: txn.0,
+                lba,
+                data,
+            }
         } else {
             let s = ctx.sent.pop().unwrap();
             assert_eq!(
                 (s.port, s.when, s.phase),
                 (DMA_PORT, ScheduleWhen::Now, Phase::Request)
             );
-            let MemMsg::WriteReq { txn, addr, data } = s.msg else {
+            let MemMsg::ReadReq { txn, addr, len } = s.msg else {
                 panic!("{:?}", s.msg)
             };
-            Req::Beat {
-                txn: txn.0,
-                addr,
-                data,
-            }
+            assert_eq!(len, 16, "a beat is 16 bytes");
+            Req::Beat { txn: txn.0, addr }
         };
         self.log.push(req.clone());
         self.outstanding = Some(req);
     }
 
-    /// The successful result of `req`, applying a beat to the RAM.
+    /// The successful result of `req`, applying a `WriteBlock` to the media.
     fn result_of(&mut self, req: &Req) -> (PortId, Message) {
         match req {
-            Req::Read { txn, lba } => (
-                BLK_PORT,
-                BlockMsg::ReadResult {
+            Req::Beat { txn, addr } => (
+                DMA_PORT,
+                MemMsg::ReadResp {
                     txn: TxnId(*txn),
-                    outcome: BlockReadOutcome::Data {
-                        data: self.media[*lba as usize].clone(),
+                    outcome: ReadOutcome::Data {
+                        data: self.ram[*addr as usize..][..BEAT].to_vec(),
                     },
                 }
                 .into(),
             ),
-            Req::Beat { txn, addr, data } => {
-                self.ram[*addr as usize..][..data.len()].copy_from_slice(data);
+            Req::Write { txn, lba, data } => {
+                assert_eq!(data.len(), BLOCK);
+                self.media[*lba as usize] = data.clone();
                 (
-                    DMA_PORT,
-                    MemMsg::WriteResp {
+                    BLK_PORT,
+                    BlockMsg::WriteResult {
                         txn: TxnId(*txn),
-                        outcome: WriteOutcome::Done,
+                        outcome: BlockWriteOutcome::Done,
                     }
                     .into(),
                 )
@@ -382,9 +384,10 @@ impl World {
         ctx.deliver_msg(&mut self.c, port, msg).unwrap();
         assert!(ctx.sent.is_empty() && ctx.blocks.is_empty());
         self.absorb(&ctx);
-        // A result either schedules the next wake or completes the command.
         let completed = ctx.traced.iter().any(|(kind, _)| *kind == DONE_KIND);
-        assert!(self.wake != completed, "{ctx:?}", ctx = ctx.traced);
+        assert!(self.wake != completed, "{:?}", ctx.traced);
+        // Only a `WriteResult` can complete a WRITE.
+        assert!(!completed || matches!(req, Req::Write { .. }));
     }
 
     fn step(&mut self) -> bool {
@@ -415,29 +418,49 @@ impl World {
         assert_eq!(fresh.inspect(), self.c.inspect());
         self.c = fresh;
     }
-}
 
-/// The READ transfer of §9.5–§9.6, written from the text: the requests in order and the
-/// RAM they leave.
-fn oracle(media: &[Vec<u8>], ram: &[u8], lba: u32, addr: u32, count: u32) -> (Vec<Op>, Vec<u8>) {
-    let mut ops = Vec::new();
-    let mut ram = ram.to_vec();
-    for k in 0..u64::from(count) {
-        let block = u64::from(lba) + k;
-        ops.push(Op::Read(block));
-        let data = &media[block as usize];
-        for j in 0..BEATS as u64 {
-            let at = u64::from(addr) + k * BLOCK as u64 + j * BEAT as u64;
-            let bytes = data[(j as usize) * BEAT..][..BEAT].to_vec();
-            ram[at as usize..][..BEAT].copy_from_slice(&bytes);
-            ops.push(Op::Beat(at, bytes));
-        }
+    /// The log as oracle operations; RAM does not change during a WRITE.
+    fn ops(&self) -> Vec<Op> {
+        self.log
+            .iter()
+            .map(|r| match r {
+                Req::Beat { addr, .. } => {
+                    Op::Beat(*addr, self.ram[*addr as usize..][..BEAT].to_vec())
+                }
+                Req::Write { lba, data, .. } => Op::Write(*lba, data.clone()),
+            })
+            .collect()
     }
-    (ops, ram)
+
+    fn view_busy(&self) -> bool {
+        view(&self.c).busy
+    }
 }
 
-fn ops(log: &[Req]) -> Vec<Op> {
-    log.iter().map(Req::op).collect()
+/// The WRITE transfer of §9.5–§9.7, written from the text: the requests in order and the
+/// media they leave.
+fn oracle(
+    ram: &[u8],
+    media: &[Vec<u8>],
+    lba: u32,
+    addr: u32,
+    count: u32,
+) -> (Vec<Op>, Vec<Vec<u8>>) {
+    let mut ops = Vec::new();
+    let mut media = media.to_vec();
+    for k in 0..count as usize {
+        let mut block = Vec::new();
+        for j in 0..BEATS {
+            let at = addr as usize + k * BLOCK + j * BEAT;
+            let bytes = ram[at..at + BEAT].to_vec();
+            block.extend_from_slice(&bytes);
+            ops.push(Op::Beat(at as u64, bytes));
+        }
+        let target = lba as usize + k;
+        ops.push(Op::Write(target as u64, block.clone()));
+        media[target] = block;
+    }
+    (ops, media)
 }
 
 fn command_record(op: u64, lba: u64, addr: u64, count: u64, accepted: bool) -> Traced {
@@ -457,117 +480,141 @@ fn done_record(error: u64) -> Traced {
     (DONE_KIND, vec![("error", Value::U64(error))])
 }
 
-/// Runs a READ in a fresh world and checks it against the oracle; the world afterwards.
-fn read_and_check(lba: u32, addr: u32, count: u32, irq: bool) -> World {
+/// Runs a WRITE in a fresh world and checks it against the oracle; the world afterwards.
+fn write_and_check(lba: u32, addr: u32, count: u32, irq: bool) -> World {
     let mut w = World::new();
     w.write_reg(R_IRQ_ENABLE, u32::from(irq));
-    let ram = w.ram.clone();
-    w.command(READ, lba, addr, count);
+    let media = w.media.clone();
+    w.command(WRITE, lba, addr, count);
     assert!(
         w.wake && w.log.is_empty(),
         "the engine starts at Wake(ISSUE)"
     );
     w.run();
-    let (expected, final_ram) = oracle(&w.media, &ram, lba, addr, count);
-    assert_eq!(ops(&w.log), expected);
-    assert!(w.ram == final_ram, "RAM differs from the oracle");
+    let (expected, final_media) = oracle(&w.ram, &media, lba, addr, count);
+    assert_eq!(w.ops(), expected);
+    assert!(w.media == final_media, "media differs from the oracle");
+    assert!(w.ram == ram(), "a WRITE never changes RAM");
     assert_eq!(w.status(), DONE);
     assert_eq!(w.levels, if irq { vec![true] } else { vec![] });
     assert_eq!(
         w.traced,
         vec![
-            command_record(1, lba.into(), addr.into(), count.into(), true),
+            command_record(2, lba.into(), addr.into(), count.into(), true),
             done_record(0),
         ]
     );
     w
 }
 
-// --- READ flow ---
+// --- WRITE flow ---
 
 #[test]
-fn a_one_block_read_is_one_read_block_then_32_beats() {
-    let w = read_and_check(5, 0x1200, 1, false);
-    assert_eq!(w.log.len(), 1 + BEATS);
-    assert_eq!(w.log[0], Req::Read { txn: 0, lba: 5 });
-    for (j, req) in w.log[1..].iter().enumerate() {
-        let Req::Beat { txn, addr, data } = req else {
-            panic!("{req:?}")
-        };
-        assert_eq!(*txn, j as u64);
-        assert_eq!(*addr, 0x1200 + 16 * j as u64);
-        assert_eq!(data.len(), 16);
-        assert_eq!(*data, pattern(5)[16 * j..16 * (j + 1)]);
-    }
-    // All 512 bytes arrived, and nothing else changed.
-    assert_eq!(w.ram[0x1200..0x1400], pattern(5)[..]);
-    assert!(w.ram[..0x1200].iter().all(|&b| b == 0));
-    assert!(w.ram[0x1400..].iter().all(|&b| b == 0));
-}
-
-#[test]
-fn a_multi_block_read_reads_each_block_then_writes_it() {
-    let w = read_and_check(3, 0x1000, 2, false);
-    assert_eq!(w.log.len(), 2 * (1 + BEATS));
-    assert_eq!(w.log[0], Req::Read { txn: 0, lba: 3 });
-    assert_eq!(w.log[1 + BEATS], Req::Read { txn: 1, lba: 4 });
-    // The second ReadBlock follows beat 31 of the first block, and nothing interleaves.
-    assert!(
-        matches!(
-            w.log[BEATS],
+fn a_one_block_write_is_32_beats_then_one_write_block() {
+    let w = write_and_check(5, 0x1200, 1, false);
+    assert_eq!(w.log.len(), BEATS + 1);
+    for (j, req) in w.log[..BEATS].iter().enumerate() {
+        assert_eq!(
+            *req,
             Req::Beat {
-                txn: 31,
-                addr: 0x11f0,
-                ..
+                txn: j as u64,
+                addr: 0x1200 + 16 * j as u64
             }
-        ),
-        "{:?}",
-        w.log[BEATS]
-    );
-    let mut concatenated = pattern(3);
-    concatenated.extend(pattern(4));
-    assert_eq!(w.ram[0x1000..0x1400], concatenated[..]);
-    // The largest case: every block of the controller into the top of the aperture.
-    let w = read_and_check(0, 0x3000, 16, false);
-    assert_eq!(w.log.len(), 16 * (1 + BEATS));
-    let all: Vec<u8> = (0..16).flat_map(pattern).collect();
-    assert_eq!(w.ram[0x3000..0x5000], all[..]);
+        );
+    }
+    let Req::Write { txn, lba, data } = &w.log[BEATS] else {
+        panic!("{:?}", w.log[BEATS])
+    };
+    assert_eq!((*txn, *lba), (0, 5));
+    assert_eq!(*data, ram()[0x1200..0x1400]);
+    // Only block 5 changed.
+    for (b, block) in w.media.iter().enumerate() {
+        if b == 5 {
+            assert_eq!(block[..], ram()[0x1200..0x1400]);
+        } else {
+            assert_eq!(*block, old_media()[b], "block {b}");
+        }
+    }
 }
 
 #[test]
-fn the_buffer_holds_the_block_exactly_from_data_through_beat_31() {
+fn the_write_block_payload_is_the_beats_in_order() {
+    let w = write_and_check(0, 0x2000, 1, false);
+    let Some(Req::Write { data, .. }) = w.log.last() else {
+        panic!()
+    };
+    // Beat j of the RAM at 0x2000 is RAM beat 0x200 + j: its number leads its 16 bytes.
+    for j in 0..BEATS {
+        let chunk = &data[j * BEAT..][..BEAT];
+        let number = u16::from_le_bytes([chunk[0], chunk[1]]);
+        assert_eq!(number as usize, 0x200 + j, "beat {j}");
+        assert_eq!(*chunk, ram()[0x2000 + j * BEAT..][..BEAT]);
+    }
+}
+
+#[test]
+fn a_multi_block_write_reads_each_block_then_writes_it() {
+    let w = write_and_check(3, 0x1000, 2, false);
+    assert_eq!(w.log.len(), 2 * (BEATS + 1));
+    // 32 beats, WriteBlock(3), 32 beats, WriteBlock(4), and nothing interleaves.
+    for (n, req) in w.log.iter().enumerate() {
+        match (n, req) {
+            (32, Req::Write { txn: 0, lba: 3, .. }) | (65, Req::Write { txn: 1, lba: 4, .. }) => {}
+            (n, Req::Beat { txn, addr }) if n != 32 && n != 65 => {
+                let k = if n < 32 { n } else { n - 1 };
+                assert_eq!((*txn, *addr), (k as u64, 0x1000 + 16 * k as u64));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(w.media[3][..], ram()[0x1000..0x1200]);
+    assert_eq!(w.media[4][..], ram()[0x1200..0x1400]);
+    // The largest case: every block of the controller from the top of the aperture.
+    let w = write_and_check(0, 0x3000, 16, false);
+    assert_eq!(w.log.len(), 16 * (BEATS + 1));
+    for b in 0..16 {
+        assert_eq!(w.media[b][..], ram()[0x3000 + b * BLOCK..][..BLOCK]);
+    }
+}
+
+#[test]
+fn the_buffer_grows_by_one_beat_and_is_dropped_once_write_block_is_outstanding() {
     let mut w = World::new();
-    w.command(READ, 7, 0x1400, 2);
+    w.command(WRITE, 7, 0x1400, 2);
     // Accepted: `Issue` at block 0, beat 0, empty buffer, the wake pending.
     let v = view(&w.c);
     assert_eq!((v.engine, v.block, v.beat, v.buffer.len()), (1, 0, 0, 0));
-    let mut positions = Vec::new();
+    let mut positions = vec![(1, 0, 0, 0)];
     while w.step() {
         let v = view(&w.c);
-        if v.busy {
-            positions.push((v.engine, v.block, v.beat, v.buffer.len()));
+        if !v.busy {
+            break;
         }
-        match (v.engine, v.buffer.len()) {
-            (2, len) => assert_eq!(len, 0, "waiting for ReadBlock"),
-            (3, len) => {
-                assert_eq!(len, 512, "waiting for a beat");
-                assert_eq!(v.buffer, pattern(7 + v.block as usize));
+        positions.push((v.engine, v.block, v.beat, v.buffer.len()));
+        let at = 0x1400 + v.block as usize * BLOCK;
+        match v.engine {
+            // Issuing or waiting for beat j: the 16j bytes read so far.
+            1 | 3 if v.beat < 32 => {
+                assert_eq!(v.buffer.len(), 16 * v.beat as usize);
+                assert_eq!(v.buffer, ram()[at..at + v.buffer.len()]);
             }
-            (1, 0) => assert_eq!(v.beat, 0, "issuing ReadBlock"),
-            (1, 512) => assert_eq!(v.buffer, pattern(7 + v.block as usize)),
-            (0, 0) => assert!(v.done),
-            other => panic!("unreachable position {other:?}"),
+            // After beat 31: all 512 bytes, until the `WriteBlock` is sent.
+            1 => {
+                assert_eq!((v.beat, v.buffer.len()), (32, 512));
+                assert_eq!(v.buffer, ram()[at..at + BLOCK]);
+            }
+            // `WriteBlock` outstanding: none, since the request carries the data.
+            2 => assert_eq!((v.beat, v.buffer.len()), (32, 0)),
+            other => panic!("unreachable engine {other}"),
         }
     }
-    // The exact sequence of positions of block 0, then the start of block 1.
-    let mut expected = vec![(2, 0, 0, 0), (1, 0, 0, 512)];
+    // The exact positions of block 0, then the start of block 1.
+    let mut expected = vec![(1, 0, 0, 0)];
     for j in 0..32u8 {
-        expected.push((3, 0, j, 512));
-        if j < 31 {
-            expected.push((1, 0, j + 1, 512));
-        }
+        expected.push((3, 0, j, 16 * j as usize));
+        expected.push((1, 0, j + 1, 16 * (j as usize + 1)));
     }
-    expected.extend([(1, 1, 0, 0), (2, 1, 0, 0), (1, 1, 0, 512)]);
+    expected.extend([(2, 0, 32, 0), (1, 1, 0, 0), (3, 1, 0, 0), (1, 1, 1, 16)]);
     assert_eq!(positions[..expected.len()], expected[..]);
     // Completion drops everything.
     let v = view(&w.c);
@@ -578,50 +625,58 @@ fn the_buffer_holds_the_block_exactly_from_data_through_beat_31() {
 }
 
 #[test]
+fn the_buffer_boundaries_are_exact() {
+    let mut w = World::new();
+    w.command(WRITE, 0, 0x1000, 1);
+    // Steps to the position where beat `j` is outstanding.
+    let to_beat = |w: &mut World, j: u8| {
+        while !(view(&w.c).engine == 3 && view(&w.c).beat == j) {
+            assert!(w.step());
+        }
+        view(&w.c).buffer.len()
+    };
+    assert_eq!(to_beat(&mut w, 0), 0);
+    assert_eq!(to_beat(&mut w, 1), 16);
+    assert_eq!(to_beat(&mut w, 15), 240);
+    assert_eq!(to_beat(&mut w, 31), 496);
+    // Beat 31's response: 512, and the next request is the `WriteBlock`.
+    w.step();
+    let v = view(&w.c);
+    assert_eq!((v.engine, v.beat, v.buffer.len()), (1, 32, 512));
+    assert!(w.wake);
+    w.step();
+    let v = view(&w.c);
+    assert_eq!((v.engine, v.beat, v.buffer.len()), (2, 32, 0));
+    assert!(matches!(&w.outstanding, Some(Req::Write { data, .. }) if data.len() == 512));
+}
+
+#[test]
 fn inspect_shows_the_engine_position() {
     let mut w = World::new();
-    w.command(READ, 1, 0x1000, 2);
+    w.command(WRITE, 1, 0x1000, 2);
     let at = |w: &World| {
         let f = w.c.inspect().fields;
         let get = |n: &str| f.iter().find(|(k, _)| *k == n).unwrap().1.clone();
         (get("engine"), get("block"), get("beat"))
     };
-    assert_eq!(
-        at(&w),
-        (Value::Str("issue".into()), Value::U64(0), Value::U64(0))
-    );
+    let s = |x: &str| Value::Str(x.into());
+    assert_eq!(at(&w), (s("issue"), Value::U64(0), Value::U64(0)));
     w.step();
-    assert_eq!(
-        at(&w),
-        (
-            Value::Str("wait_media".into()),
-            Value::U64(0),
-            Value::U64(0)
-        )
-    );
-    for _ in 0..2 + 2 * 20 {
+    assert_eq!(at(&w), (s("wait_beat"), Value::U64(0), Value::U64(0)));
+    for _ in 0..2 * 20 {
         w.step();
     }
-    assert_eq!(
-        at(&w),
-        (
-            Value::Str("wait_beat".into()),
-            Value::U64(0),
-            Value::U64(20)
-        )
-    );
-    for _ in 0..2 * 12 + 1 {
+    assert_eq!(at(&w), (s("wait_beat"), Value::U64(0), Value::U64(20)));
+    for _ in 0..2 * 12 - 1 {
         w.step();
     }
-    assert_eq!(
-        at(&w),
-        (Value::Str("issue".into()), Value::U64(1), Value::U64(0))
-    );
+    assert_eq!(at(&w), (s("issue"), Value::U64(0), Value::U64(32)));
+    w.step();
+    assert_eq!(at(&w), (s("wait_media"), Value::U64(0), Value::U64(32)));
+    w.step();
+    assert_eq!(at(&w), (s("issue"), Value::U64(1), Value::U64(0)));
     w.run();
-    assert_eq!(
-        at(&w),
-        (Value::Str("idle".into()), Value::U64(0), Value::U64(0))
-    );
+    assert_eq!(at(&w), (s("idle"), Value::U64(0), Value::U64(0)));
 }
 
 // --- Completion and the interrupt ---
@@ -629,50 +684,45 @@ fn inspect_shows_the_engine_position() {
 #[test]
 fn completion_sets_done_with_error_0_and_follows_irq_enable() {
     // Disabled: DONE, no level; enabling afterwards asserts it.
-    let mut w = read_and_check(0, 0x1000, 1, false);
+    let mut w = write_and_check(0, 0x1000, 1, false);
     assert_eq!(w.read_reg(0x18), 1);
     assert_eq!(w.write_reg(R_IRQ_ENABLE, 1), WriteOutcome::Done);
     assert_eq!(w.levels, [true]);
     // Enabled: exactly one assertion at completion, one deassertion at ACK.
-    let mut w = read_and_check(2, 0x1800, 3, true);
+    let mut w = write_and_check(2, 0x1800, 3, true);
     assert_eq!(w.write_reg(R_ACK, 1), WriteOutcome::Done);
     assert_eq!(w.levels, [true, false]);
     assert_eq!(w.status(), 0);
-    // Nothing is asserted while the engine runs.
+    // Nothing is asserted while the engine runs, and only the last `WriteResult`
+    // completes.
     let mut w = World::new();
     w.write_reg(R_IRQ_ENABLE, 1);
-    w.command(READ, 0, 0x1000, 2);
+    w.command(WRITE, 0, 0x1000, 2);
     while w.view_busy() {
         assert!(w.levels.is_empty());
         w.step();
     }
+    assert!(matches!(w.log.last(), Some(Req::Write { lba: 1, .. })));
     assert_eq!(w.levels, [true]);
-    // A second READ after ACK completes and asserts again.
+    // A READ after ACK completes and asserts again, and the counters carry on.
     w.write_reg(R_ACK, 1);
     w.command(READ, 4, 0x2000, 1);
-    w.run();
-    assert_eq!(w.levels, [true, false, true]);
-    assert_eq!(w.ram[0x2000..0x2200], pattern(4)[..]);
-}
-
-impl World {
-    fn view_busy(&self) -> bool {
-        view(&self.c).busy
-    }
+    assert_eq!((view(&w.c).dma_txn, view(&w.c).blk_txn), (64, 2));
 }
 
 #[test]
 fn busy_holds_at_every_stage_and_a_second_command_is_rejected() {
     let mut w = World::new();
     w.write_reg(R_IRQ_ENABLE, 1);
-    let ram = w.ram.clone();
-    w.command(READ, 6, 0x2400, 2);
+    let media = w.media.clone();
+    w.command(WRITE, 6, 0x2400, 2);
     let mut n = 0;
     while w.view_busy() {
         let rejected = if n > 0 { REJECTED } else { 0 };
         assert_eq!(w.status(), BUSY | rejected);
         assert_eq!(w.read_reg(0x18), 0);
-        if n % 5 == 0 {
+        // Every stage of the first block, then every fifth event.
+        if n < 70 || n % 5 == 0 {
             // A command at this stage: REJECTED, nothing else changes, nothing starts.
             let before = view(&w.c);
             let (log, wake, outstanding) = (w.log.len(), w.wake, w.outstanding.clone());
@@ -697,9 +747,9 @@ fn busy_holds_at_every_stage_and_a_second_command_is_rejected() {
         w.step();
         n += 1;
     }
-    let (expected, final_ram) = oracle(&w.media, &ram, 6, 0x2400, 2);
-    assert_eq!(ops(&w.log), expected);
-    assert!(w.ram == final_ram);
+    let (expected, final_media) = oracle(&w.ram, &media, 6, 0x2400, 2);
+    assert_eq!(w.ops(), expected);
+    assert!(w.media == final_media);
     assert_eq!(w.status(), DONE | REJECTED);
     assert_eq!(w.levels, [true]);
 }
@@ -709,22 +759,25 @@ fn busy_holds_at_every_stage_and_a_second_command_is_rejected() {
 #[test]
 fn the_transfer_uses_the_latched_descriptor_not_the_registers() {
     let mut w = World::new();
-    let ram = w.ram.clone();
-    w.command(READ, 1, 0x1200, 3);
-    // Rewrite the registers at once, and again mid-transfer.
-    w.command_registers(9, 0x3000, 1);
+    let media = w.media.clone();
+    w.command(WRITE, 1, 0x1200, 3);
+    // Rewrite the registers at once, mid-block, while the `WriteBlock` is outstanding,
+    // and between blocks.
+    w.registers(9, 0x3000, 1);
     for _ in 0..40 {
         w.step();
     }
-    w.command_registers(12, 0x4000, 2);
-    for _ in 0..70 {
+    w.registers(12, 0x4000, 2);
+    while view(&w.c).engine != 2 {
         w.step();
     }
-    w.command_registers(0, 0x1000, 4);
+    w.registers(4, 0x2000, 5);
+    w.step();
+    w.registers(0, 0x1000, 4);
     w.run();
-    let (expected, final_ram) = oracle(&w.media, &ram, 1, 0x1200, 3);
-    assert_eq!(ops(&w.log), expected);
-    assert!(w.ram == final_ram);
+    let (expected, final_media) = oracle(&w.ram, &media, 1, 0x1200, 3);
+    assert_eq!(w.ops(), expected);
+    assert!(w.media == final_media);
     assert_eq!(
         (
             w.read_reg(R_LBA),
@@ -733,28 +786,18 @@ fn the_transfer_uses_the_latched_descriptor_not_the_registers() {
         ),
         (0, 0x1000, 4)
     );
-    assert!(w.ram[0x3000..0x5000].iter().all(|&b| b == 0));
-}
-
-impl World {
-    fn command_registers(&mut self, lba: u32, addr: u32, count: u32) {
-        for (offset, value) in [(R_LBA, lba), (R_MEM_ADDR, addr), (R_BLOCK_COUNT, count)] {
-            assert_eq!(self.write_reg(offset, value), WriteOutcome::Done);
-        }
-        assert!(self.levels.is_empty() || self.levels == [true]);
-    }
 }
 
 // --- Transaction identity ---
 
 #[test]
 fn every_request_gets_a_fresh_txn_from_its_ports_counter() {
-    let mut w = read_and_check(0, 0x1000, 2, false);
+    let mut w = write_and_check(0, 0x1000, 2, false);
     let blk: Vec<u64> = w
         .log
         .iter()
         .filter_map(|r| match r {
-            Req::Read { txn, .. } => Some(*txn),
+            Req::Write { txn, .. } => Some(*txn),
             _ => None,
         })
         .collect();
@@ -771,17 +814,17 @@ fn every_request_gets_a_fresh_txn_from_its_ports_counter() {
     assert_eq!((view(&w.c).dma_txn, view(&w.c).blk_txn), (64, 2));
     // The counters carry over to the next command: nothing is reused.
     w.write_reg(R_ACK, 1);
-    w.command(READ, 9, 0x2000, 1);
+    w.command(WRITE, 9, 0x2000, 1);
     w.run();
-    assert_eq!(w.log[66], Req::Read { txn: 2, lba: 9 });
-    let later: Vec<u64> = w.log[67..]
-        .iter()
-        .map(|r| match r {
-            Req::Beat { txn, .. } => *txn,
-            other => panic!("{other:?}"),
-        })
-        .collect();
-    assert_eq!(later, (64..96).collect::<Vec<_>>());
+    let later: Vec<Req> = w.log[66..].to_vec();
+    assert_eq!(later.len(), 33);
+    for (j, req) in later[..32].iter().enumerate() {
+        assert!(
+            matches!(req, Req::Beat { txn, .. } if *txn == 64 + j as u64),
+            "{req:?}"
+        );
+    }
+    assert!(matches!(later[32], Req::Write { txn: 2, lba: 9, .. }));
 }
 
 /// Requires delivering `msg` on `port` in `phase` to fault the session and change
@@ -798,140 +841,173 @@ fn assert_violation(w: &mut World, port: PortId, msg: Message, phase: Phase) {
     assert_eq!(snapshot_of(&w.c), before, "{msg:?}");
 }
 
-fn read_result(txn: u64, len: usize) -> Message {
-    BlockMsg::ReadResult {
+fn read_resp(txn: u64, len: usize) -> Message {
+    MemMsg::ReadResp {
         txn: TxnId(txn),
-        outcome: BlockReadOutcome::Data {
+        outcome: ReadOutcome::Data {
             data: vec![0x77; len],
         },
     }
     .into()
 }
 
-fn write_resp(txn: u64) -> Message {
-    MemMsg::WriteResp {
+fn write_result(txn: u64) -> Message {
+    BlockMsg::WriteResult {
         txn: TxnId(txn),
-        outcome: WriteOutcome::Done,
+        outcome: BlockWriteOutcome::Done,
     }
     .into()
+}
+
+fn assert_second_wake_faults(w: &mut World) {
+    let before = snapshot_of(&w.c);
+    let mut ctx = MockCtx::new(Phase::Request);
+    let result =
+        w.c.handle_event(&Delivered::Wake { token: ISSUE }, &mut ctx);
+    assert!(matches!(result, Err(SimError::ComponentFault(_))));
+    assert!(ctx.order.is_empty());
+    assert_eq!(snapshot_of(&w.c), before);
 }
 
 #[test]
 fn a_result_must_match_the_one_outstanding_request() {
     let mut w = World::new();
     // Advance the counters so stale and future txns exist on both ports.
-    w.command(READ, 0, 0x1000, 1);
+    w.command(WRITE, 0, 0x1000, 1);
     w.run();
     w.write_reg(R_ACK, 1);
-    w.command(READ, 1, 0x1200, 2);
+    w.command(WRITE, 1, 0x1200, 2);
     // `Issue`, wake pending: nothing is outstanding.
     for (port, msg) in [
-        (BLK_PORT, read_result(1, 512)),
-        (DMA_PORT, write_resp(32)),
-        (DMA_PORT, write_resp(31)),
+        (DMA_PORT, read_resp(32, 16)),
+        (DMA_PORT, read_resp(31, 16)),
+        (BLK_PORT, write_result(1)),
+        (BLK_PORT, write_result(0)),
     ] {
         assert_violation(&mut w, port, msg, Phase::Complete);
     }
     w.step();
+    // `WaitBeat { txn: 32 }`, beat 0.
+    assert_eq!(
+        w.outstanding,
+        Some(Req::Beat {
+            txn: 32,
+            addr: 0x1200
+        })
+    );
+    let wrong_beat = |txn: u64| -> Vec<(PortId, Message, Phase)> {
+        vec![
+            // Stale, future, and far-off txns.
+            (DMA_PORT, read_resp(txn - 1, 16), Phase::Complete),
+            (DMA_PORT, read_resp(txn + 1, 16), Phase::Complete),
+            (DMA_PORT, read_resp(u64::MAX, 16), Phase::Complete),
+            // Not 16 bytes: never truncated or padded.
+            (DMA_PORT, read_resp(txn, 0), Phase::Complete),
+            (DMA_PORT, read_resp(txn, 15), Phase::Complete),
+            (DMA_PORT, read_resp(txn, 17), Phase::Complete),
+            (DMA_PORT, read_resp(txn, 32), Phase::Complete),
+            // Outside `Complete`.
+            (DMA_PORT, read_resp(txn, 16), Phase::Request),
+            (DMA_PORT, read_resp(txn, 16), Phase::Transfer),
+            (DMA_PORT, read_resp(txn, 16), Phase::Commit),
+            // The wrong kind: a READ's beat response, or a request.
+            (
+                DMA_PORT,
+                MemMsg::WriteResp {
+                    txn: TxnId(txn),
+                    outcome: WriteOutcome::Done,
+                }
+                .into(),
+                Phase::Complete,
+            ),
+            (
+                DMA_PORT,
+                MemMsg::ReadReq {
+                    txn: TxnId(txn),
+                    addr: 0x1200,
+                    len: 16,
+                }
+                .into(),
+                Phase::Complete,
+            ),
+            // The wrong port or protocol.
+            (BLK_PORT, write_result(1), Phase::Complete),
+            (BLK_PORT, read_resp(txn, 16), Phase::Complete),
+            (MEM_PORT, read_resp(txn, 16), Phase::Complete),
+            (IRQ_PORT, read_resp(txn, 16), Phase::Complete),
+            (
+                DMA_PORT,
+                IrqMsg::Level { asserted: true }.into(),
+                Phase::Complete,
+            ),
+        ]
+    };
+    for (port, msg, phase) in wrong_beat(32) {
+        assert_violation(&mut w, port, msg, phase);
+    }
+    assert_second_wake_faults(&mut w);
+    // Mid-block: beat 9 outstanding, the buffer holding 144 bytes.
+    for _ in 0..18 {
+        w.step();
+    }
+    assert!(matches!(w.outstanding, Some(Req::Beat { txn: 41, .. })));
+    assert_eq!(view(&w.c).buffer.len(), 144);
+    for (port, msg, phase) in wrong_beat(41) {
+        assert_violation(&mut w, port, msg, phase);
+    }
+    // Buffer full, `WriteBlock` due: nothing is outstanding.
+    while view(&w.c).beat != 32 {
+        w.step();
+    }
+    assert!(w.wake);
+    assert_violation(&mut w, DMA_PORT, read_resp(63, 16), Phase::Complete);
+    assert_violation(&mut w, BLK_PORT, write_result(1), Phase::Complete);
+    w.step();
     // `WaitMedia { txn: 1 }`.
-    assert_eq!(w.outstanding, Some(Req::Read { txn: 1, lba: 1 }));
+    assert!(matches!(
+        w.outstanding,
+        Some(Req::Write { txn: 1, lba: 1, .. })
+    ));
     let wrong: Vec<(PortId, Message, Phase)> = vec![
-        // Stale, future, and far-off txns.
-        (BLK_PORT, read_result(0, 512), Phase::Complete),
-        (BLK_PORT, read_result(2, 512), Phase::Complete),
-        (BLK_PORT, read_result(u64::MAX, 512), Phase::Complete),
-        // Not 512 bytes.
-        (BLK_PORT, read_result(1, 0), Phase::Complete),
-        (BLK_PORT, read_result(1, 511), Phase::Complete),
-        (BLK_PORT, read_result(1, 513), Phase::Complete),
-        (BLK_PORT, read_result(1, 1024), Phase::Complete),
-        // Outside `Complete`.
-        (BLK_PORT, read_result(1, 512), Phase::Request),
-        (BLK_PORT, read_result(1, 512), Phase::Transfer),
-        (BLK_PORT, read_result(1, 512), Phase::Commit),
-        // The wrong kind.
+        (BLK_PORT, write_result(0), Phase::Complete),
+        (BLK_PORT, write_result(2), Phase::Complete),
+        (BLK_PORT, write_result(u64::MAX), Phase::Complete),
+        (BLK_PORT, write_result(1), Phase::Request),
+        (BLK_PORT, write_result(1), Phase::Transfer),
+        (BLK_PORT, write_result(1), Phase::Commit),
+        // A READ's media result, or a request.
         (
             BLK_PORT,
-            BlockMsg::WriteResult {
+            BlockMsg::ReadResult {
                 txn: TxnId(1),
-                outcome: BlockWriteOutcome::Done,
+                outcome: BlockReadOutcome::Data { data: vec![0; 512] },
             }
             .into(),
             Phase::Complete,
         ),
         (
             BLK_PORT,
-            BlockMsg::ReadBlock {
+            BlockMsg::WriteBlock {
                 txn: TxnId(1),
-                lba: 0,
+                lba: 1,
+                data: vec![0; 512],
             }
             .into(),
             Phase::Complete,
         ),
-        // The wrong port or protocol.
-        (DMA_PORT, write_resp(32), Phase::Complete),
-        (DMA_PORT, read_result(1, 512), Phase::Complete),
-        (BLK_PORT, write_resp(1), Phase::Complete),
-        (IRQ_PORT, read_result(1, 512), Phase::Complete),
-        (
-            DMA_PORT,
-            IrqMsg::Level { asserted: true }.into(),
-            Phase::Complete,
-        ),
+        (DMA_PORT, read_resp(63, 16), Phase::Complete),
+        (DMA_PORT, write_result(1), Phase::Complete),
+        (MEM_PORT, write_result(1), Phase::Complete),
     ];
     for (port, msg, phase) in wrong {
         assert_violation(&mut w, port, msg, phase);
     }
-    // A second wake while a request is outstanding.
-    let mut ctx = MockCtx::new(Phase::Request);
-    let before = snapshot_of(&w.c);
-    let result =
-        w.c.handle_event(&Delivered::Wake { token: ISSUE }, &mut ctx);
-    assert!(matches!(result, Err(SimError::ComponentFault(_))));
-    assert!(ctx.order.is_empty());
-    assert_eq!(snapshot_of(&w.c), before);
-    w.step();
-    w.step();
-    // `WaitBeat { txn: 32 }`.
-    assert!(matches!(w.outstanding, Some(Req::Beat { txn: 32, .. })));
-    let wrong: Vec<(PortId, Message, Phase)> = vec![
-        (DMA_PORT, write_resp(31), Phase::Complete),
-        (DMA_PORT, write_resp(33), Phase::Complete),
-        (DMA_PORT, write_resp(0), Phase::Complete),
-        (DMA_PORT, write_resp(32), Phase::Request),
-        (DMA_PORT, write_resp(32), Phase::Transfer),
-        (DMA_PORT, write_resp(32), Phase::Commit),
-        (
-            DMA_PORT,
-            MemMsg::ReadResp {
-                txn: TxnId(32),
-                outcome: ReadOutcome::Data { data: vec![0; 16] },
-            }
-            .into(),
-            Phase::Complete,
-        ),
-        (
-            DMA_PORT,
-            MemMsg::WriteReq {
-                txn: TxnId(32),
-                addr: 0x1200,
-                data: vec![0; 16],
-            }
-            .into(),
-            Phase::Complete,
-        ),
-        (BLK_PORT, read_result(1, 512), Phase::Complete),
-        (BLK_PORT, read_result(2, 512), Phase::Complete),
-        (MEM_PORT, write_resp(32), Phase::Complete),
-    ];
-    for (port, msg, phase) in wrong {
-        assert_violation(&mut w, port, msg, phase);
-    }
+    assert_second_wake_faults(&mut w);
     // The run then completes normally, and a late duplicate faults.
     w.run();
     assert_eq!(w.status(), DONE);
-    assert_violation(&mut w, DMA_PORT, write_resp(95), Phase::Complete);
-    assert_violation(&mut w, BLK_PORT, read_result(2, 512), Phase::Complete);
+    assert_violation(&mut w, BLK_PORT, write_result(2), Phase::Complete);
+    assert_violation(&mut w, DMA_PORT, read_resp(95, 16), Phase::Complete);
 }
 
 /// The snapshot of an IDLE controller whose next `dma` and `blk` txns are these.
@@ -945,44 +1021,9 @@ fn idle_with_counters(dma_txn: u64, blk_txn: u64) -> DmaBlockController {
     c
 }
 
-#[test]
-fn txn_counters_never_wrap() {
-    // `blk`: the last allocatable txn is u64::MAX - 1; the next ReadBlock faults.
-    let mut w = World::with(idle_with_counters(0, u64::MAX - 1));
-    w.command(READ, 0, 0x1000, 1);
-    w.step();
-    assert_eq!(
-        w.outstanding,
-        Some(Req::Read {
-            txn: u64::MAX - 1,
-            lba: 0
-        })
-    );
-    w.run();
-    assert_eq!(w.status(), DONE);
-    assert_eq!(view(&w.c).blk_txn, u64::MAX);
-    w.write_reg(R_ACK, 1);
-    w.command(READ, 1, 0x1000, 1);
-    let before = snapshot_of(&w.c);
-    let mut ctx = MockCtx::new(Phase::Request);
-    let result =
-        w.c.handle_event(&Delivered::Wake { token: ISSUE }, &mut ctx);
-    assert!(
-        matches!(result, Err(SimError::ComponentFault(_))),
-        "{result:?}"
-    );
-    assert!(ctx.order.is_empty(), "nothing sent");
-    assert_eq!(snapshot_of(&w.c), before, "counter and engine unchanged");
-    // `dma`: 32 beats end exactly at u64::MAX - 1; the next beat faults.
-    let mut w = World::with(idle_with_counters(u64::MAX - 32, 0));
-    w.command(READ, 0, 0x1000, 1);
-    w.run();
-    assert!(matches!(w.log.last(), Some(Req::Beat { txn, .. }) if *txn == u64::MAX - 1));
-    assert_eq!(view(&w.c).dma_txn, u64::MAX);
-    w.write_reg(R_ACK, 1);
-    w.command(READ, 1, 0x1000, 1);
-    w.step();
-    w.step();
+/// Delivers `Wake(ISSUE)` and requires a session fault with nothing sent and nothing
+/// changed.
+fn assert_exhausted(w: &mut World) {
     assert!(w.wake);
     let before = snapshot_of(&w.c);
     let mut ctx = MockCtx::new(Phase::Request);
@@ -993,9 +1034,38 @@ fn txn_counters_never_wrap() {
         "{result:?}"
     );
     assert!(ctx.order.is_empty(), "nothing sent");
-    assert_eq!(snapshot_of(&w.c), before);
+    assert_eq!(snapshot_of(&w.c), before, "counter and engine unchanged");
+}
+
+#[test]
+fn txn_counters_never_wrap() {
+    // `dma`: 32 beats end exactly at u64::MAX - 1; the next beat faults.
+    let mut w = World::with(idle_with_counters(u64::MAX - 32, 0));
+    w.command(WRITE, 0, 0x1000, 1);
+    w.run();
+    assert!(matches!(w.log[31], Req::Beat { txn, .. } if txn == u64::MAX - 1));
+    assert_eq!(view(&w.c).dma_txn, u64::MAX);
+    w.write_reg(R_ACK, 1);
+    w.command(WRITE, 1, 0x1000, 1);
+    assert_exhausted(&mut w);
+    assert_eq!(view(&w.c).buffer.len(), 0);
+    // `blk`: the last allocatable txn is u64::MAX - 1; the next `WriteBlock` faults after
+    // all 32 beats, with the full buffer kept and the media untouched.
+    let mut w = World::with(idle_with_counters(0, u64::MAX - 1));
+    w.command(WRITE, 0, 0x1000, 1);
+    w.run();
+    assert!(matches!(w.log[32], Req::Write { txn, .. } if txn == u64::MAX - 1));
+    assert_eq!(view(&w.c).blk_txn, u64::MAX);
+    w.write_reg(R_ACK, 1);
+    let media = w.media.clone();
+    w.command(WRITE, 1, 0x1200, 1);
+    for _ in 0..2 * BEATS {
+        w.step();
+    }
+    assert_exhausted(&mut w);
     let v = view(&w.c);
-    assert_eq!((v.engine, v.beat, v.buffer.len()), (1, 0, 512));
+    assert_eq!((v.engine, v.beat, v.buffer.len()), (1, 32, 512));
+    assert!(w.media == media);
 }
 
 // --- Failure paths: M2.7c; here only shown not to panic ---
@@ -1003,96 +1073,101 @@ fn txn_counters_never_wrap() {
 #[test]
 fn engine_failure_results_do_not_panic() {
     let mut w = World::new();
-    w.command(READ, 0, 0x1000, 2);
-    w.step();
-    let mut ctx = MockCtx::new(Phase::Complete);
-    let error = BlockMsg::ReadResult {
-        txn: TxnId(0),
-        outcome: BlockReadOutcome::Error {
-            error: MediaError::BadBlock,
-        },
-    };
-    assert!(ctx.deliver_msg(&mut w.c, BLK_PORT, error.into()).is_ok());
-    assert!(!view(&w.c).busy);
-    let mut w = World::new();
-    w.command(READ, 0, 0x1000, 2);
+    w.command(WRITE, 0, 0x1000, 2);
     for _ in 0..5 {
         w.step();
     }
     let Some(Req::Beat { txn, .. }) = w.outstanding.clone() else {
         panic!()
     };
-    let fault = MemMsg::WriteResp {
+    let fault = MemMsg::ReadResp {
         txn: TxnId(txn),
-        outcome: WriteOutcome::Fault {
+        outcome: ReadOutcome::Fault {
             fault: MemFault::AccessFault,
         },
     };
     let mut ctx = MockCtx::new(Phase::Complete);
     assert!(ctx.deliver_msg(&mut w.c, DMA_PORT, fault.into()).is_ok());
     assert!(!view(&w.c).busy);
+    let mut w = World::new();
+    w.command(WRITE, 0, 0x1000, 2);
+    for _ in 0..2 * BEATS + 1 {
+        w.step();
+    }
+    let Some(Req::Write { txn, .. }) = w.outstanding.clone() else {
+        panic!()
+    };
+    let error = BlockMsg::WriteResult {
+        txn: TxnId(txn),
+        outcome: BlockWriteOutcome::Error {
+            error: MediaError::BadBlock,
+        },
+    };
+    let mut ctx = MockCtx::new(Phase::Complete);
+    assert!(ctx.deliver_msg(&mut w.c, BLK_PORT, error.into()).is_ok());
+    assert!(!view(&w.c).busy);
 }
 
 // --- Checkpoints (mock) ---
 
-/// Named positions of a three-block READ, each identified from the snapshot.
 /// A named position and its test on the snapshot.
 type Point = (&'static str, fn(&View) -> bool);
 
+/// Named positions of a three-block WRITE, each identified from the snapshot.
 fn named_points() -> Vec<Point> {
     vec![
-        ("accepted, before the first issue", |v| {
-            v.busy && v.engine == 1 && v.block == 0 && v.buffer.is_empty()
-        }),
-        ("ReadBlock outstanding", |v| v.engine == 2 && v.block == 0),
-        ("Data received, buffer full", |v| {
-            v.engine == 1 && v.block == 0 && v.beat == 0 && v.buffer.len() == 512
+        ("accepted, before the first beat", |v| {
+            v.busy && v.engine == 1 && v.block == 0 && v.beat == 0
         }),
         ("beat 0 outstanding", |v| {
             v.engine == 3 && v.block == 0 && v.beat == 0
         }),
-        ("mid-block beat outstanding", |v| {
-            v.engine == 3 && v.block == 0 && v.beat == 15
+        ("mid-block, issuing beat 7", |v| {
+            v.engine == 1 && v.block == 0 && v.beat == 7
         }),
-        ("mid-block, issuing", |v| {
-            v.engine == 1 && v.block == 0 && v.beat == 16
+        ("mid-block, beat 7 outstanding", |v| {
+            v.engine == 3 && v.block == 0 && v.beat == 7
         }),
         ("beat 31 outstanding", |v| {
             v.engine == 3 && v.block == 0 && v.beat == 31
         }),
+        ("buffer full, before WriteBlock", |v| {
+            v.engine == 1 && v.block == 0 && v.beat == 32
+        }),
+        ("WriteBlock outstanding", |v| v.engine == 2 && v.block == 0),
         ("between blocks", |v| {
-            v.engine == 1 && v.block == 1 && v.buffer.is_empty()
+            v.engine == 1 && v.block == 1 && v.beat == 0
         }),
-        ("second ReadBlock outstanding", |v| {
-            v.engine == 2 && v.block == 1
+        ("second block, beat 20 outstanding", |v| {
+            v.engine == 3 && v.block == 1 && v.beat == 20
         }),
-        ("final beat outstanding", |v| {
-            v.engine == 3 && v.block == 2 && v.beat == 31
+        ("final WriteBlock outstanding", |v| {
+            v.engine == 2 && v.block == 2
         }),
         ("completed", |v| v.done),
     ]
 }
 
-fn three_block_read(w: &mut World) {
+fn three_block_write(w: &mut World) {
     w.write_reg(R_IRQ_ENABLE, 1);
-    w.command(READ, 10, 0x2200, 3);
+    w.command(WRITE, 10, 0x2200, 3);
 }
 
 #[test]
 fn named_checkpoints_resume_identically() {
     let mut reference = World::new();
-    three_block_read(&mut reference);
+    three_block_write(&mut reference);
     reference.run();
     for (name, at) in named_points() {
         let mut w = World::new();
-        three_block_read(&mut w);
+        three_block_write(&mut w);
         while !at(&view(&w.c)) {
             assert!(w.step(), "never reached {name}");
         }
         w.checkpoint();
         w.run();
         assert_eq!(w.log, reference.log, "{name}");
-        assert!(w.ram == reference.ram, "{name}");
+        assert!(w.media == reference.media, "{name}");
         assert_eq!(w.levels, reference.levels, "{name}");
         assert_eq!(w.traced, reference.traced, "{name}");
         assert_eq!(snapshot_of(&w.c), snapshot_of(&reference.c), "{name}");
@@ -1102,15 +1177,15 @@ fn named_checkpoints_resume_identically() {
 #[test]
 fn a_checkpoint_after_every_event_resumes_identically() {
     let mut reference = World::new();
-    three_block_read(&mut reference);
+    three_block_write(&mut reference);
     reference.run();
     let mut w = World::new();
     w.checkpoint_every_event = true;
-    three_block_read(&mut w);
+    three_block_write(&mut w);
     w.checkpoint();
     w.run();
     assert_eq!(w.log, reference.log);
-    assert!(w.ram == reference.ram);
+    assert!(w.media == reference.media);
     assert_eq!(w.levels, reference.levels);
     assert_eq!(w.traced, reference.traced);
     assert_eq!(snapshot_of(&w.c), snapshot_of(&reference.c));
@@ -1122,7 +1197,7 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(128))]
 
     #[test]
-    fn reads_match_the_oracle(
+    fn writes_match_the_oracle(
         (lba, count) in (1u32..=4).prop_flat_map(|n| (0..=(CAPACITY as u32 - n), Just(n))),
         slot in 0u32..(APERTURE as u32 / 16),
         irq in any::<bool>(),
@@ -1134,37 +1209,33 @@ proptest! {
         let slots = (APERTURE as u32 - span) / 16 + 1;
         let addr = BASE as u32 + (slot % slots) * 16;
         let mut w = World::new();
-        // Random block contents.
+        // Random RAM contents.
         let mut x = seed | 1;
-        for block in &mut w.media {
-            for b in block.iter_mut() {
-                x ^= x << 13;
-                x ^= x >> 7;
-                x ^= x << 17;
-                *b = x as u8;
-            }
+        for b in w.ram.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = x as u8;
         }
         w.write_reg(R_IRQ_ENABLE, u32::from(irq));
-        let ram = w.ram.clone();
-        w.command(READ, lba, addr, count);
+        let (ram, media) = (w.ram.clone(), w.media.clone());
+        w.command(WRITE, lba, addr, count);
         let mut steps = 0;
-        let mut max_outstanding = 0;
         loop {
             if Some(steps) == checkpoint_at {
                 w.checkpoint();
             }
-            max_outstanding = max_outstanding.max(usize::from(w.outstanding.is_some()));
             if !w.step() {
                 break;
             }
             steps += 1;
         }
-        let (expected, final_ram) = oracle(&w.media, &ram, lba, addr, count);
-        prop_assert_eq!(ops(&w.log), expected);
-        prop_assert!(w.ram == final_ram);
+        let (expected, final_media) = oracle(&ram, &media, lba, addr, count);
+        prop_assert_eq!(w.ops(), expected);
+        prop_assert!(w.media == final_media);
+        prop_assert!(w.ram == ram);
         prop_assert_eq!(w.log.len(), count as usize * 33);
         prop_assert_eq!(steps, count as usize * 33 * 2);
-        prop_assert_eq!(max_outstanding, 1);
         prop_assert_eq!(w.status(), DONE);
         prop_assert_eq!(w.levels.clone(), if irq { vec![true] } else { vec![] });
         let v = view(&w.c);
@@ -1225,13 +1296,9 @@ struct Ids {
     sink: ComponentId,
 }
 
-fn media_image() -> Vec<u8> {
-    media().concat()
-}
-
-/// A host and the controller's `dma` as the two masters of a bus with the RAM at 0 and
-/// the controller's window at [`MMIO`]; the controller's `blk` to a `SimpleBlockMedia`
-/// holding [`media`], its `irq` to a sink. Every link is one cycle.
+/// A host and the controller's `dma` as the two masters of a bus with an empty RAM at 0
+/// and the controller's window at [`MMIO`]; the controller's `blk` to a
+/// `SimpleBlockMedia` holding [`old_media`], its `irq` to a sink. Every link is one cycle.
 fn build(requests: &[(u64, MemMsg)]) -> (Runtime, Ids) {
     let mut t = TopologyBuilder::new(SimulationClock::default());
     let clock = t
@@ -1279,7 +1346,7 @@ fn build(requests: &[(u64, MemMsg)]) -> (Runtime, Ids) {
     )
     .unwrap();
     let ram = t.add_component("soc.ram", Box::new(ram));
-    let bytes = media_image();
+    let bytes = old_media().concat();
     let disk = SimpleBlockMedia::new(
         BlockMediaConfig {
             capacity_blocks: CAPACITY,
@@ -1320,32 +1387,51 @@ fn build(requests: &[(u64, MemMsg)]) -> (Runtime, Ids) {
     )
 }
 
-/// The READ of `count` blocks from `lba` to `addr` with the interrupt enabled, the
-/// registers rewritten while it runs, a rejected second command, then at cycle
-/// `readback` a `STATUS` read, 16-byte reads of `[addr - 16, addr + 512 count + 16)`, an
-/// ACK, and a final `STATUS` read. Every request has its own txn.
-fn workload(lba: u32, addr: u32, count: u32, readback: u64) -> Vec<(u64, MemMsg)> {
-    let w32 = |offset: u64, value: u32| write(0, MMIO + offset, &value.to_le_bytes());
-    let mut requests = vec![
-        (0, w32(R_LBA, lba)),
-        (1, w32(R_MEM_ADDR, addr)),
-        (2, w32(R_BLOCK_COUNT, count)),
-        (3, w32(R_IRQ_ENABLE, 1)),
-        (4, w32(R_COMMAND, READ)),
-        (6, w32(R_LBA, 0)),
-        (7, w32(R_MEM_ADDR, BASE as u32)),
-        (8, w32(R_BLOCK_COUNT, 5)),
-        (10, w32(R_COMMAND, READ)),
+fn w32(offset: u64, value: u32) -> MemMsg {
+    write(0, MMIO + offset, &value.to_le_bytes())
+}
+
+/// The host fills `[addr, addr + 512 count)` with [`ram`]'s bytes in 16-byte writes,
+/// then WRITEs `count` blocks from there to `lba` with the interrupt enabled, rewrites
+/// the registers while it runs, and has a second command rejected. At cycle `readback`
+/// it reads `STATUS`, ACKs, READs the same blocks back to `back`, and at `readback +
+/// 2000` reads `STATUS` and `[back, back + 512 count)` in 16-byte reads. Every request
+/// has its own txn.
+fn workload(lba: u32, addr: u32, count: u32, back: u32, readback: u64) -> Vec<(u64, MemMsg)> {
+    let pattern = ram();
+    let span = count as usize * BLOCK;
+    let mut requests: Vec<(u64, MemMsg)> = (0..span)
+        .step_by(BEAT)
+        .enumerate()
+        .map(|(k, at)| {
+            let a = addr as usize + at;
+            (k as u64, write(0, a as u64, &pattern[a..a + BEAT]))
+        })
+        .collect();
+    let t = requests.len() as u64 + 4;
+    requests.extend([
+        (t, w32(R_LBA, lba)),
+        (t + 1, w32(R_MEM_ADDR, addr)),
+        (t + 2, w32(R_BLOCK_COUNT, count)),
+        (t + 3, w32(R_IRQ_ENABLE, 1)),
+        (t + 4, w32(R_COMMAND, WRITE)),
+        (t + 6, w32(R_LBA, 0)),
+        (t + 7, w32(R_MEM_ADDR, back)),
+        (t + 8, w32(R_BLOCK_COUNT, 1)),
+        (t + 10, w32(R_COMMAND, READ)),
         (readback, read(0, MMIO + R_STATUS, 4)),
-    ];
-    let start = u64::from(addr) - 16;
-    let end = u64::from(addr) + u64::from(count) * 512 + 16;
-    for (k, at) in (start..end).step_by(16).enumerate() {
-        requests.push((readback + 1 + k as u64, read(0, at, 16)));
+        (readback + 1, w32(R_ACK, 1)),
+        (readback + 2, w32(R_LBA, lba)),
+        (readback + 3, w32(R_BLOCK_COUNT, count)),
+        (readback + 4, w32(R_COMMAND, READ)),
+        (readback + 2000, read(0, MMIO + R_STATUS, 4)),
+    ]);
+    for (k, at) in (0..span).step_by(BEAT).enumerate() {
+        requests.push((
+            readback + 2001 + k as u64,
+            read(0, u64::from(back) + at as u64, 16),
+        ));
     }
-    let after = readback + 2 + (end - start) / 16;
-    requests.push((after, w32(R_ACK, 1)));
-    requests.push((after + 1, read(0, MMIO + R_STATUS, 4)));
     for (i, (_, msg)) in requests.iter_mut().enumerate() {
         match msg {
             MemMsg::ReadReq { txn, .. } | MemMsg::WriteReq { txn, .. } => *txn = TxnId(i as u64),
@@ -1366,15 +1452,51 @@ fn cycle(e: &Dispatched) -> u64 {
 }
 
 #[test]
-fn a_runtime_read_puts_the_media_bytes_in_ram() {
-    let (lba, addr, count, readback) = (2, 0x1400, 3, 3000);
-    let requests = workload(lba, addr, count, readback);
+fn a_runtime_write_puts_the_ram_bytes_on_the_media() {
+    let (lba, addr, count, back, readback) = (9, 0x1600, 3, 0x3000, 3000);
+    let requests = workload(lba, addr, count, back, readback);
     let (mut rt, ids) = build(&requests);
     rt.start_trace().unwrap();
     rt.init().unwrap();
     let events = run_all(&mut rt);
-    // Host responses, by txn.
-    let responses: BTreeMap<u64, MemMsg> = events
+    let pattern = ram();
+    let block = |k: usize| &pattern[addr as usize + k * BLOCK..][..BLOCK];
+    // The media received exactly the three WriteBlocks, in order, each the exact RAM
+    // block, then the READ's three ReadBlocks.
+    let media: Vec<BlockMsg> = events
+        .iter()
+        .filter(|e| e.target == ids.media)
+        .map(|e| {
+            assert_eq!(e.key.phase, Phase::Request);
+            match &e.delivery {
+                Delivered::Message {
+                    msg: Message::Block(m),
+                    ..
+                } => m.clone(),
+                other => panic!("{other:?}"),
+            }
+        })
+        .collect();
+    assert_eq!(media.len(), 6);
+    for (k, msg) in media[..3].iter().enumerate() {
+        let BlockMsg::WriteBlock { txn, lba: at, data } = msg else {
+            panic!("{msg:?}")
+        };
+        assert_eq!((txn.0, *at), (k as u64, u64::from(lba) + k as u64));
+        assert!(data[..] == *block(k), "WriteBlock {k}");
+    }
+    for (k, msg) in media[3..].iter().enumerate() {
+        assert_eq!(
+            *msg,
+            BlockMsg::ReadBlock {
+                txn: TxnId(3 + k as u64),
+                lba: u64::from(lba) + k as u64
+            }
+        );
+    }
+    // Host responses: STATUS reads DONE | REJECTED (REJECTED is sticky) at the read-back
+    // and at the end, and the blocks read back from the media are the RAM's.
+    let responses: Vec<(u64, MemMsg)> = events
         .iter()
         .filter(|e| e.target == ids.host)
         .map(|e| {
@@ -1393,63 +1515,40 @@ fn a_runtime_read_puts_the_media_bytes_in_ram() {
         })
         .collect();
     assert_eq!(responses.len(), requests.len());
-    let data = |txn: u64| match &responses[&txn] {
+    let data = |txn: u64| match &responses.iter().find(|(t, _)| *t == txn).unwrap().1 {
         MemMsg::ReadResp {
             outcome: ReadOutcome::Data { data },
             ..
         } => data.clone(),
         other => panic!("{other:?}"),
     };
-    // STATUS at read-back: DONE and REJECTED; after ACK: REJECTED only.
-    assert_eq!(data(9), (DONE | REJECTED).to_le_bytes());
-    let last = requests.len() as u64 - 1;
-    assert_eq!(data(last), REJECTED.to_le_bytes());
-    // RAM: zeros, blocks 2, 3, 4 exactly, zeros.
-    let ram: Vec<u8> = (10..last - 1).flat_map(data).collect();
-    let mut expected = vec![0; 16];
-    for b in lba..lba + count {
-        expected.extend(pattern(b as usize));
-    }
-    expected.extend([0; 16]);
-    assert_eq!(ram.len(), expected.len());
-    assert!(ram == expected, "RAM differs from the media blocks");
-    // The media saw exactly the three ReadBlocks, in order.
-    let media_reads: Vec<(u64, u64)> = events
-        .iter()
-        .filter(|e| e.target == ids.media)
-        .map(|e| match &e.delivery {
-            Delivered::Message {
-                msg: Message::Block(BlockMsg::ReadBlock { txn, lba }),
-                ..
-            } => (txn.0, *lba),
-            other => panic!("{other:?}"),
-        })
-        .collect();
-    assert_eq!(media_reads, [(0, 2), (1, 3), (2, 4)]);
-    // The controller's engine events strictly alternate wake, result: one outstanding.
+    let base = (count as usize * BLOCK / BEAT) as u64;
+    assert_eq!(data(base + 9), (DONE | REJECTED).to_le_bytes());
+    assert_eq!(data(base + 14), (DONE | REJECTED).to_le_bytes());
+    let back_bytes: Vec<u8> = (base + 15..requests.len() as u64).flat_map(data).collect();
+    assert!(back_bytes[..] == pattern[addr as usize..][..count as usize * BLOCK]);
+    // The WRITE's engine events strictly alternate wake, result: 32 beats and a
+    // WriteBlock per block, each wake one cycle after the result before it.
     let engine: Vec<&Dispatched> = events
         .iter()
         .filter(|e| e.target == ids.ctl)
         .filter(|e| !matches!(e.delivery, Delivered::Message { port: MEM_PORT, .. }))
+        .take(2 * 3 * 33)
         .collect();
-    assert_eq!(engine.len(), 2 * 3 * 33);
-    for pair in engine.chunks(2) {
+    for (n, pair) in engine.chunks(2).enumerate() {
         assert!(matches!(pair[0].delivery, Delivered::Wake { token: ISSUE }));
         assert_eq!(pair[0].key.phase, Phase::Request);
-        assert!(matches!(
-            pair[1].delivery,
-            Delivered::Message {
-                port: DMA_PORT | BLK_PORT,
-                ..
-            }
-        ));
+        let port = if n % 33 == 32 { BLK_PORT } else { DMA_PORT };
+        assert!(
+            matches!(pair[1].delivery, Delivered::Message { port: p, .. } if p == port),
+            "event {n}"
+        );
         assert_eq!(pair[1].key.phase, Phase::Complete);
     }
-    // Each wake is one cycle after the result before it.
     for w in engine[1..].windows(2).step_by(2) {
         assert_eq!(cycle(w[1]), cycle(w[0]) + 1);
     }
-    // One assertion at completion, one deassertion at ACK.
+    // Two completions, two assertions, one ACK between them.
     let levels: Vec<bool> = events
         .iter()
         .filter(|e| e.target == ids.sink)
@@ -1461,10 +1560,10 @@ fn a_runtime_read_puts_the_media_bytes_in_ram() {
             _ => panic!("{e:?}"),
         })
         .collect();
-    assert_eq!(levels, [true, false]);
-    // Trace: the command, the rejection, the completion, all before the read-back.
+    assert_eq!(levels, [true, false, true]);
+    // Trace: the WRITE, the rejection, its completion before the read-back, then the READ.
     let trace = rt.take_trace().unwrap();
-    let records: Vec<(u64, Traced)> = trace
+    let (at, traced): (Vec<u64>, Vec<Traced>) = trace
         .records
         .iter()
         .filter(|r| r.origin == TraceOrigin::Component && r.component == ids.ctl)
@@ -1474,27 +1573,24 @@ fn a_runtime_read_puts_the_media_bytes_in_ram() {
             };
             (key.tick.0 / TICKS_PER_CYCLE, (r.kind, r.fields.clone()))
         })
-        .collect();
-    let (at, traced): (Vec<u64>, Vec<Traced>) = records.into_iter().unzip();
+        .unzip();
     assert_eq!(
         traced,
         [
-            command_record(1, 2, 0x1400, 3, true),
+            command_record(2, lba.into(), addr.into(), count.into(), true),
             (REJECTED_KIND, vec![]),
+            done_record(0),
+            command_record(1, lba.into(), back.into(), count.into(), true),
             done_record(0),
         ]
     );
     assert!(at[2] < readback);
-    // Timing: the first wake one cycle after the accepting MMIO write, the ReadBlock one
-    // link cycle after it.
+    // Timing: the first wake one cycle after the accepting MMIO write.
     assert_eq!(cycle(engine[0]), at[0] + 1);
-    let first_media = events.iter().find(|e| e.target == ids.media).unwrap();
-    assert_eq!(cycle(first_media), cycle(engine[0]) + 1);
-    assert_eq!(first_media.key.phase, Phase::Request);
 }
 
 fn checkpoint_workload() -> Vec<(u64, MemMsg)> {
-    workload(12, 0x4c00, 2, 1200)
+    workload(12, 0x4c00, 2, 0x1000, 1200)
 }
 
 #[test]
@@ -1514,7 +1610,7 @@ fn runtime_checkpoints_at_every_event_boundary_resume_identically() {
             rt.execution_digest(),
         )
     };
-    // The workload's DMA must be finished before its read-back.
+    // The WRITE must be finished before the read-back.
     assert!(reference.1.records.iter().any(|r| r.kind == DONE_KIND
         && matches!(r.at, TraceAt::Event(k) if k.tick.0 < 1200 * TICKS_PER_CYCLE)));
     for k in 0..=reference.0.len() {
@@ -1555,7 +1651,7 @@ fn runtime_checkpoints_at_every_event_boundary_resume_identically() {
 }
 
 #[test]
-fn runtime_reads_are_deterministic() {
+fn runtime_writes_are_deterministic() {
     let run = || {
         let (mut rt, _) = build(&checkpoint_workload());
         rt.start_trace().unwrap();

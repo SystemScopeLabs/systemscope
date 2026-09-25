@@ -3,13 +3,13 @@
 //! validation and its precedence, `REJECTED`, the interrupt line, snapshots, restore
 //! rejection, inspect, and trace, driven through a mock context and checked against an
 //! independent register/lifecycle model; then in a real runtime with a scripted MMIO
-//! initiator, an interrupt sink, and tie-offs on `dma` and `blk` that fault on any
-//! message, for timing and every-event checkpoints.
+//! initiator, an interrupt sink, a `blk` tie-off that faults on any message, and a `dma`
+//! target that accepts the engine's first beat and never answers, so that the accepted
+//! command stays BUSY, for timing and every-event checkpoints.
 //!
 //! Every mock-context MMIO delivery also checks that nothing is sent on `dma` or `blk`,
-//! and that exactly an accepted READ schedules one `Wake(ISSUE)` (M2.7a); the READ engine
-//! itself is tested in `dma_read.rs`. The runtime workload's accepted command is a WRITE,
-//! which stays at the M2.6 boundary until M2.7b.
+//! and that exactly an accepted command schedules one `Wake(ISSUE)` (M2.7a, M2.7b); the
+//! engine itself is tested in `dma_read.rs` and `dma_write.rs`.
 
 mod common;
 
@@ -97,10 +97,8 @@ fn mmio(c: &mut DmaBlockController, msg: MemMsg) -> (MemMsg, MockCtx) {
     let mut ctx = MockCtx::new(Phase::Transfer);
     ctx.deliver(c, MEM_PORT, msg).unwrap();
     assert!(ctx.blocks.is_empty(), "block.v0 sent: {:?}", ctx.blocks);
-    let read_accepted = ctx.traced.iter().any(|(kind, fields)| {
-        *kind == COMMAND_KIND
-            && fields.contains(&("op", Value::U64(1)))
-            && fields.contains(&("accepted", Value::Bool(true)))
+    let accepted = ctx.traced.iter().any(|(kind, fields)| {
+        *kind == COMMAND_KIND && fields.contains(&("accepted", Value::Bool(true)))
     });
     let wakes: Vec<_> = ctx
         .wakes
@@ -115,7 +113,7 @@ fn mmio(c: &mut DmaBlockController, msg: MemMsg) -> (MemMsg, MockCtx) {
         Phase::Request,
         ISSUE,
     );
-    let expected = if read_accepted { vec![issue] } else { vec![] };
+    let expected = if accepted { vec![issue] } else { vec![] };
     assert_eq!(wakes, expected);
     assert_eq!(ctx.sent.len(), 1, "mem.v1 sends: {:?}", ctx.sent);
     let sent = ctx.sent.pop().unwrap();
@@ -507,13 +505,12 @@ fn protocol_violations_fault_the_session() {
         assert!(ctx.order.is_empty());
         assert_eq!(snapshot_of(&c), before);
     }
-    // `Wake(ISSUE)` with nothing to issue: IDLE, DONE, and an accepted WRITE (M2.7b).
+    // `Wake(ISSUE)` with nothing to issue: IDLE and DONE. (A wake while a request is
+    // outstanding is tested with the engine, in `dma_read.rs` and `dma_write.rs`.)
     let mut idle = controller();
     let mut done = controller();
     submit(&mut done, 1, 0, 0x1000, 0);
-    let mut write_busy = controller();
-    assert_eq!(submit(&mut write_busy, 2, 0, 0x1000, 1), 0);
-    for c in [&mut idle, &mut done, &mut write_busy] {
+    for c in [&mut idle, &mut done] {
         let before = snapshot_of(c);
         let mut ctx = MockCtx::new(Phase::Request);
         let result = c.handle_event(&Delivered::Wake { token: ISSUE }, &mut ctx);
@@ -977,6 +974,31 @@ impl Raw {
         }
     }
 
+    /// A busy WRITE of blocks 2..5 to 0x1100 at block `block`, engine `engine` with
+    /// `txn`, beat `beat`, with `buffer` and the next `dma_txn` and `blk_txn`.
+    fn write(
+        block: u32,
+        engine: u8,
+        txn: Option<u64>,
+        beat: u8,
+        buffer: Vec<u8>,
+        dma_txn: u64,
+        blk_txn: u64,
+    ) -> Raw {
+        Raw {
+            registers: [2, 0x1100, 3, 1],
+            latched: Some((2, 2, 0x1100, 3)),
+            engine,
+            txn,
+            block,
+            beat,
+            buffer,
+            dma_txn,
+            blk_txn,
+            ..Raw::busy()
+        }
+    }
+
     fn done(error: u8, irq_enable: bool) -> Raw {
         Raw {
             registers: [0, 0, 0, u32::from(irq_enable)],
@@ -1200,6 +1222,15 @@ fn hand_written_valid_snapshots_restore() {
             dma_txn: 40,
             ..Raw::busy()
         },
+        // Reachable since M2.7b: every WRITE engine position.
+        Raw::write(0, 1, None, 0, vec![], 0, 0),
+        Raw::write(2, 1, None, 0, vec![], 5, 9),
+        Raw::write(0, 3, Some(0), 0, vec![], 1, 0),
+        Raw::write(1, 3, Some(40), 7, vec![0x5a; 112], 41, 1),
+        Raw::write(1, 1, None, 16, vec![0x5a; 256], 48, 1),
+        Raw::write(2, 3, Some(95), 31, vec![0x5a; 496], 96, 2),
+        Raw::write(2, 1, None, 32, vec![0x5a; 512], 96, 2),
+        Raw::write(2, 2, Some(2), 32, vec![], 96, 3),
     ] {
         let bytes = raw.encode();
         let mut c = controller();
@@ -1385,13 +1416,44 @@ fn restore_rejects_impossible_states() {
             .encode(),
         ),
         (
-            "block progress on a WRITE",
-            Raw {
-                latched: Some((2, 2, 0x1100, 3)),
-                block: 1,
-                ..Raw::busy()
-            }
-            .encode(),
+            "a WRITE block index at the latched count",
+            Raw::write(3, 1, None, 0, vec![], 96, 3).encode(),
+        ),
+        (
+            "a WRITE beat index past 32",
+            Raw::write(0, 1, None, 33, vec![0; 528], 33, 0).encode(),
+        ),
+        (
+            "a WRITE buffer shorter than the beats read",
+            Raw::write(0, 1, None, 7, vec![0; 96], 7, 0).encode(),
+        ),
+        (
+            "a WRITE buffer longer than the beats read",
+            Raw::write(0, 3, Some(6), 7, vec![0; 128], 7, 0).encode(),
+        ),
+        (
+            "a WRITE waiting for beat 32",
+            Raw::write(0, 3, Some(31), 32, vec![0; 512], 32, 0).encode(),
+        ),
+        (
+            "a WRITE waiting for media before beat 32",
+            Raw::write(0, 2, Some(0), 31, vec![], 31, 1).encode(),
+        ),
+        (
+            "a WRITE waiting for media with its buffer kept",
+            Raw::write(0, 2, Some(0), 32, vec![0; 512], 32, 1).encode(),
+        ),
+        (
+            "a WRITE waiting for media on a stale txn",
+            Raw::write(1, 2, Some(0), 32, vec![], 64, 2).encode(),
+        ),
+        (
+            "a WRITE waiting for a beat on a stale txn",
+            Raw::write(0, 3, Some(3), 5, vec![0; 80], 6, 0).encode(),
+        ),
+        (
+            "a WRITE idle while BUSY",
+            Raw::write(0, 0, None, 0, vec![], 0, 0).encode(),
         ),
         (
             "a WRITE waiting for a beat",
@@ -1723,6 +1785,11 @@ impl Model {
 
     /// The canonical snapshot of this state.
     fn snapshot(&self, header: &[u8]) -> Vec<u8> {
+        self.raw().encode_with(header)
+    }
+
+    /// The snapshot fields, with the engine where an MMIO-only run leaves it.
+    fn raw(&self) -> Raw {
         Raw {
             registers: [self.lba, self.addr, self.count, self.enable as u32],
             busy: self.busy as u8,
@@ -1739,7 +1806,6 @@ impl Model {
             blk_txn: 0,
             irq: self.line as u8,
         }
-        .encode_with(header)
     }
 }
 
@@ -1926,14 +1992,57 @@ impl Component for TieOff {
     }
 }
 
+/// A `mem.v1` target that accepts `ReadReq`s in `Request` and never answers: the
+/// engine's first beat of an accepted WRITE stays outstanding, so the command stays BUSY.
+struct Stall;
+
+impl Component for Stall {
+    fn type_name(&self) -> &'static str {
+        "test.stall"
+    }
+
+    fn ports(&self) -> Vec<PortSpec> {
+        vec![PortSpec {
+            name: "mem",
+            protocol: mem_v1::PROTOCOL,
+            role: Role::Target,
+        }]
+    }
+
+    fn init(&mut self, _: &mut dyn InitContext) -> Result<(), SimError> {
+        Ok(())
+    }
+
+    fn handle_event(&mut self, ev: &Delivered, ctx: &mut dyn SimContext) -> Result<(), SimError> {
+        match ev {
+            Delivered::Message {
+                msg: Message::MemV1(MemMsg::ReadReq { .. }),
+                ..
+            } if ctx.phase() == Phase::Request => Ok(()),
+            _ => Err(SimError::ComponentFault("stall: unexpected delivery")),
+        }
+    }
+
+    fn snapshot_schema_version(&self) -> u32 {
+        1
+    }
+
+    fn snapshot(&self, _: &mut SnapshotWriter) {}
+
+    fn restore(&mut self, _: &mut SnapshotReader<'_>, _: u32) -> Result<(), RestoreError> {
+        Ok(())
+    }
+}
+
 struct Ids {
     host: ComponentId,
     ctl: ComponentId,
     sink: ComponentId,
+    ram: ComponentId,
 }
 
 /// A scripted MMIO initiator → the controller (`Cycles { 1 }`, the controller answering
-/// after `Cycles { 2 }`), its `irq` → a sink, and `dma` and `blk` → tie-offs.
+/// after `Cycles { 2 }`), its `irq` → a sink, `dma` → a [`Stall`], and `blk` → a tie-off.
 fn build(requests: &[(u64, MemMsg)]) -> (Runtime, Ids) {
     let mut t = TopologyBuilder::new(SimulationClock::default());
     let clock = t
@@ -1961,7 +2070,7 @@ fn build(requests: &[(u64, MemMsg)]) -> (Runtime, Ids) {
     .unwrap();
     let ctl = t.add_component("soc.blk", Box::new(ctl));
     let sink = t.add_component("soc.irqc", Box::new(IrqSink));
-    let ram = t.add_component("soc.ram", Box::new(TieOff("mem", mem_v1::PROTOCOL)));
+    let ram = t.add_component("soc.ram", Box::new(Stall));
     let disk = t.add_component("soc.disk", Box::new(TieOff("blk", block_v0::PROTOCOL)));
     t.connect((host, "mem"), (ctl, "mem"), Some(cycles(1)));
     t.connect((ctl, "irq"), (sink, "irq"), None);
@@ -1969,7 +2078,12 @@ fn build(requests: &[(u64, MemMsg)]) -> (Runtime, Ids) {
     t.connect((ctl, "blk"), (disk, "blk"), Some(cycles(1)));
     (
         t.elaborate(SessionConfig::default()).unwrap(),
-        Ids { host, ctl, sink },
+        Ids {
+            host,
+            ctl,
+            sink,
+            ram,
+        },
     )
 }
 
@@ -1978,9 +2092,9 @@ fn w32(offset: u64, value: u32) -> MemMsg {
 }
 
 /// Programming, a validation failure with the interrupt enabled, a rejection in DONE,
-/// ACK, clearing REJECTED, a valid WRITE (which stays BUSY at the M2.6 boundary until
-/// M2.7b, sending nothing), a rejection in BUSY, reprogramming during
-/// BUSY, reads, and bad accesses. Each request has its own txn.
+/// ACK, clearing REJECTED, a valid WRITE (which stays BUSY: its first beat is never
+/// answered), a rejection in BUSY, reprogramming during BUSY, reads, and bad accesses.
+/// Each request has its own txn.
 fn workload() -> Vec<(u64, MemMsg)> {
     let mut requests = vec![
         (0, w32(R_LBA, 2)),
@@ -2119,10 +2233,35 @@ fn the_runtime_workload_matches_the_model_and_the_frozen_timing() {
             (11, REJECTED_KIND),
         ]
     );
-    // The controller ends BUSY with the command latched at cycle 10, and nothing else
-    // ever happened: no engine traffic reached a tie-off (it would have faulted).
+    // The engine sent exactly the WRITE's beat 0, a `ReadReq` of 16 bytes at 0x1000
+    // under dma txn 0, from the wake one cycle after the command was accepted.
+    let beats: Vec<(u64, Phase, MemMsg)> = events
+        .iter()
+        .filter(|e| e.target == ids.ram)
+        .map(|e| (e.key.tick.0 / TICKS_PER_CYCLE, e.key.phase, outcome_of(e)))
+        .collect();
+    assert_eq!(
+        beats,
+        [(
+            12,
+            Phase::Request,
+            MemMsg::ReadReq {
+                txn: TxnId(0),
+                addr: 0x1000,
+                len: 16,
+            }
+        )]
+    );
+    // The controller ends BUSY with the command latched at cycle 10, waiting for that
+    // beat; nothing reached the `blk` tie-off (it would have faulted).
     let snap = rt.snapshot().unwrap();
-    let ours = m.snapshot(&header_of(&DmaBlockControllerConfig {
+    let ours = Raw {
+        engine: 3,
+        txn: Some(0),
+        dma_txn: 1,
+        ..m.raw()
+    }
+    .encode_with(&header_of(&DmaBlockControllerConfig {
         clock: ClockDomainId(0),
         latency: LinkLatency::Cycles {
             domain: ClockDomainId(0),
