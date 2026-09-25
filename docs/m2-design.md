@@ -779,7 +779,7 @@ Checkpoint-and-resume must give identical results (final state, output, `StateDi
 ### 13.3 Sizes
 
 - The M1 portable snapshot `tests/golden/m1-reference.mid.snap` is **8,942 bytes** (measured at M2.0; `m0-reference.mid.snap` is 3,979).
-- M2.9 records the size of `m2-reference.mid.snap` next to these numbers in this section. Expected new contributors: the media block map (512 bytes per non-zero block), the controller's 512-byte buffer, the bus FIFOs, and the CPU CSRs. No compaction is planned for M2 (§16).
+- The M2 portable snapshot `tests/golden/m2-reference.mid.snap` is **14,356 bytes** (measured at M2.9, after 13,462 events: the WRITE to LBA 1 with 16 of 32 beats buffered). Component state: RAM 12,369 bytes (three non-zero 4 KiB pages), disk 585 (one stored block, LBA 0), block controller 365 (256 buffered bytes), CPU 193, bus 192, IRQ controller 23, UART 17; the rest is session information, the scheduler queue, and the RNG streams. No compaction is planned for M2 (§16).
 
 ### 13.4 Observation Invariance
 

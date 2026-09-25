@@ -1,0 +1,41 @@
+{
+  "scenario": "m2-reference",
+  "compatibility_id": "0.0.0",
+  "seed": 0,
+  "program": {
+    "program": "block_irq",
+    "elf_blake3": "39f23b9ff855b5bd1c18bba51cc6720a62693dec6bb37f03057533e943d88bc8",
+    "image_hash": "39f23b9ff855b5bd1c18bba51cc6720a62693dec6bb37f03057533e943d88bc8",
+    "disk_blake3": "ffcfaec0371bba378912708f3fc9312c878c9969aaf1a779993c993844a83b43",
+    "media_image_hash": "ffcfaec0371bba378912708f3fc9312c878c9969aaf1a779993c993844a83b43",
+    "halt": "EnvironmentCall",
+    "trap_pc": "0x80000130",
+    "tval": "0x00000000",
+    "instret": 2401,
+    "events": 22000,
+    "registers": ["0x80000130", "0x800000cc", "0x00000000", "0x00000001", "0x00000000", "0x10000000", "0x0000000a", "0x5aa5c33c", "0x10002000", "0x80002000", "0x00000000", "0x00000001", "0x80001008", "0x80001008", "0xda2543bc", "0xda2543bc", "0x80002400", "0x00000000", "0x00000000", "0x00000000", "0x00000000", "0x00000000", "0x00000000", "0x00000000", "0x00000000", "0x00000000", "0x00000000", "0x00000000", "0x00000002", "0x00000001", "0x00000000", "0x00000000"],
+    "csrs": ["0x00001888", "0x00000800", "0x00000000", "0x80000164", "0x00000000", "0x8000014c", "0x8000000b", "0x00000000"],
+    "uart": "4d3220504153530a",
+    "uart_blake3": "5f7f4be37740275f81d38e25668a347e9be5512296969ef2aacc3bed58311cf8",
+    "interrupts": ["0x8000000b", "0x8000000b", "0x8000000b"],
+    "handler_entries": 3,
+    "disk_ops": [{ "op": "read", "lba": 0 }, { "op": "write", "lba": 1 }, { "op": "read", "lba": 1 }],
+    "dma_beats": 96,
+    "disk_blocks": [{ "lba": 0, "blake3": "b29ebf5ccdbfe45fb2819bb9468514ba1f3014eaae61e49ee41da822a12fc294" }, { "lba": 1, "blake3": "12851485a66ea4b496089e7b52303f0161b8944e28c54335747945826ded422e" }],
+    "state": "cd04fb9b8eacd8d66b18a271a2aa1ea31090f610578b6650c81ef83ee5805dd3",
+    "execution": "f9b6214d57d8fbea8cca578d626884094ac19a96220150922cd7ea33840bce0d",
+    "trace": "4534ee4c548b512a7003fa5a2bf20e117bf1fd7cfae8ca92d74ba697128990c3"
+  },
+  "mid_snapshot": {
+    "file": "m2-reference.mid.snap",
+    "program": "block_irq",
+    "checkpoint": "WRITE to LBA 1 half buffered: 16 of 32 beats read, beat 16 outstanding",
+    "after_events": 13462,
+    "seed": 0,
+    "compatibility_id": "0.0.0",
+    "image_hash": "39f23b9ff855b5bd1c18bba51cc6720a62693dec6bb37f03057533e943d88bc8",
+    "media_image_hash": "ffcfaec0371bba378912708f3fc9312c878c9969aaf1a779993c993844a83b43",
+    "size": 14356,
+    "blake3": "5233f9e0fac7092ec4e174238ae0723db7b5238f092fcc0a90d89b8b8b0e0764"
+  }
+}

@@ -120,6 +120,12 @@ jobs:
         run: cargo nextest run -p systemscope-acceptance --locked --profile ci --no-fail-fast --test m1_a8
       - name: M1 golden verify
         run: cargo xtask m1-golden verify
+      # docs/m2-design.md §13.2: block_irq.elf on m2-reference. Both operating systems
+      # check the same committed golden file and portable snapshot.
+      - name: M2.9 golden reproduction (in process, separate processes, drift)
+        run: cargo nextest run -p systemscope-acceptance --locked --profile ci --no-fail-fast --test m2_golden
+      - name: M2 golden verify
+        run: cargo xtask m2-golden verify
       - name: rv32ui fixtures, hello.elf, block_irq.elf, and the ACT4 corpus unchanged
         shell: bash
         run: git diff --exit-code -- tests/rv32/fixtures tests/rv32/hello tests/rv32/block_irq tests/act4
@@ -136,6 +142,14 @@ jobs:
         with:
           name: m1-result-${{ matrix.os }}
           path: systemscope/target/m1-result
+          if-no-files-found: error
+      # This machine's own M2 result and portable snapshot, for the m2-cross-os job.
+      - name: Emit this machine's M2 result
+        run: cargo xtask m2-golden emit target/m2-result
+      - uses: actions/upload-artifact@v4
+        with:
+          name: m2-result-${{ matrix.os }}
+          path: systemscope/target/m2-result
           if-no-files-found: error
 
   # docs/m1-design.md §10.1 M1-A6, M1-A8: each operating system restores the portable
@@ -175,6 +189,44 @@ jobs:
           path: systemscope/target/m1-foreign
       - name: Check the ${{ matrix.from }} result and restore its snapshot
         run: cargo xtask m1-golden check target/m1-foreign
+
+  # docs/m2-design.md §13.2: each operating system restores the portable M2
+  # snapshot the other one took, taken mid-DMA, and checks the other one's golden result
+  # against the committed files and its own run.
+  m2-cross-os:
+    name: M2 cross-OS (${{ matrix.os }} checks ${{ matrix.from }})
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            from: ubuntu-latest
+          - os: ubuntu-latest
+            from: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: systemscope
+      # systemscope depends on `../contracts` by path (plan.md §10), so reproduce the
+      # sibling layout, with contracts pinned to a pushed revision (bump it deliberately).
+      - uses: actions/checkout@v4
+        with:
+          repository: SystemScopeLabs/contracts
+          ref: 90900a128d51f6b42e86dc789447882c90c52ef4
+          path: contracts
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: systemscope
+      - uses: actions/download-artifact@v4
+        with:
+          name: m2-result-${{ matrix.from }}
+          path: systemscope/target/m2-foreign
+      - name: Check the ${{ matrix.from }} result and restore its snapshot
+        run: cargo xtask m2-golden check target/m2-foreign
 
   # docs/m1-design.md §10.6: rebuilds the rv32ui fixtures from the pinned riscv-tests,
   # hello.elf from tests/rv32/hello, and block_irq.elf and its disk fixture from

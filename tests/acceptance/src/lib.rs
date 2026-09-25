@@ -4,6 +4,9 @@
 //!   the golden files that `cargo xtask bless` writes.
 //! - [`m1`] (`docs/m1-design.md` §10.1): M1-A6, M1-A7, and M1-A8 on `m1-reference`, and
 //!   the golden files that `cargo xtask m1-golden bless` writes.
+//! - [`m2`] (`docs/m2-design.md` §13, §15.1): checkpoint and resume from every event of
+//!   `block_irq.elf` on `m2-reference`, observation invariance, and the golden files that
+//!   `cargo xtask m2-golden bless` writes.
 //!
 //! Every check returns a `Result` instead of asserting, so the tests can also feed it
 //! doctored inputs and prove that it notices them.
@@ -13,6 +16,7 @@ pub mod digests;
 pub mod golden;
 pub mod layout;
 pub mod m1;
+pub mod m2;
 pub mod observation;
 pub mod process;
 
