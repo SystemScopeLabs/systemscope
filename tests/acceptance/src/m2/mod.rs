@@ -29,7 +29,9 @@ use systemscope_rv32i::cpu::INTERRUPT_KIND;
 
 use crate::layout::Layout;
 
+pub mod checkpoint;
 pub mod golden;
+pub mod observation;
 
 /// The scenario's name, as the golden file records it.
 pub const SCENARIO: &str = "m2-reference";

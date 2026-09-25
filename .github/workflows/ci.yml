@@ -120,8 +120,13 @@ jobs:
         run: cargo nextest run -p systemscope-acceptance --locked --profile ci --no-fail-fast --test m1_a8
       - name: M1 golden verify
         run: cargo xtask m1-golden verify
-      # docs/m2-design.md §13.2: block_irq.elf on m2-reference. Both operating systems
-      # check the same committed golden file and portable snapshot.
+      # docs/m2-design.md §13: block_irq.elf on m2-reference. Every checkpoint, no
+      # sampling, is restored into a fresh platform and run to the end; both operating
+      # systems check the same committed golden file and portable snapshot.
+      - name: M2.9 snapshot/restore (every event, stress points, watchdog, portable snapshot, rejections)
+        run: cargo nextest run -p systemscope-acceptance --locked --profile ci --no-fail-fast --test m2_snapshot
+      - name: M2.9 observation invariance (O0-O5)
+        run: cargo nextest run -p systemscope-acceptance --locked --profile ci --no-fail-fast --test m2_observation
       - name: M2.9 golden reproduction (in process, separate processes, drift)
         run: cargo nextest run -p systemscope-acceptance --locked --profile ci --no-fail-fast --test m2_golden
       - name: M2 golden verify
