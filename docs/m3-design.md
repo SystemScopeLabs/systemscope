@@ -1,6 +1,6 @@
 # M3 Design: Modeled OS Backend
 
-> Status: Design frozen (M3.0) · Parent: [plan.md](../plan.md) · Builds on: [m2-design.md](m2-design.md), [m1-design.md](m1-design.md), [m0-design.md](m0-design.md)
+> Status: Design frozen (M3.0), with M3.2 clarifications to §5.1, §5.3, §5.5, §15.1, §15.3, and §17 from [m3-2-spike-appendix.md](m3-2-spike-appendix.md) · Parent: [plan.md](../plan.md) · Builds on: [m2-design.md](m2-design.md), [m1-design.md](m1-design.md), [m0-design.md](m0-design.md)
 
 This document is the architecture contract for M3. It fixes the decisions the M3 implementation steps (§17) depend on. §19.1 records the design choices accepted at the freeze and the alternatives considered. Nothing in it is implemented yet: M3.0 changes documentation only. The M2 reference platform is frozen, and nothing here changes it.
 
@@ -150,7 +150,21 @@ M3 is built only from what M2 already implemented and verified (`docs/releases/m
 
 ### 5.1 Privilege Modes and CSRs
 
-The hart has a current privilege mode `priv ∈ {M, S, U}`, reset to M. It is architectural state (snapshot, inspect), but no CSR exposes it.
+The hart has a current privilege mode `priv ∈ {M, S, U}`, reset to M. It is architectural state (snapshot, inspect), but no CSR exposes it. These three are the only modes the `M3` profile supports. Encoding 2 is reserved: no instruction, trap entry, or return produces it, and restore rejects it (§5.5).
+
+**Canonical privilege fields.** Every privilege-valued field of the CPU state holds only a supported mode:
+
+- `priv` and `MPP` hold one of {U, S, M};
+- `SPP` holds one of {U, S}.
+
+An implementation stores them as types with exactly those values, so a reserved encoding cannot be represented. Each field can come from four places, and none of them produces a reserved encoding:
+
+- **Reset:** gives supported values only.
+- **A CSR write:** is legalized (`MPP = 0b10` becomes U).
+- **Trap entry and return:** copy only values that are already supported.
+- **Restore:** rejects a reserved encoding before any state is built (§5.5).
+
+**Reset (M3 profile only).** `priv` = M. `mstatus` = `0x0000_0000`, so `MPP` = U and every other field is 0. Every CSR added in this section is 0. The M2 CSRs reset as in M2, apart from `mstatus`. This matches the pinned Spike (m3-2-spike-appendix B.1). The `M2` profile keeps its own reset `mstatus` of `0x0000_1800` with `MPP` hardwired to `0b11` (m2-design §4.3). This rule applies to the `M3` profile and schema 3 only.
 
 **CSR access rule.** Bits [9:8] of a CSR number give the lowest privilege that may access it, and bits [11:10] = `0b11` mark it read-only. Accessing a CSR from a lower mode raises `IllegalInstruction`, and so does writing a read-only one; in both cases `tval` is the instruction. In U-mode every CSR is therefore illegal.
 
@@ -158,7 +172,7 @@ The hart has a current privilege mode `priv ∈ {M, S, U}`, reset to M. It is ar
 
 | CSR | Rule in the `M3` profile |
 |---|---|
-| `mstatus` | Writable: `SIE`(1), `MIE`(3), `SPIE`(5), `MPIE`(7), `SPP`(8), `MPP`(12:11), `SUM`(18), `MXR`(19). `MPP` is WARL over {U=0, S=1, M=3}. The value written for the reserved encoding `0b10` is measured against Spike at M3.2 (§15.3). `MPRV`, `TVM`, `TW`, `TSR`, the endianness bits, and `FS`/`VS`/`XS`/`SD` read 0 |
+| `mstatus` | Writable: `SIE`(1), `MIE`(3), `SPIE`(5), `MPIE`(7), `SPP`(8), `MPP`(12:11), `SUM`(18), `MXR`(19). `MPP` is WARL over {U=0, S=1, M=3}. A write of the reserved encoding `0b10` stores U (`0b00`), as the pinned Spike does (m3-2-spike-appendix B.4 P1); the other written fields are stored as usual. `MPP` therefore never holds `0b10`. `MPRV`, `TVM`, `TW`, `TSR`, the endianness bits, and `FS`/`VS`/`XS`/`SD` read 0 |
 | `sstatus` | The S view of `mstatus`: `SIE`, `SPIE`, `SPP`, `SUM`, `MXR`; everything else reads 0, and writes to it are ignored |
 | `medeleg` | WARL; writable mask `0xB1FF`, which covers causes 0–8, 12, 13, and 15. Bit 9 (`ecall` from S) and bit 11 (`ecall` from M) read 0, so an S-mode `ecall` always goes to M (§7.4) |
 | `mideleg` | Read-only 0: no interrupt is delegated |
@@ -167,16 +181,31 @@ The hart has a current privilege mode `priv ∈ {M, S, U}`, reset to M. It is ar
 | `sscratch` | Any value |
 | `sepc` | Bits [1:0] read 0 (IALIGN = 32), like `mepc` |
 | `scause`, `stval` | As `mcause` and `mtval` (m2-design §4.6) |
-| `satp` | `MODE` (bit 31: 0 Bare, 1 Sv32), `ASID` (30:22) reads 0, `PPN` (21:0). A write takes effect from the next instruction, because CSR writes land in `Commit` (m2-design §6.3) |
+| `satp` | `MODE` (bit 31: 0 Bare, 1 Sv32), `ASID` (30:22) reads 0, `PPN` (21:0). WARL, see the `satp` rule below. A write takes effect from the next instruction, because CSR writes land in `Commit` (m2-design §6.3) |
 
 `misa`, `mhartid`, the counters, `mcounteren`, `scounteren`, and `menvcfg` remain unsupported (§19.2).
+
+**`satp` rule.** `MODE` is one bit on RV32, and each of its two values is either a supported mode or an unsupported one:
+
+| Step | Supported | Unsupported |
+|---|---|---|
+| M3.2 | Bare (0) | Sv32 (1) |
+| M3.3 onward | Bare (0), Sv32 (1) | none |
+
+- **A write with a supported `MODE`** stores `MODE` and `PPN` as written and stores `ASID` as 0. With Bare, `PPN` is stored and read back, but it is not used.
+- **A write with an unsupported `MODE`** leaves every field of `satp` at its previous value. This is the privileged specification's rule for an unsupported mode. The CSR instruction still retires normally: `rd` receives the old value, and `pc` advances.
+- **Determinism:** the new value depends only on the old `satp` and the written value, never on other state or timing. The snapshot stores the 32-bit value, and restore rejects a value that no write could produce (§5.5).
+
+**`WFI`** is illegal in every mode in the `M3` profile, as in M2 (m2-design §5.7), and raises `IllegalInstruction` with `tval` = the instruction. The pinned Spike retires `WFI` in M, and in S with `TW` = 0, then waits for an interrupt. The Spike differential therefore compares `WFI` only in U, where both raise `IllegalInstruction`; m3-2-spike-appendix B.6 records the exclusion (D9). A SystemScope-only unit test covers M and S.
 
 **Changed M2 rules (M3 profile only):**
 
 - **`MRET`**: `priv ← MPP`, `MIE ← MPIE`, `MPIE ← 1`, `MPP ← U`. In the M2 profile `MPP` stays hardwired to `0b11`.
 - **`SRET`**, new: legal in S and M, illegal in U. It sets `priv ← SPP`, `SIE ← SPIE`, `SPIE ← 1`, `SPP ← U`, and `pc ← sepc`, and it retires.
-- **`SFENCE.VMA`**, new: legal in S and M, illegal in U, and it retires as a no-op (§5.4). `MRET` from S or U is illegal. `WFI` stays illegal in every mode (m2-design §5.7).
+- **`SFENCE.VMA`**, new: legal in S and M, illegal in U, and it retires as a no-op (§5.4). `MRET` from S or U is illegal. `WFI` stays illegal in every mode (see the `WFI` rule above).
 - **MEI** (m2-design §5): it is still sampled only after a retirement. It is eligible when `MEIP & MEIE & (priv < M || MIE)`. On entry `MPP ← priv` and `priv ← M`; every other entry rule is unchanged. The reference workload never sets `MEIE` (§8.2), but the rule is specified and tested (§15.1).
+
+  **Ownership:** this rule belongs to the `M3` profile only. The `M2` profile keeps m2-design §5 exactly: MEI is eligible when `MEIP & MEIE & MIE`, and `MPP` stays `0b11`. The M2 `take_mei` oracle and its tests are unchanged. The M3 rule is a separate oracle that also takes `priv`, and only the `M3` profile uses it. `mideleg` is 0, so MEI is always taken in M, from any mode.
 
 ### 5.2 Sv32 Translation
 
@@ -210,6 +239,16 @@ A pure function `sv32_translate(satp, priv, sum, mxr, access, va, read_pte) -> R
 | 12 | `InstructionPageFault` (`tval` = VA) | yes |
 | 13 | `LoadPageFault` (`tval` = VA) | yes |
 | 15 | `StorePageFault` (`tval` = VA) | yes |
+
+These are the architectural `mcause`/`scause` values. The snapshot uses its own numbering for causes (§5.5), which is not the same as these values.
+
+**Which step raises which cause:**
+
+- **Defined from M3.2:** every cause in this table. That means its name, its `medeleg` bit inside `0xB1FF`, and its schema 3 code.
+- **Raised from M3.2:** causes 0–9 and 11. These are M1's causes, plus the `ecall` causes that now depend on the mode.
+- **Raised from M3.3:** causes 12, 13, and 15, which come only from the Sv32 walk.
+
+In M3.2, no instruction raises a page fault. Restore rejects their snapshot codes until M3.3 (§5.5).
 
 **Order within one access**, keeping M1's order. This design's reading is that the privileged specification lets address-misaligned exceptions take either priority relative to page and access faults. M3.3 confirms that reading against the specification text and the pinned Spike before implementing it, and records the result in the Spike appendix (§15.3):
 
@@ -247,17 +286,69 @@ A misaligned access never walks.
 
 ### 5.5 Snapshot (Schema 3)
 
-Schema 3 is schema 2 (m2-design §6.4) followed by:
+Schema 3 is written and restored only by the `M3` profile. It is schema 2 (m2-design §6.4), then the M3 block below. Schema 3 appears in no file and no digest that exists today, so schemas 1 and 2 stay byte-for-byte unchanged, as §4.2 and §14 require.
 
-- `priv` (`u8`: 0 U, 1 S, 3 M);
-- the new CSRs in the whitelist order of §5.1;
-- for `WalkIssue` and `WalkWait`: `purpose`, the raw instruction for `Data`, `level`, `table`, and `txn` for `WalkWait`;
-- for `FetchIssue`, `FetchWait`, `MemIssue`, and `MemWait`: the `pa` option (§5.4).
+**M3 block**, after schema 2's `irq` input level:
 
-Restore also rejects:
+| # | Field | Encoding | Restore check |
+|---|---|---|---|
+| 1 | `priv` | `u8`: 0 U, 1 S, 3 M | 0, 1, or 3 |
+| 2 | `mstatus.SIE` | `u8` 0/1 | 0 or 1 |
+| 3 | `mstatus.SPIE` | `u8` 0/1 | 0 or 1 |
+| 4 | `mstatus.SPP` | `u8`: 0 U, 1 S | 0 or 1 |
+| 5 | `mstatus.MPP` | `u8`: 0 U, 1 S, 3 M | 0, 1, or 3; never `0b10` (§5.1) |
+| 6 | `mstatus.SUM` | `u8` 0/1 | 0 or 1 |
+| 7 | `mstatus.MXR` | `u8` 0/1 | 0 or 1 |
+| 8 | `medeleg` | `u32` | no bit outside `0xB1FF` |
+| 9 | `stvec` | `u32` | bits [1:0] = 0 |
+| 10 | `sscratch` | `u32` | — |
+| 11 | `sepc` | `u32` | bits [1:0] = 0 |
+| 12 | `scause` | `u32` | — |
+| 13 | `stval` | `u32` | — |
+| 14 | `satp` | `u32` | `ASID` = 0; `MODE` supported at this step (§5.1) |
 
-- a `priv` of 2;
-- CSR values their write rules cannot produce (for example `MPP = 0b10`, a set bit outside the `medeleg` mask, or a non-zero `ASID`);
+- **Fields 2–7** are the architectural `mstatus` fields that schema 2 does not hold. `MIE` and `MPIE` are schema 2's first two fields and are not repeated. Every other `mstatus` bit reads 0 in the `M3` profile (§5.1), so it is not stored.
+- **Not stored:** `sstatus` is a view of `mstatus` fields 2–7 and is derived from them. `mideleg`, `sie`, and `sip` are constant 0 in the `M3` profile. Restore derives or re-creates all four and never reads a value for them, so the snapshot has one copy of each fact.
+
+**Cause codes and outcome tags.** Both extend only in schema 3. Schemas 1 and 2 keep their value sets and still reject everything added here.
+
+- **Trap cause codes** 0–8 keep m1-design §6's order in every schema. Code 4 is `EnvironmentCall`, which M3 traces name `EnvironmentCallFromM` (§5.3). Schema 3 appends:
+  - 9 `EnvironmentCallFromU`;
+  - 10 `EnvironmentCallFromS`;
+  - 11 `InstructionPageFault`;
+  - 12 `LoadPageFault`;
+  - 13 `StorePageFault`.
+
+  Codes 11–13 are rejected on restore until M3.3, because no walk exists before it.
+- **`CommitPending` outcome tags:**
+  - 0 (retirement) and 1 (trap) exist in every schema;
+  - 2 (CSR operation) and 3 (`MRET`) exist in schemas 2 and 3;
+  - schema 3 appends 4 (`SRET`), with no payload. Like `MRET`, it reads `sepc`, `SPP`, and `SPIE` at `Commit`.
+
+  A pending `SFENCE.VMA` is tag 0: a retirement with no register write. A delegated exception adds no tag. It is a pending trap (tag 1), and `Commit` decides from `priv` and `medeleg` whether it is delivered or halts.
+
+**M3.3 additions.** Schema 3 gains the walk encodings at M3.3:
+
+- `WalkIssue` and `WalkWait` state records: `purpose`, the raw instruction for `Data`, `level`, `table`, and `txn` for `WalkWait`;
+- the `pa` option in `FetchIssue`, `FetchWait`, `MemIssue`, and `MemWait` (§5.4).
+
+Schema 3's byte layout is final when M3.3 merges. Before that, no schema 3 snapshot is committed or published: the first is `m3-reference.mid.snap` at M3.7. The M3.3 additions therefore invalidate no stored file.
+
+**Restore order (schema 3).** Restore runs in three steps, strictly in order:
+
+1. **Decode all fields.** Read the whole snapshot to its end: configuration, `pc`, registers, counters, the state record, the schema 2 CSR block, and the M3 block. Only encoding is checked here: known tags, `u8` flags of 0 or 1, and the lengths of fields.
+2. **Validate invariants.** Check every invariant on the decoded values together:
+   - the schema 1 and 2 checks (configuration, `pc` alignment, `TxnId`, `instret` against the limit, `mtvec`/`mepc` alignment, the trap `pc`);
+   - the M3 block checks in the table above;
+   - a cause code allowed at this step;
+   - the pending outcome, recomputed from the instruction word, the registers, `priv`, and the CSRs, must match the stored one. This covers the CSR access rule, the `ecall` cause, and whether `MRET`/`SRET` is legal;
+   - from M3.3, the walk and `pa` checks below.
+3. **Construct state.** Build the CPU state from the validated values, and replace the current state in one step. A restore that fails at any step changes nothing.
+
+Partial decode followed by validation is forbidden. The state record comes before `priv` and the CSRs in the byte stream, but its checks depend on them, so no invariant may be checked while a field it could depend on is still unread. Schemas 1 and 2 keep their current restore unchanged (m1-design §5.6, m2-design §6.4): the inputs they accept and reject stay the same.
+
+**Walk checks (M3.3).** Restore also rejects:
+
 - a walk state that the recorded `satp`, `priv`, registers, and instruction cannot reach: a walk while translation is off, a `level` above 1, or a `table` that is not `satp.PPN` at level 1;
 - a `pa` of `Some` while translation is off, a `pa` of `None` while it is on, and a `pa` whose low 12 bits differ from the virtual address's. Restore cannot check the rest of `pa` without reading RAM, and it never reads RAM.
 
@@ -715,7 +806,7 @@ A run passes only if:
 |---|---|---|---|
 | Executable table, user ELF rules | this document's §8.1 and §8.3 tables | each rule and boundary, a test-only ELF writer (m1-design §8), property tests, arbitrary bytes | M3.1 |
 | Privilege, CSRs, `MRET`/`SRET`, delegation | pinned Spike, directed (§15.3), plus this document for divergences | every mode transition, the CSR access rule, WARL masks, delegated vs halting traps | M3.2 |
-| MEI with modes | the M2 pure oracle `take_mei`, extended with `priv` | property tests; entry from U and S | M3.2 |
+| MEI with modes | a pure M3 oracle: M2's `take_mei` plus `priv` (the M2 oracle and its tests unchanged, §5.1) | property tests; entry from U and S | M3.2 |
 | Sv32 | pinned Spike, directed; the pure `sv32_translate` | leaf and megapage, every permission and fault case, `SUM`/`MXR`, A/D, PTE access fault, PA beyond the bus; property tests with random page tables, CPU vs oracle | M3.3 |
 | M3 CPU on RV32I | M1 oracles | 40 `rv32ui` and 39 ACT4 on the M3 profile (M-mode, bare) | M3.2 |
 | Gate and held entry | a scripted gate operation with a known effect on the trap frame and UART | ecall round trips from U, register preservation, every-event resume including held `ENTER`, kernel access to `kgate` refused before sending, three-master bus contention | M3.4a |
@@ -739,10 +830,10 @@ The expected `os.*` sequence of §12.3 is a committed file keyed by the disk ima
 
 ### 15.3 Spike-Directed Tests (M3.2, M3.3)
 
-- Directed programs run on the pinned Spike (`19609434`) with supervisor and user modes enabled. The exact `--isa`/`--priv` arguments are measured at M3.2 and recorded in an appendix, like M2.0's Appendix A.
+- Directed programs run on the pinned Spike (`19609434`) with supervisor and user modes enabled. The exact arguments were measured at M3.2 and are recorded in [m3-2-spike-appendix.md](m3-2-spike-appendix.md) (B.0), like M2.0's Appendix A. They include the device tree: `--disable-dtb` is not used.
 - The comparison is per retirement and per delivered exception (`pc`, register writes, whitelisted CSR writes, `priv`) up to the first halting trap. It reuses the M1-A3 judges.
 - These runs continue through handlers, so they must not rely on `--instructions` (m2-design §15.2).
-- WARL choices where Spike and §5.1 differ, such as `MPP = 0b10` and Spike's own A/D behavior, are measured first. They are either matched or documented as divergences with SystemScope-only unit tests.
+- WARL choices were measured first (m3-2-spike-appendix B.2–B.5). §5.1 matches Spike where the appendix says it agrees, for example `MPP = 0b10` stored as U and Svade A/D. Every difference is listed in appendix B.6 (D1–D11), is kept out of the differential, and is covered by SystemScope-only unit tests.
 
 ### 15.4 ACT4
 
@@ -790,8 +881,8 @@ Every M3 step must keep all of these passing, unchanged:
 |---|---|---|---|
 | **M3.0** | This design | docs only | Design reviewed; §19.1 decisions accepted; status set to "Design frozen" |
 | **M3.1** | ELF user-image loader and executable table: `parse_user_elf32`, table validation, pure mapping plan (segments → pages + perms) | `elf` | §8.1 and §8.3 rules each tested at their boundaries; property and arbitrary-byte tests; M1 loader tests unchanged; no runtime change |
-| **M3.2** | Privilege and trap boundary: `M3` profile, `priv`, the §5.1 CSRs and access rule, `MRET`/`SRET`, `medeleg` delivery, M3 cause names, MEI with modes, schema 3 (no walk yet; `satp` accepts only `MODE = Bare` until M3.3) | CPU | Spike-directed privilege tests pass; `take_mei` extended; 40 `rv32ui` + 39 ACT4 on M3; every-event snapshot of a mode-switching program; M1/M2 profiles and goldens unchanged |
-| **M3.3** | Sv32 MMU: `sv32.rs`, `satp` Sv32, walk states, permissions, A/D, page faults, `SFENCE.VMA`, walk snapshot | CPU | Spike-directed Sv32 tests; oracle property tests; resume from every event including mid-walk; regressions unchanged |
+| **M3.2** | Privilege and trap boundary: `M3` profile, `priv`, the §5.1 CSRs and access rule, `MRET`/`SRET`, `medeleg` delivery, M3 cause names (page faults defined but not raised, §5.3), `SFENCE.VMA` as a privilege-checked no-op, MEI with modes, schema 3 (no walk yet; Bare is the only supported `satp` mode until M3.3, §5.1). Excluded: Sv32 translation, page walks, A/D handling (all M3.3), and any TLB (none in M3, §5.4) | CPU | Spike-directed privilege tests pass; the M3 MEI oracle, with M2's `take_mei` unchanged; 40 `rv32ui` + 39 ACT4 on M3; every-event snapshot of a mode-switching program; M1/M2 profiles and goldens unchanged |
+| **M3.3** | Sv32 MMU: `sv32.rs`, `satp` Sv32, walk states, permissions, A/D, page faults, `SFENCE.VMA` checked with translation on (still a no-op, §5.4), walk snapshot | CPU | Spike-directed Sv32 tests; oracle property tests; resume from every event including mid-walk; regressions unchanged |
 | **M3.4a** | Kernel gate prototype: `systemscope-os` skeleton, `gate` and `mem` ports, held `ENTER`, the `Issue`/`Wait` state engine with a scripted operation (read the trap frame, write it back with `sepc + 4`, write one UART byte), schema 1 for that state, the access whitelist; the firmware stub and trampoline fixture; a three-master bus configuration | os + tests | On a minimal platform, a bare-metal U-mode loop of `ecall`s round-trips through the trampoline and the scripted gate with registers preserved; resume from every event, including every held-`ENTER` state; a kernel access to `kgate` faults the session before sending; no `rv32.exception` from S; regressions unchanged |
 | **M3.4b** | Process model: frame allocator, page-table builder, boot from the executable table through the block controller, user ELF mapping (M3.1), dispatch, sequential processes on `exit`, shutdown reasons | os + tests | A minimal platform boots two processes from a disk that `exit` in order; kernel oracle tests; frame accounting (all free after shutdown); every-event snapshot through boot, including DMA in flight |
 | **M3.5** | Syscall and output: the full §6.5 ABI, user-copy walk, `write` to UART, `sched_yield` context switch, errors, fault kill (§6.7) | os | Every syscall and error path by the kernel oracle and in the runtime; kernel walk vs `sv32_translate`; UART output exact |
