@@ -64,8 +64,31 @@
 //! retiring or sampling the interrupt; it traces `rv32.exception`. Any other exception
 //! halts exactly as in M2 and writes no CSR. The interrupt is eligible below M whatever
 //! `MIE` says, and its entry saves the mode in `MPP`. Snapshot schema 3 is schema 2 plus
-//! the mode and the new CSRs (§5.5); `satp` supports only Bare until M3.3, and no page
-//! fault is raised.
+//! the mode and the new CSRs (§5.5).
+//!
+//! # Sv32 (`M3`)
+//!
+//! In S and U with `satp.MODE` = Sv32, every fetch, load, and store is translated
+//! (`docs/m3-design.md` §5.2, §5.4), with no TLB. The walk reads each PTE as an ordinary
+//! `mem.v1` read over the `mem` port, one per cycle like any access, and feeds it to
+//! [`sv32::step`]:
+//!
+//! ```text
+//! Commit ──translated──▶ WalkIssue { Fetch, 1, satp.PPN }        (Wake(WALK) @ REQUEST)
+//! FetchWait ──aligned load or store, translated──▶ WalkIssue { Data, 1, satp.PPN }
+//! WalkIssue ──Wake(WALK)──▶ send ReadReq { PTE address, 4 } ──▶ WalkWait { txn }
+//! WalkWait ──ReadResp @ COMPLETE──▶ sv32::step
+//!    ├─ pointer ──▶ WalkIssue { level 0, table }                  (next cycle)
+//!    ├─ leaf ─────▶ FetchIssue { pa } or MemIssue { pa }          (next cycle)
+//!    └─ page fault, or the PTE read faults ──▶ CommitPending (trap, same tick)
+//! ```
+//!
+//! The translated address is state: `FetchIssue`, `FetchWait`, `MemIssue`, `MemWait`,
+//! and `CommitPending` hold `pa` (`None` when untranslated), so nothing is ever read
+//! twice and a restored CPU never sends a request again. A page fault raises the page
+//! fault of the access, and a PTE read the bus refuses raises the access's access fault;
+//! both have `tval` = the virtual address, and both are delivered like any exception.
+//! Alignment is checked before any walk.
 //!
 //! # Machine external interrupt (`M2`)
 //!
@@ -110,6 +133,7 @@ use crate::memory::{
 };
 use crate::privilege::{self, M3State, Privilege, Spp, SupervisorInstr, decode_supervisor};
 use crate::regfile::RegisterFile;
+use crate::sv32::{self, Access};
 
 /// The `mem` port: a `mem.v1` initiator, for fetches and data alike. It is the CPU's only
 /// port in the `M1` profile.
@@ -126,6 +150,9 @@ pub const MEMORY: u64 = 1;
 
 /// Wake token that commits the pending instruction.
 pub const COMMIT: u64 = 2;
+
+/// Wake token that sends the next PTE read of a walk (`M3`, `docs/m3-design.md` §5.4).
+pub const WALK: u64 = 3;
 
 /// Layout of [`Rv32iCpu`]'s snapshot in the `M1` profile.
 pub const SNAPSHOT_SCHEMA: u32 = 1;
@@ -161,8 +188,8 @@ pub enum Rv32iProfile {
     /// port and the machine external interrupt, snapshot schema 2.
     M2,
     /// The `M2` CPU plus M, S, and U modes, the supervisor CSRs, `SRET`, `SFENCE.VMA`,
-    /// delegated exceptions, and the interrupt with modes (`docs/m3-design.md` §5),
-    /// snapshot schema 3.
+    /// delegated exceptions, the interrupt with modes, and Sv32 translation
+    /// (`docs/m3-design.md` §5), snapshot schema 3.
     M3,
 }
 
@@ -223,33 +250,96 @@ pub enum Halt {
 /// Where the CPU is in its current instruction. Every state but `Halted` waits for exactly
 /// one runtime-owned event.
 #[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `pa` is the physical address a completed Sv32 walk produced (`M3`), or `None` when the
+/// access is not translated and goes to its own address (`docs/m3-design.md` §5.4). In
+/// `CommitPending` it is kept only for a translated load or store that retires, whose
+/// `rv32.commit` record shows it as `paddr`.
 enum State {
     /// Waiting for `Wake(FETCH)`.
-    FetchIssue,
+    FetchIssue { pa: Option<u64> },
     /// The fetch `txn` is outstanding.
-    FetchWait { txn: TxnId },
+    FetchWait { txn: TxnId, pa: Option<u64> },
     /// Waiting for `Wake(MEMORY)` to send `plan`, for the instruction `insn`.
-    MemIssue { insn: u32, plan: MemoryPlan },
+    MemIssue {
+        insn: u32,
+        plan: MemoryPlan,
+        pa: Option<u64>,
+    },
     /// The data request `txn` for `plan` is outstanding.
     MemWait {
         txn: TxnId,
         insn: u32,
         plan: MemoryPlan,
+        pa: Option<u64>,
     },
+    /// Waiting for `Wake(WALK)` to read the next PTE of `walk` (`M3`).
+    WalkIssue { walk: Walk },
+    /// The PTE read `txn` of `walk` is outstanding (`M3`).
+    WalkWait { txn: TxnId, walk: Walk },
     /// Waiting for `Wake(COMMIT)` to apply `outcome`. `insn` is `None` only after a
     /// faulting fetch, which has no instruction.
-    CommitPending { insn: Option<u32>, outcome: Outcome },
+    CommitPending {
+        insn: Option<u32>,
+        outcome: Outcome,
+        pa: Option<u64>,
+    },
     /// Stopped; nothing is pending.
     Halted(Halt),
+}
+
+/// An Sv32 walk in progress: the next PTE to read is at `level` in the table with PPN
+/// `table` (`docs/m3-design.md` §5.4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Walk {
+    purpose: Purpose,
+    level: u8,
+    table: u32,
+}
+
+/// What a walk translates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Purpose {
+    /// The fetch at `pc`.
+    Fetch,
+    /// The load or store `plan` of the instruction `insn`. The snapshot stores `insn`
+    /// only, and restore recomputes `plan`.
+    Data { insn: u32, plan: MemoryPlan },
+}
+
+impl Purpose {
+    fn access(&self) -> Access {
+        match self {
+            Purpose::Fetch => Access::Fetch,
+            Purpose::Data {
+                plan: MemoryPlan::Load(_),
+                ..
+            } => Access::Load,
+            Purpose::Data {
+                plan: MemoryPlan::Store(_),
+                ..
+            } => Access::Store,
+        }
+    }
+}
+
+/// The virtual address of `plan`.
+fn plan_addr(plan: &MemoryPlan) -> u32 {
+    match plan {
+        MemoryPlan::Load(load) => load.addr,
+        MemoryPlan::Store(store) => store.addr,
+    }
 }
 
 impl State {
     fn name(&self) -> &'static str {
         match self {
-            State::FetchIssue => "fetch_issue",
+            State::FetchIssue { .. } => "fetch_issue",
             State::FetchWait { .. } => "fetch_wait",
             State::MemIssue { .. } => "mem_issue",
             State::MemWait { .. } => "mem_wait",
+            State::WalkIssue { .. } => "walk_issue",
+            State::WalkWait { .. } => "walk_wait",
             State::CommitPending { .. } => "commit_pending",
             State::Halted(_) => "halted",
         }
@@ -515,7 +605,7 @@ impl Rv32iCpu {
             regs: RegisterFile::new(),
             instret: 0,
             next_txn: 0,
-            state: State::FetchIssue,
+            state: State::FetchIssue { pa: None },
             csrs: CsrFile::new(),
             m3: M3State::new(),
         })
@@ -539,6 +629,37 @@ impl Rv32iCpu {
             Rv32iProfile::M1 => Isa::M1,
             Rv32iProfile::M2 => Isa::M2,
             Rv32iProfile::M3 => Isa::M3(self.m3.privilege),
+        }
+    }
+
+    /// Whether fetches, loads, and stores are translated now (`M3` only, §5.2).
+    fn translating(&self) -> bool {
+        self.config.profile == Rv32iProfile::M3 && self.m3.translates()
+    }
+
+    /// The virtual address `walk` translates.
+    fn walk_va(&self, walk: &Walk) -> u32 {
+        match &walk.purpose {
+            Purpose::Fetch => self.pc,
+            Purpose::Data { plan, .. } => plan_addr(plan),
+        }
+    }
+
+    /// Goes on to the next fetch, at the next cycle's `Request`: straight to the bus, or,
+    /// when translated, through a walk from `satp`'s root.
+    fn fetch_next(&mut self, ctx: &mut dyn SimContext) -> Result<(), SimError> {
+        if self.translating() {
+            self.state = State::WalkIssue {
+                walk: Walk {
+                    purpose: Purpose::Fetch,
+                    level: 1,
+                    table: self.m3.root(),
+                },
+            };
+            self.wake_next_cycle(ctx, WALK)
+        } else {
+            self.state = State::FetchIssue { pa: None };
+            self.wake_next_cycle(ctx, FETCH)
         }
     }
 
@@ -627,32 +748,46 @@ impl Rv32iCpu {
 
     fn wake(&mut self, token: u64, ctx: &mut dyn SimContext) -> Result<(), SimError> {
         match (token, &self.state) {
-            (FETCH, State::FetchIssue) => {
-                let addr = u64::from(self.pc);
+            (FETCH, State::FetchIssue { pa }) => {
+                let pa = *pa;
+                let addr = pa.unwrap_or(u64::from(self.pc));
                 let txn = self.send(ctx, |txn| MemMsg::ReadReq { txn, addr, len: 4 })?;
-                self.state = State::FetchWait { txn };
+                self.state = State::FetchWait { txn, pa };
                 Ok(())
             }
-            (MEMORY, State::MemIssue { insn, plan }) => {
-                let (insn, plan) = (*insn, plan.clone());
+            (MEMORY, State::MemIssue { insn, plan, pa }) => {
+                let (insn, plan, pa) = (*insn, plan.clone(), *pa);
+                let addr = pa.unwrap_or(u64::from(plan_addr(&plan)));
                 let txn = self.send(ctx, |txn| match &plan {
                     MemoryPlan::Load(load) => MemMsg::ReadReq {
                         txn,
-                        addr: u64::from(load.addr),
+                        addr,
                         len: load.width.bytes(),
                     },
                     MemoryPlan::Store(store) => MemMsg::WriteReq {
                         txn,
-                        addr: u64::from(store.addr),
+                        addr,
                         data: store.data.clone(),
                     },
                 })?;
-                self.state = State::MemWait { txn, insn, plan };
+                self.state = State::MemWait {
+                    txn,
+                    insn,
+                    plan,
+                    pa,
+                };
                 Ok(())
             }
-            (COMMIT, State::CommitPending { insn, outcome }) => {
-                let (insn, outcome) = (*insn, *outcome);
-                self.commit(insn, outcome, ctx)
+            (WALK, State::WalkIssue { walk }) => {
+                let walk = walk.clone();
+                let addr = sv32::pte_address(walk.table, self.walk_va(&walk), walk.level);
+                let txn = self.send(ctx, |txn| MemMsg::ReadReq { txn, addr, len: 4 })?;
+                self.state = State::WalkWait { txn, walk };
+                Ok(())
+            }
+            (COMMIT, State::CommitPending { insn, outcome, pa }) => {
+                let (insn, outcome, pa) = (*insn, *outcome, *pa);
+                self.commit(insn, outcome, pa, ctx)
             }
             _ => Err(SimError::ComponentFault(
                 "rv32 cpu: wake does not match the execution state",
@@ -670,9 +805,12 @@ impl Rv32iCpu {
             }
         };
         let expected = match &self.state {
-            State::FetchWait { txn } | State::MemWait { txn, .. } => *txn,
-            State::FetchIssue
+            State::FetchWait { txn, .. }
+            | State::MemWait { txn, .. }
+            | State::WalkWait { txn, .. } => *txn,
+            State::FetchIssue { .. }
             | State::MemIssue { .. }
+            | State::WalkIssue { .. }
             | State::CommitPending { .. }
             | State::Halted(_) => {
                 return Err(SimError::ComponentFault(
@@ -690,7 +828,11 @@ impl Rv32iCpu {
                 "rv32 cpu: response arrived outside COMPLETE",
             ));
         }
-        let (insn, next) = match &self.state {
+        let (insn, next, pa) = match &self.state {
+            State::WalkWait { walk, .. } => {
+                let walk = walk.clone();
+                return self.walk_response(walk, msg, ctx);
+            }
             State::FetchWait { .. } => match msg {
                 MemMsg::ReadResp {
                     outcome: ReadOutcome::Data { data },
@@ -700,7 +842,11 @@ impl Rv32iCpu {
                         SimError::ComponentFault("rv32 cpu: fetch returned other than 4 bytes")
                     })?;
                     let word = u32::from_le_bytes(bytes);
-                    (Some(word), step(self.isa(), word, self.pc, &self.regs))
+                    (
+                        Some(word),
+                        step(self.isa(), word, self.pc, &self.regs),
+                        None,
+                    )
                 }
                 MemMsg::ReadResp {
                     outcome:
@@ -714,6 +860,7 @@ impl Rv32iCpu {
                         cause: TrapCause::InstructionAccessFault,
                         tval: self.pc,
                     }))),
+                    None,
                 ),
                 _ => {
                     return Err(SimError::ComponentFault(
@@ -721,23 +868,127 @@ impl Rv32iCpu {
                     ));
                 }
             },
-            State::MemWait { insn, plan, .. } => {
+            State::MemWait { insn, plan, pa, .. } => {
                 let outcome = complete_memory(plan, msg).map_err(completion_fault)?;
-                (Some(*insn), Step::Done(Outcome::Exec(outcome)))
+                // Only a retirement keeps the physical address, for its commit record.
+                let pa = match outcome {
+                    ExecOutcome::Effect(_) => *pa,
+                    ExecOutcome::Trap(_) => None,
+                };
+                (Some(*insn), Step::Done(Outcome::Exec(outcome)), pa)
             }
             _ => unreachable!("checked above"),
         };
         match next {
             Step::Done(outcome) => {
-                self.state = State::CommitPending { insn, outcome };
+                self.state = State::CommitPending { insn, outcome, pa };
                 ctx.wake_self(ScheduleWhen::Now, Phase::Commit, COMMIT)
             }
             Step::Memory(plan) => {
                 let insn = insn.expect("only a fetched word can need memory");
-                self.state = State::MemIssue { insn, plan };
-                self.wake_next_cycle(ctx, MEMORY)
+                if self.translating() {
+                    self.state = State::WalkIssue {
+                        walk: Walk {
+                            purpose: Purpose::Data { insn, plan },
+                            level: 1,
+                            table: self.m3.root(),
+                        },
+                    };
+                    self.wake_next_cycle(ctx, WALK)
+                } else {
+                    self.state = State::MemIssue {
+                        insn,
+                        plan,
+                        pa: None,
+                    };
+                    self.wake_next_cycle(ctx, MEMORY)
+                }
             }
         }
+    }
+
+    /// Takes the response to a PTE read of `walk` (§5.4): the next level, the translated
+    /// access, or a trap. A page fault raises the access's page fault, and a PTE read the
+    /// bus refuses raises its access fault (§5.3); either has `tval` = the virtual address
+    /// and goes to `Commit` in this tick, like any trap.
+    fn walk_response(
+        &mut self,
+        walk: Walk,
+        msg: &MemMsg,
+        ctx: &mut dyn SimContext,
+    ) -> Result<(), SimError> {
+        let access = walk.purpose.access();
+        let pte = match msg {
+            MemMsg::ReadResp {
+                outcome: ReadOutcome::Data { data },
+                ..
+            } => {
+                let bytes: [u8; 4] = data.as_slice().try_into().map_err(|_| {
+                    SimError::ComponentFault("rv32 cpu: PTE read returned other than 4 bytes")
+                })?;
+                Some(u32::from_le_bytes(bytes))
+            }
+            MemMsg::ReadResp {
+                outcome:
+                    ReadOutcome::Fault {
+                        fault: MemFault::AccessFault,
+                    },
+                ..
+            } => None,
+            _ => {
+                return Err(SimError::ComponentFault(
+                    "rv32 cpu: write response to a PTE read",
+                ));
+            }
+        };
+        let va = self.walk_va(&walk);
+        let context = sv32::Context {
+            privilege: self.m3.privilege,
+            sum: self.m3.sum,
+            mxr: self.m3.mxr,
+            access,
+        };
+        let fault = match pte.map(|pte| sv32::step(&context, va, walk.level, pte)) {
+            Some(sv32::Step::Next { table }) => {
+                self.state = State::WalkIssue {
+                    walk: Walk {
+                        level: walk.level - 1,
+                        table,
+                        ..walk
+                    },
+                };
+                return self.wake_next_cycle(ctx, WALK);
+            }
+            Some(sv32::Step::Leaf { pa }) => {
+                let pa = Some(pa);
+                return match walk.purpose {
+                    Purpose::Fetch => {
+                        self.state = State::FetchIssue { pa };
+                        self.wake_next_cycle(ctx, FETCH)
+                    }
+                    Purpose::Data { insn, plan } => {
+                        self.state = State::MemIssue { insn, plan, pa };
+                        self.wake_next_cycle(ctx, MEMORY)
+                    }
+                };
+            }
+            Some(sv32::Step::PageFault) => sv32::Fault::Page,
+            None => sv32::Fault::Access,
+        };
+        let insn = match walk.purpose {
+            Purpose::Fetch => None,
+            Purpose::Data { insn, .. } => Some(insn),
+        };
+        let outcome = Outcome::Exec(ExecOutcome::Trap(PendingTrap {
+            cause: fault.cause(access),
+            tval: va,
+        }));
+        self.state = State::CommitPending {
+            insn,
+            outcome,
+            pa: None,
+        };
+        ctx.wake_self(ScheduleWhen::Now, Phase::Commit, COMMIT)
     }
 
     /// Applies the pending outcome: the only place architectural state changes.
@@ -745,6 +996,7 @@ impl Rv32iCpu {
         &mut self,
         insn: Option<u32>,
         outcome: Outcome,
+        pa: Option<u64>,
         ctx: &mut dyn SimContext,
     ) -> Result<(), SimError> {
         if let Outcome::Exec(ExecOutcome::Trap(PendingTrap { cause, tval })) = outcome {
@@ -765,8 +1017,7 @@ impl Rv32iCpu {
                         ],
                     );
                     self.pc = handler;
-                    self.state = State::FetchIssue;
-                    return self.wake_next_cycle(ctx, FETCH);
+                    return self.fetch_next(ctx);
                 }
             }
             ctx.trace(
@@ -792,7 +1043,7 @@ impl Rv32iCpu {
         let fields = match outcome {
             Outcome::Exec(ExecOutcome::Trap(_)) => unreachable!("handled above"),
             Outcome::Exec(ExecOutcome::Effect(effect)) => {
-                let fields = self.commit_fields(insn, effect);
+                let fields = self.commit_fields(insn, effect, pa);
                 if let Some(RegWrite { rd, value }) = effect.reg_write {
                     self.regs.write(rd, value);
                 }
@@ -805,7 +1056,7 @@ impl Rv32iCpu {
                     reg_write: None,
                     next_pc: self.csrs.mepc,
                 };
-                let fields = self.commit_fields(insn, effect);
+                let fields = self.commit_fields(insn, effect, None);
                 self.pc = match self.config.profile {
                     Rv32iProfile::M1 | Rv32iProfile::M2 => self.csrs.mret(),
                     Rv32iProfile::M3 => self.m3.mret(&mut self.csrs),
@@ -817,7 +1068,7 @@ impl Rv32iCpu {
                     reg_write: None,
                     next_pc: self.m3.sepc,
                 };
-                let fields = self.commit_fields(insn, effect);
+                let fields = self.commit_fields(insn, effect, None);
                 self.pc = self.m3.sret();
                 fields
             }
@@ -855,8 +1106,7 @@ impl Rv32iCpu {
                 ],
             );
         }
-        self.state = State::FetchIssue;
-        self.wake_next_cycle(ctx, FETCH)
+        self.fetch_next(ctx)
     }
 
     /// Takes an `irq.v0` level on the `irq` port (`M2`, `M3`): valid only in `Complete`, in any
@@ -892,7 +1142,7 @@ impl Rv32iCpu {
             }),
             next_pc: op.next_pc,
         };
-        let mut fields = self.commit_fields(insn, effect);
+        let mut fields = self.commit_fields(insn, effect, None);
         fields.push(("csr", Value::U64(u64::from(op.csr))));
         if op.write {
             self.write_csr(op.csr, op.op.apply(old, op.operand))
@@ -907,9 +1157,14 @@ impl Rv32iCpu {
 
     /// The `rv32.commit` fields (§5.7), computed before the effect is applied. The `M3`
     /// profile adds `priv`, the mode the instruction ran in, after `next_pc`, and for
-    /// loads and stores `paddr` after `addr` (`docs/m3-design.md` §5.6): without
-    /// translation (M3.2) it is the address itself.
-    fn commit_fields(&self, insn: u32, effect: PendingEffect) -> Vec<(&'static str, Value)> {
+    /// loads and stores `paddr` after `addr` (`docs/m3-design.md` §5.6): `pa`, the address
+    /// the Sv32 walk produced, or without translation the address itself.
+    fn commit_fields(
+        &self,
+        insn: u32,
+        effect: PendingEffect,
+        pa: Option<u64>,
+    ) -> Vec<(&'static str, Value)> {
         // A write to x0 writes nothing, and is reported as no write.
         let (rd, rd_value) = effect
             .reg_write
@@ -933,7 +1188,7 @@ impl Rv32iCpu {
             Step::Memory(MemoryPlan::Load(load)) => {
                 fields.push(("addr", Value::U64(u64::from(load.addr))));
                 if m3 {
-                    fields.push(("paddr", Value::U64(u64::from(load.addr))));
+                    fields.push(("paddr", Value::U64(pa.unwrap_or(u64::from(load.addr)))));
                 }
             }
             Step::Memory(MemoryPlan::Store(store)) => {
@@ -944,7 +1199,7 @@ impl Rv32iCpu {
                     .fold(0u64, |v, &b| (v << 8) | u64::from(b));
                 fields.push(("addr", Value::U64(u64::from(store.addr))));
                 if m3 {
-                    fields.push(("paddr", Value::U64(u64::from(store.addr))));
+                    fields.push(("paddr", Value::U64(pa.unwrap_or(u64::from(store.addr)))));
                 }
                 fields.push(("width", Value::U64(store.data.len() as u64)));
                 fields.push(("value", Value::U64(value)));
@@ -994,15 +1249,17 @@ impl Rv32iCpu {
             )),
         };
         Ok(match r.u8()? {
-            0 => State::FetchIssue,
+            0 => State::FetchIssue { pa: None },
             1 => State::FetchWait {
                 txn: outstanding(r.u64()?)?,
+                pa: None,
             },
             2 => {
                 let insn = r.u32()?;
                 State::MemIssue {
                     insn,
                     plan: memory(insn)?,
+                    pa: None,
                 }
             }
             3 => {
@@ -1012,6 +1269,7 @@ impl Rv32iCpu {
                     txn,
                     insn,
                     plan: memory(insn)?,
+                    pa: None,
                 }
             }
             4 => {
@@ -1021,12 +1279,16 @@ impl Rv32iCpu {
                     t => return Err(tag("rv32 cpu instruction", t)),
                 };
                 let outcome = read_outcome(r, profile)?;
-                if !consistent(isa, insn, outcome, pc, regs) {
+                if !consistent(isa, false, insn, outcome, pc, regs) {
                     return Err(invalid(
                         "rv32 cpu: pending outcome does not match its instruction",
                     ));
                 }
-                State::CommitPending { insn, outcome }
+                State::CommitPending {
+                    insn,
+                    outcome,
+                    pa: None,
+                }
             }
             5 => State::Halted(match r.u8()? {
                 0 => {
@@ -1052,6 +1314,8 @@ impl Rv32iCpu {
     /// field to the end, checking only encodings; validate every invariant on the decoded
     /// values together; then replace the state at once. The state record comes before the
     /// mode and the CSRs it depends on, so nothing about it is checked until all are read.
+    /// A restored walk or access waits for the event it was waiting for and never sends its
+    /// request again.
     fn restore_m3(&mut self, r: &mut SnapshotReader<'_>) -> Result<(), RestoreError> {
         let invalid = RestoreError::InvalidState;
         let flag = |r: &mut SnapshotReader<'_>| {
@@ -1167,25 +1431,117 @@ impl Rv32iCpu {
 
 /// A schema 3 state record, decoded but not yet checked against anything.
 enum StateRecord {
-    FetchIssue,
-    FetchWait { txn: u64 },
-    MemIssue { insn: u32 },
-    MemWait { txn: u64, insn: u32 },
-    CommitPending { insn: Option<u32>, outcome: Outcome },
+    FetchIssue {
+        pa: Option<u64>,
+    },
+    FetchWait {
+        txn: u64,
+        pa: Option<u64>,
+    },
+    MemIssue {
+        insn: u32,
+        pa: Option<u64>,
+    },
+    MemWait {
+        txn: u64,
+        insn: u32,
+        pa: Option<u64>,
+    },
+    WalkIssue {
+        walk: WalkRecord,
+    },
+    WalkWait {
+        txn: u64,
+        walk: WalkRecord,
+    },
+    CommitPending {
+        insn: Option<u32>,
+        outcome: Outcome,
+        pa: Option<u64>,
+    },
     Trap(RvTrap),
     InstructionLimit,
+}
+
+/// A walk as schema 3 stores it: the purpose's raw instruction, not its plan.
+struct WalkRecord {
+    /// `None` for a fetch, the instruction for a load or store.
+    data: Option<u32>,
+    level: u8,
+    table: u32,
+}
+
+/// Schema 3's optional physical address: `u8` 0, or `u8` 1 and the `u64`.
+fn write_pa(w: &mut SnapshotWriter, pa: Option<u64>) {
+    match pa {
+        None => w.u8(0),
+        Some(pa) => {
+            w.u8(1);
+            w.u64(pa);
+        }
+    }
+}
+
+fn read_pa(r: &mut SnapshotReader<'_>) -> Result<Option<u64>, RestoreError> {
+    match r.u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(r.u64()?)),
+        t => Err(RestoreError::Decode(DecodeError::InvalidTag {
+            what: "rv32 cpu physical address",
+            tag: t,
+        })),
+    }
+}
+
+/// Schema 3's walk: the purpose (`u8` 0 fetch, or 1 data and the `u32` instruction), then
+/// `level` (`u8`) and `table` (`u32`).
+fn write_walk(w: &mut SnapshotWriter, walk: &Walk) {
+    match &walk.purpose {
+        Purpose::Fetch => w.u8(0),
+        Purpose::Data { insn, .. } => {
+            w.u8(1);
+            w.u32(*insn);
+        }
+    }
+    w.u8(walk.level);
+    w.u32(walk.table);
+}
+
+fn read_walk(r: &mut SnapshotReader<'_>) -> Result<WalkRecord, RestoreError> {
+    let data = match r.u8()? {
+        0 => None,
+        1 => Some(r.u32()?),
+        t => {
+            return Err(RestoreError::Decode(DecodeError::InvalidTag {
+                what: "rv32 cpu walk purpose",
+                tag: t,
+            }));
+        }
+    };
+    Ok(WalkRecord {
+        data,
+        level: r.u8()?,
+        table: r.u32()?,
+    })
 }
 
 /// Decodes a schema 3 state record, checking only its tags.
 fn decode_state_m3(r: &mut SnapshotReader<'_>) -> Result<StateRecord, RestoreError> {
     let tag = |what, tag| RestoreError::Decode(DecodeError::InvalidTag { what, tag });
     Ok(match r.u8()? {
-        0 => StateRecord::FetchIssue,
-        1 => StateRecord::FetchWait { txn: r.u64()? },
-        2 => StateRecord::MemIssue { insn: r.u32()? },
+        0 => StateRecord::FetchIssue { pa: read_pa(r)? },
+        1 => StateRecord::FetchWait {
+            txn: r.u64()?,
+            pa: read_pa(r)?,
+        },
+        2 => StateRecord::MemIssue {
+            insn: r.u32()?,
+            pa: read_pa(r)?,
+        },
         3 => StateRecord::MemWait {
             txn: r.u64()?,
             insn: r.u32()?,
+            pa: read_pa(r)?,
         },
         4 => {
             let insn = match r.u8()? {
@@ -1196,6 +1552,7 @@ fn decode_state_m3(r: &mut SnapshotReader<'_>) -> Result<StateRecord, RestoreErr
             StateRecord::CommitPending {
                 insn,
                 outcome: read_outcome(r, Rv32iProfile::M3)?,
+                pa: read_pa(r)?,
             }
         }
         5 => match r.u8()? {
@@ -1207,12 +1564,34 @@ fn decode_state_m3(r: &mut SnapshotReader<'_>) -> Result<StateRecord, RestoreErr
             1 => StateRecord::InstructionLimit,
             t => return Err(tag("rv32 cpu halt", t)),
         },
+        6 => StateRecord::WalkIssue {
+            walk: read_walk(r)?,
+        },
+        7 => StateRecord::WalkWait {
+            txn: r.u64()?,
+            walk: read_walk(r)?,
+        },
         t => return Err(tag("rv32 cpu state", t)),
     })
 }
 
+/// Whether `cause` is a page fault, which only an Sv32 walk raises.
+fn page_fault(cause: TrapCause) -> bool {
+    matches!(
+        cause,
+        TrapCause::InstructionPageFault | TrapCause::LoadPageFault | TrapCause::StorePageFault
+    )
+}
+
 /// Checks a decoded schema 3 state record against the decoded mode, CSRs, `pc`, registers,
 /// and next `TxnId`, and builds the state.
+///
+/// Beyond the M3.2 checks, it rejects what translation cannot reach (§5.5): a walk while
+/// translation is off, a `level` above 1, a level-1 `table` other than `satp.PPN`, a
+/// `table` wider than a PPN; a `pa` present while translation is off or absent while it is
+/// on, one wider than 34 bits, or one whose page offset is not the virtual address's; and
+/// a page fault while translation is off. A `pa` in `CommitPending` belongs only to a load
+/// or store that retires.
 fn validate_state_m3(
     record: StateRecord,
     m3: &M3State,
@@ -1222,6 +1601,7 @@ fn validate_state_m3(
 ) -> Result<State, RestoreError> {
     let invalid = RestoreError::InvalidState;
     let isa = Isa::M3(m3.privilege);
+    let translates = m3.translates();
     let outstanding = |txn: u64| {
         if next_txn.checked_sub(1) == Some(txn) {
             Ok(TxnId(txn))
@@ -1237,40 +1617,106 @@ fn validate_state_m3(
             "rv32 cpu: pending memory instruction is not an aligned load or store",
         )),
     };
-    let raised = |cause| {
-        if privilege::raised(cause) {
-            Ok(())
-        } else {
-            Err(invalid("rv32 cpu: trap cause is not raised at this step"))
+    // The translated address of an access to `va`: present exactly when translating.
+    let translated = |pa: Option<u64>, va: u32| match (translates, pa) {
+        (false, None) => Ok(None),
+        (false, Some(_)) => Err(invalid(
+            "rv32 cpu: physical address while translation is off",
+        )),
+        (true, None) => Err(invalid(
+            "rv32 cpu: no physical address while translation is on",
+        )),
+        (true, Some(pa)) if pa >> sv32::PA_BITS != 0 => {
+            Err(invalid("rv32 cpu: physical address wider than 34 bits"))
         }
+        (true, Some(pa)) if pa & 0xFFF != u64::from(va & 0xFFF) => Err(invalid(
+            "rv32 cpu: physical address offset is not the virtual address's",
+        )),
+        (true, Some(pa)) => Ok(Some(pa)),
+    };
+    let walk = |record: WalkRecord| {
+        if !translates {
+            return Err(invalid("rv32 cpu: walk while translation is off"));
+        }
+        if record.level > 1 {
+            return Err(invalid("rv32 cpu: walk level above 1"));
+        }
+        if record.table & !privilege::SATP_PPN != 0 {
+            return Err(invalid("rv32 cpu: walk table wider than a PPN"));
+        }
+        if record.level == 1 && record.table != m3.root() {
+            return Err(invalid("rv32 cpu: level-1 walk table is not satp.PPN"));
+        }
+        let purpose = match record.data {
+            None => Purpose::Fetch,
+            Some(insn) => Purpose::Data {
+                insn,
+                plan: memory(insn)?,
+            },
+        };
+        Ok(Walk {
+            purpose,
+            level: record.level,
+            table: record.table,
+        })
     };
     Ok(match record {
-        StateRecord::FetchIssue => State::FetchIssue,
-        StateRecord::FetchWait { txn } => State::FetchWait {
+        StateRecord::FetchIssue { pa } => State::FetchIssue {
+            pa: translated(pa, pc)?,
+        },
+        StateRecord::FetchWait { txn, pa } => State::FetchWait {
             txn: outstanding(txn)?,
+            pa: translated(pa, pc)?,
         },
-        StateRecord::MemIssue { insn } => State::MemIssue {
-            insn,
-            plan: memory(insn)?,
-        },
-        StateRecord::MemWait { txn, insn } => State::MemWait {
-            txn: outstanding(txn)?,
-            insn,
-            plan: memory(insn)?,
-        },
-        StateRecord::CommitPending { insn, outcome } => {
-            if let Outcome::Exec(ExecOutcome::Trap(t)) = outcome {
-                raised(t.cause)?;
+        StateRecord::MemIssue { insn, pa } => {
+            let plan = memory(insn)?;
+            State::MemIssue {
+                insn,
+                pa: translated(pa, plan_addr(&plan))?,
+                plan,
             }
-            if !consistent(isa, insn, outcome, pc, regs) {
+        }
+        StateRecord::MemWait { txn, insn, pa } => {
+            let plan = memory(insn)?;
+            State::MemWait {
+                txn: outstanding(txn)?,
+                insn,
+                pa: translated(pa, plan_addr(&plan))?,
+                plan,
+            }
+        }
+        StateRecord::WalkIssue { walk: record } => State::WalkIssue {
+            walk: walk(record)?,
+        },
+        StateRecord::WalkWait { txn, walk: record } => State::WalkWait {
+            txn: outstanding(txn)?,
+            walk: walk(record)?,
+        },
+        StateRecord::CommitPending { insn, outcome, pa } => {
+            if !consistent(isa, translates, insn, outcome, pc, regs) {
                 return Err(invalid(
                     "rv32 cpu: pending outcome does not match its instruction",
                 ));
             }
-            State::CommitPending { insn, outcome }
+            let retiring_access = match (insn.map(|w| step(isa, w, pc, regs)), outcome) {
+                (Some(Step::Memory(plan)), Outcome::Exec(ExecOutcome::Effect(_))) => Some(plan),
+                _ => None,
+            };
+            let pa = match retiring_access {
+                Some(plan) => translated(pa, plan_addr(&plan))?,
+                None if pa.is_some() => {
+                    return Err(invalid(
+                        "rv32 cpu: physical address on an outcome that is not an access",
+                    ));
+                }
+                None => None,
+            };
+            State::CommitPending { insn, outcome, pa }
         }
         StateRecord::Trap(trap) => {
-            raised(trap.cause)?;
+            if page_fault(trap.cause) && !translates {
+                return Err(invalid("rv32 cpu: page fault while translation is off"));
+            }
             if trap.pc != pc {
                 return Err(invalid("rv32 cpu: trap pc is not the architectural pc"));
             }
@@ -1301,14 +1747,29 @@ fn validate_state_m3(
 
 /// Whether `outcome` can be the result of `insn` at `pc` with `regs` for `isa`: exactly
 /// the pure result when memory is not involved (including a pending CSR operation,
-/// `MRET`, or `SRET`), and a retirement or the matching access fault when it is.
-fn consistent(isa: Isa, insn: Option<u32>, outcome: Outcome, pc: u32, regs: &RegisterFile) -> bool {
+/// `MRET`, or `SRET`), and a retirement or the matching access fault when it is. With
+/// `translates`, the access may also have raised its page fault; the access fault then
+/// also covers a PTE read the bus refused (`docs/m3-design.md` §5.3).
+fn consistent(
+    isa: Isa,
+    translates: bool,
+    insn: Option<u32>,
+    outcome: Outcome,
+    pc: u32,
+    regs: &RegisterFile,
+) -> bool {
+    let fault = |access: Access, tval: u32, t: PendingTrap| {
+        t == PendingTrap {
+            cause: access.access_fault(),
+            tval,
+        } || (translates
+            && t == PendingTrap {
+                cause: access.page_fault(),
+                tval,
+            })
+    };
     let Some(word) = insn else {
-        return outcome
-            == Outcome::Exec(ExecOutcome::Trap(PendingTrap {
-                cause: TrapCause::InstructionAccessFault,
-                tval: pc,
-            }));
+        return matches!(outcome, Outcome::Exec(ExecOutcome::Trap(t)) if fault(Access::Fetch, pc, t));
     };
     let plan = match step(isa, word, pc, regs) {
         Step::Done(expected) => return expected == outcome,
@@ -1321,24 +1782,14 @@ fn consistent(isa: Isa, insn: Option<u32>, outcome: Outcome, pc: u32, regs: &Reg
         (MemoryPlan::Load(load), ExecOutcome::Effect(e)) => {
             e.next_pc == load.next_pc && e.reg_write.is_some_and(|w| w.rd == load.rd)
         }
-        (MemoryPlan::Load(load), ExecOutcome::Trap(t)) => {
-            t == PendingTrap {
-                cause: TrapCause::LoadAccessFault,
-                tval: load.addr,
-            }
-        }
+        (MemoryPlan::Load(load), ExecOutcome::Trap(t)) => fault(Access::Load, load.addr, t),
         (MemoryPlan::Store(store), ExecOutcome::Effect(e)) => {
             e == PendingEffect {
                 reg_write: None,
                 next_pc: store.next_pc,
             }
         }
-        (MemoryPlan::Store(store), ExecOutcome::Trap(t)) => {
-            t == PendingTrap {
-                cause: TrapCause::StoreAccessFault,
-                tval: store.addr,
-            }
-        }
+        (MemoryPlan::Store(store), ExecOutcome::Trap(t)) => fault(Access::Store, store.addr, t),
     }
 }
 
@@ -1588,8 +2039,9 @@ impl Component for Rv32iCpu {
         }
     }
 
-    /// `pc`, `x1`…`x31`, `instret`, the execution state's name, and, once halted, the
-    /// reason (§5.7). In the `M2` profile, then `mstatus`, `mie`, `mip`, `mtvec`,
+    /// `pc`, `x1`…`x31`, `instret`, the execution state's name, for a walk (`M3`)
+    /// `walk_purpose` (`fetch` or `data`), `walk_level`, and `walk_table`
+    /// (`docs/m3-design.md` §5.6), and, once halted, the reason (§5.7). In the `M2` profile, then `mstatus`, `mie`, `mip`, `mtvec`,
     /// `mscratch`, `mepc`, `mcause`, and `mtval` as read (`docs/m2-design.md` §6.5). In
     /// the `M3` profile, then `priv` (0 U, 1 S, 3 M) and the 19 `M3` CSRs as read, in
     /// [`privilege::SUPPORTED`] order (`docs/m3-design.md` §5.6).
@@ -1600,6 +2052,15 @@ impl Component for Rv32iCpu {
         }
         fields.push(("instret", Value::U64(self.instret)));
         fields.push(("state", Value::Str(self.state.name().to_owned())));
+        if let State::WalkIssue { walk } | State::WalkWait { walk, .. } = &self.state {
+            let purpose = match walk.purpose {
+                Purpose::Fetch => "fetch",
+                Purpose::Data { .. } => "data",
+            };
+            fields.push(("walk_purpose", Value::Str(purpose.to_owned())));
+            fields.push(("walk_level", Value::U64(u64::from(walk.level))));
+            fields.push(("walk_table", Value::U64(u64::from(walk.table))));
+        }
         match self.state {
             State::Halted(Halt::Trap(trap)) => {
                 fields.push(("halt", Value::Str("trap".to_owned())));
@@ -1655,7 +2116,11 @@ impl Component for Rv32iCpu {
     /// Schema 3 (`M3`, `docs/m3-design.md` §5.5): schema 2, then `priv`, `mstatus.SIE`,
     /// `SPIE`, `SPP`, `MPP`, `SUM`, `MXR` (`u8`), `medeleg`, `stvec`, `sscratch`, `sepc`,
     /// `scause`, `stval`, and `satp` (`u32`). Its cause codes and outcome tags extend
-    /// schema 2's.
+    /// schema 2's. Its state records add the Sv32 walk (M3.3, §5.4): `FetchIssue`,
+    /// `FetchWait`, `MemIssue`, `MemWait`, and `CommitPending` end with the optional
+    /// physical address (`u8` 0, or `u8` 1 and a `u64`), and tags 6 (`WalkIssue`) and 7
+    /// (`WalkWait`, with its `TxnId` first) hold the walk: purpose (`u8` 0 fetch, or 1
+    /// data and the `u32` instruction), `level` (`u8`), and `table` (`u32`).
     fn snapshot(&self, w: &mut SnapshotWriter) {
         self.write_config(w);
         w.u32(self.pc);
@@ -1664,22 +2129,50 @@ impl Component for Rv32iCpu {
         }
         w.u64(self.instret);
         w.u64(self.next_txn);
+        // Schemas 1 and 2 never hold a physical address or a walk.
+        let m3 = self.config.profile == Rv32iProfile::M3;
+        let pa = |w: &mut SnapshotWriter, pa: Option<u64>| {
+            if m3 {
+                write_pa(w, pa);
+            }
+        };
         match &self.state {
-            State::FetchIssue => w.u8(0),
-            State::FetchWait { txn } => {
+            State::FetchIssue { pa: p } => {
+                w.u8(0);
+                pa(w, *p);
+            }
+            State::FetchWait { txn, pa: p } => {
                 w.u8(1);
                 w.u64(txn.0);
+                pa(w, *p);
             }
-            State::MemIssue { insn, .. } => {
+            State::MemIssue { insn, pa: p, .. } => {
                 w.u8(2);
                 w.u32(*insn);
+                pa(w, *p);
             }
-            State::MemWait { txn, insn, .. } => {
+            State::MemWait {
+                txn, insn, pa: p, ..
+            } => {
                 w.u8(3);
                 w.u64(txn.0);
                 w.u32(*insn);
+                pa(w, *p);
             }
-            State::CommitPending { insn, outcome } => {
+            State::WalkIssue { walk } => {
+                w.u8(6);
+                write_walk(w, walk);
+            }
+            State::WalkWait { txn, walk } => {
+                w.u8(7);
+                w.u64(txn.0);
+                write_walk(w, walk);
+            }
+            State::CommitPending {
+                insn,
+                outcome,
+                pa: p,
+            } => {
                 w.u8(4);
                 match insn {
                     None => w.u8(0),
@@ -1689,6 +2182,7 @@ impl Component for Rv32iCpu {
                     }
                 }
                 write_outcome(w, *outcome);
+                pa(w, *p);
             }
             State::Halted(halt) => {
                 w.u8(5);

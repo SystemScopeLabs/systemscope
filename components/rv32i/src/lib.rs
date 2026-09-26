@@ -17,6 +17,8 @@
 //! The `M3` profile adds the privilege and trap boundary of `docs/m3-design.md` §5 in
 //! [`privilege`]: M, S, and U modes ([`Privilege`]), the supervisor CSR subset
 //! ([`M3State`]), `SRET`, `SFENCE.VMA`, delegated exceptions, and the interrupt with modes.
+//! Its Sv32 translation (§5.2) is in [`sv32`], and the CPU walks the page tables over the
+//! bus one PTE read at a time (§5.4).
 
 pub mod cpu;
 pub mod csr;
@@ -27,6 +29,7 @@ pub mod instr;
 pub mod memory;
 pub mod privilege;
 pub mod regfile;
+pub mod sv32;
 
 pub use cpu::{CpuConfigError, Halt, Rv32iConfig, Rv32iCpu, Rv32iProfile, RvTrap};
 pub use csr::{CsrFile, CsrOp, CsrSource, PrivInstr, decode_privileged};

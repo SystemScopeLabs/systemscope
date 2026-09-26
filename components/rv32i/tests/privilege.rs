@@ -176,7 +176,6 @@ fn the_cause_codes_are_the_architectural_ones() {
         (TrapCause::StorePageFault, 15),
     ] {
         assert_eq!(cause.code(), code, "{cause:?}");
-        assert_eq!(privilege::raised(cause), !matches!(code, 12 | 13 | 15));
     }
     assert_eq!(TrapCause::EnvironmentCall.m3_name(), "EnvironmentCallFromM");
     assert_eq!(
@@ -227,7 +226,6 @@ proptest! {
     /// Each CSR's write rule (§5.1), read back.
     #[test]
     fn every_csr_write_follows_its_rule((mut s, mut m) in states(), value in any::<u32>()) {
-        let old_satp = s.satp;
         for csr in WHITELIST {
             let (mut s2, mut m2) = (s, m);
             prop_assert_eq!(s2.write(&mut m2, csr, value), Some(()));
@@ -239,7 +237,7 @@ proptest! {
                 0x104 | 0x144 | 0x303 | 0x344 => 0,
                 0x302 => value & 0xB1FF,
                 0x105 | 0x141 | 0x305 | 0x341 => value & !3,
-                0x180 if value >> 31 == 1 => old_satp,
+                // Bare and Sv32 are both supported from M3.3.
                 0x180 => value & !(0x1ff << 22),
                 0x304 => value & 0x800,
                 _ => value,
@@ -262,18 +260,14 @@ proptest! {
         prop_assert_eq!((s, m), before);
     }
 
-    /// `satp`: a Bare write stores MODE and PPN and zeroes ASID; Sv32 keeps the old value;
-    /// and everything a write produces is reachable.
+    /// `satp` from M3.3: Bare and Sv32 are both supported, so any write stores MODE and PPN
+    /// and zeroes ASID, and everything a write produces is reachable.
     #[test]
-    fn satp_is_bare_only(old in any::<u32>(), value in any::<u32>()) {
-        let got = satp_write(old, value);
-        if value >> 31 == 0 {
-            prop_assert_eq!(got, value & 0x803f_ffff);
-            prop_assert!(satp_reachable(got));
-        } else {
-            prop_assert_eq!(got, old);
-        }
-        prop_assert_eq!(satp_reachable(value), value & 0xffc0_0000 == 0);
+    fn satp_stores_bare_and_sv32(value in any::<u32>()) {
+        let got = satp_write(value);
+        prop_assert_eq!(got, value & 0x803f_ffff);
+        prop_assert!(satp_reachable(got));
+        prop_assert_eq!(satp_reachable(value), value & 0x7fc0_0000 == 0);
     }
 
     /// `MRET` (§5.1): priv ← MPP, MIE ← MPIE, MPIE ← 1, MPP ← U; returns mepc.

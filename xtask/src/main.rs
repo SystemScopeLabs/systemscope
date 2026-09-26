@@ -38,8 +38,9 @@
 //!   SystemScope against Spike's, then the generated programs of the fixed seeds, then
 //!   the misaligned-access programs, which must all match; then the directed M2 CSR and
 //!   `MRET` programs with the M2 CPU profile against Spike with Zicsr, which must match
-//!   too. Spike's logs go to `target/spike-logs`, and the generated ELFs to
-//!   `target/spike-logs/progen`.
+//!   too; then the directed M3 privilege and Sv32 programs with the M3 CPU profile, each
+//!   up to its first exception taken in M. Spike's logs go to `target/spike-logs`, and
+//!   the generated ELFs to `target/spike-logs/progen`, `privgen`, and `vmgen`.
 //! - `spike random [<dir>]`: `verify`, then one generated program, for the seed in
 //!   `M1_PROGEN_SEED` (decimal or `0x` hex), against Spike. The nightly workflow runs it.
 //!
@@ -83,7 +84,7 @@ use systemscope_rv32::spike::{
 use systemscope_rv32::{
     BUILD_SCRIPT, FIXTURE_DIR, MANIFEST_PATH, Rv32iProfile, SELECTED, upstream,
 };
-use systemscope_rv32::{csrgen, privgen};
+use systemscope_rv32::{csrgen, privgen, vmgen};
 
 const USAGE: &str = "usage: cargo xtask bless\n       \
                      cargo xtask m1-golden bless | verify | emit <dir> | check <dir>\n       \
@@ -717,6 +718,13 @@ fn spike_diff(dir: &Path) -> ExitCode {
          retires exactly as on Spike {SPIKE_COMMIT} with --isa={SPIKE_ISA_M2} \
          --priv={SPIKE_PRIV_M3}, modes, CSR writes, and delegated exceptions included, up \
          to the same exception taken in M"
+    );
+    let sv32 = spike::run_m3_sv32(&root(), &spike, SPIKE_LOGS);
+    if !print_diff_report("M3 Sv32", "m3-sv32", &sv32, vmgen::programs().len()) {
+        return ExitCode::FAILURE;
+    }
+    println!(
+        "M3 Sv32: every directed Sv32 program (4 KiB pages, megapages, invalid PTEs,          permissions with SUM and MXR, Svade, page and access faults, SFENCE.VMA) retires          exactly as on Spike {SPIKE_COMMIT} with --priv={SPIKE_PRIV_M3}, delegated page          faults included, up to the same exception taken in M"
     );
     ExitCode::SUCCESS
 }

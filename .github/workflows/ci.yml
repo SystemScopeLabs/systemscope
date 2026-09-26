@@ -277,8 +277,8 @@ jobs:
   # programs (docs/m2-design.md §4) with the M2 CPU profile against Spike with
   # --isa=rv32i_zicsr, CSR writes included; then the directed M3 privilege programs
   # (docs/m3-design.md §5, M3.2) with the M3 CPU profile against Spike with
-  # --priv=msu, modes and delegated exceptions included. The only job that builds or
-  # runs Spike.
+  # --priv=msu, modes and delegated exceptions included; then the directed M3 Sv32
+  # programs (M3.3), page faults included. The only job that builds or runs Spike.
   # A cached build is used only after `spike verify` checks it against the pin.
   spike:
     name: M1-A3 Spike differential (Linux)
@@ -317,7 +317,7 @@ jobs:
         run: cargo xtask spike verify ~/spike
       - name: rv32ui fixtures match their manifest
         run: cargo xtask rv32-fixtures verify
-      - name: M1-A3, M2 CSR, and M3 privilege differential (40 rv32ui, 64 generated, 9 misaligned, 20 M2 CSR, 13 M3 privilege)
+      - name: M1-A3, M2 CSR, M3 privilege, and M3 Sv32 differential (40 rv32ui, 64 generated, 9 misaligned, 20 M2 CSR, 13 M3 privilege, 11 M3 Sv32)
         run: cargo xtask spike diff ~/spike
       - name: Keep Spike's logs
         if: failure()

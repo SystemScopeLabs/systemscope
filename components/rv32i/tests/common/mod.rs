@@ -6,11 +6,13 @@
 //!   protocol tests can deliver responses no real memory would produce.
 //! - [`mei`] is the pure machine-external-interrupt oracle (`docs/m2-design.md` §5.8).
 //! - [`mei_m3`] is its independent `M3` counterpart, with modes (`docs/m3-design.md` §5.1).
+//! - [`sv32_ref`] is the independent Sv32 reference translator (`docs/m3-design.md` §5.2).
 
 #![allow(dead_code)]
 
 pub mod mei;
 pub mod mei_m3;
+pub mod sv32_ref;
 
 use systemscope_contracts::component::{
     Component, ComponentId, Delivered, InitContext, PortId, SimContext,

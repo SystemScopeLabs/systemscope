@@ -12,8 +12,8 @@
 //! Privilege-valued fields have types that hold only supported modes ([`Privilege`],
 //! [`Spp`]), so the reserved encoding 2 cannot be represented (§5.1).
 //!
-//! Sv32 is not supported yet: it is an unsupported `satp` mode until M3.3 (§5.1), and no
-//! page fault is raised.
+//! From M3.3 both `satp` modes, Bare and Sv32, are supported (§5.1). [`M3State::translates`]
+//! says whether an access is translated; [`crate::sv32`] has the walk.
 
 use crate::csr::{self, CsrFile, MCAUSE, MEPC, MIE, MIP, MSCRATCH, MSTATUS, MTVAL, MTVEC};
 use crate::execute::TrapCause;
@@ -178,35 +178,17 @@ pub fn accessible(csr: u16, privilege: Privilege, writes: bool) -> bool {
     privilege.bits() >= lowest && !(writes && read_only)
 }
 
-/// Whether `satp`'s `MODE` is supported at this step: only Bare until M3.3 (§5.1).
-pub const fn satp_mode_supported(value: u32) -> bool {
-    value & SATP_MODE == 0
+/// `satp` after a write of `value` (§5.1). From M3.3 both `MODE` values, Bare and Sv32, are
+/// supported, so a write stores `MODE` and `PPN` as written and `ASID` as 0, and the old
+/// value never matters.
+pub const fn satp_write(value: u32) -> u32 {
+    value & !SATP_ASID
 }
 
-/// `satp` after a write of `value` over `old` (§5.1): a supported `MODE` stores `MODE`
-/// and `PPN` as written and `ASID` as 0; an unsupported one leaves `old` unchanged. The
-/// result depends on nothing else.
-pub const fn satp_write(old: u32, value: u32) -> u32 {
-    if satp_mode_supported(value) {
-        value & !SATP_ASID
-    } else {
-        old
-    }
-}
-
-/// Whether some sequence of writes from reset can leave `satp` at `value`: `ASID` 0 and a
-/// supported `MODE`. Restore rejects any other value (§5.5).
+/// Whether some sequence of writes from reset can leave `satp` at `value`: `ASID` 0, with
+/// either `MODE`. Restore rejects any other value (§5.5).
 pub const fn satp_reachable(value: u32) -> bool {
-    value & SATP_ASID == 0 && satp_mode_supported(value)
-}
-
-/// Whether `cause` can be raised at this step: every cause but the page faults, which
-/// only the Sv32 walk raises, from M3.3 (§5.3).
-pub const fn raised(cause: TrapCause) -> bool {
-    !matches!(
-        cause,
-        TrapCause::InstructionPageFault | TrapCause::LoadPageFault | TrapCause::StorePageFault
-    )
+    value & SATP_ASID == 0
 }
 
 /// A privileged instruction the `M3` profile adds to the M2 ones
@@ -351,7 +333,7 @@ impl M3State {
             SEPC => self.sepc = value & !0b11,
             SCAUSE => self.scause = value,
             STVAL => self.stval = value,
-            SATP => self.satp = satp_write(self.satp, value),
+            SATP => self.satp = satp_write(value),
             MIE | MIP | MTVEC | MSCRATCH | MEPC | MCAUSE | MTVAL => m.write(csr, value)?,
             _ => return None,
         }
@@ -389,6 +371,17 @@ impl M3State {
         self.sie = self.spie;
         self.spie = true;
         self.sepc
+    }
+
+    /// Whether fetches, loads, and stores are translated (§5.2): the mode is S or U and
+    /// `satp.MODE` is Sv32. M-mode is always bare.
+    pub const fn translates(&self) -> bool {
+        !matches!(self.privilege, Privilege::Machine) && self.satp & SATP_MODE != 0
+    }
+
+    /// The root page table's PPN, `satp.PPN`.
+    pub const fn root(&self) -> u32 {
+        self.satp & SATP_PPN
     }
 
     /// Whether a synchronous exception with `cause` is delegated to S (§5.3): it happened

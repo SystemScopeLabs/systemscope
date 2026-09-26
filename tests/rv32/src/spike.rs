@@ -36,7 +36,8 @@
 //! compared. A passing program's log ends with the `ECALL` Spike starts before its HTIF
 //! exits ([`pass_end`]); a trap program's is read up to its first trap.
 //!
-//! **M3 programs** ([`run_m3`], `docs/m3-design.md` §15.3) run with the M3 CPU profile,
+//! **M3 programs** ([`run_m3`] and [`run_m3_sv32`], `docs/m3-design.md` §15.3) run with
+//! the M3 CPU profile,
 //! and Spike with `--priv=msu`, the device tree, and a budget that never ends a run
 //! ([`spike_m3_args`], m3-2-spike-appendix B.0). The compared stream is an [`Event`]
 //! list: each retirement with its mode, and each exception delivered to S. Spike's log
@@ -60,7 +61,7 @@ use crate::manifest::{Fixture, Manifest, load};
 use crate::progen::{self, ExpectedTrap, MISALIGNED, Program};
 use crate::runner::{self, CPU, End, Finished, PASS_CAUSE, Start};
 use crate::{FIXTURE_DIR, MAX_INSTRUCTIONS, RAM_BASE, RAM_SIZE, SELECTED, hex};
-use crate::{csrgen, privgen};
+use crate::{csrgen, privgen, vmgen};
 
 /// The upstream Spike repository.
 pub const SPIKE_REPO: &str = "https://github.com/riscv-software-src/riscv-isa-sim.git";
@@ -1268,7 +1269,7 @@ fn retirements(events: &[Event]) -> Vec<Retire> {
 
 /// Spike's name for each SystemScope M3 trap cause the directed programs raise
 /// (`docs/m3-design.md` §5.3), as its `-l` log writes it.
-pub const SPIKE_CAUSES_M3: [(&str, &str); 11] = [
+pub const SPIKE_CAUSES_M3: [(&str, &str); 14] = [
     (
         "InstructionAddressMisaligned",
         "trap_instruction_address_misaligned",
@@ -1283,12 +1284,18 @@ pub const SPIKE_CAUSES_M3: [(&str, &str); 11] = [
     ("EnvironmentCallFromU", "trap_user_ecall"),
     ("EnvironmentCallFromS", "trap_supervisor_ecall"),
     ("EnvironmentCallFromM", SPIKE_ECALL),
+    ("InstructionPageFault", "trap_instruction_page_fault"),
+    ("LoadPageFault", "trap_load_page_fault"),
+    ("StorePageFault", "trap_store_page_fault"),
 ];
 
 /// Parses a pinned-Spike `-l --log-commits` log of an M3 program, strictly, up to its
 /// first exception taken in M. As in [`parse_spike_l_log`], each instruction is an
 /// instruction line, then its commit line, now in any of the three modes, or its trap.
-/// Spike writes no tval line for the three environment calls. A trap whose handler's
+/// A fetch that faults (causes 1 and 12) has no instruction line: its trap line stands
+/// alone, with `epc` the fetched address, and its instruction word is 0, as in
+/// SystemScope's `rv32.exception` record. Spike writes no tval line for the three
+/// environment calls. A trap whose handler's
 /// first instruction commits in S was delegated: it is an [`Event::Exception`], and the
 /// log goes on. Any other trap is the one taken in M, returned with the events before
 /// it; the lines after it, Spike's handler, are not compared. A log without one is an
@@ -1308,11 +1315,27 @@ pub fn parse_spike_m3_log(log: &str) -> Result<(Vec<Event>, SpikeTrap), String> 
         let line = lines
             .get(k)
             .ok_or_else(|| "Spike's log has no exception taken in M".to_owned())?;
+        if let Some(rest) = line.strip_prefix("core   0: exception ") {
+            // A fetch fault: the trap line, as if after an instruction line at its epc.
+            let (cause, epc) = rest.split_once(", epc ").ok_or_else(|| at(k, "no epc"))?;
+            if !matches!(
+                cause,
+                "trap_instruction_page_fault" | "trap_instruction_access_fault"
+            ) {
+                return Err(at(k, "a trap without an instruction line"));
+            }
+            let pc = word(epc, 8).map_err(|why| at(k, &why))?;
+            match trap_at(&lines, k, pc, 0, &mut events, &at)? {
+                Next::Continue(j) => k = j,
+                Next::Trap(trap) => return Ok((events, trap)),
+            }
+            continue;
+        }
         let (pc, insn) = instruction_line(line).map_err(|why| at(k, &why))?;
         let next = lines
             .get(k + 1)
             .ok_or_else(|| at(k, "the log ends after an instruction line"))?;
-        let Some(rest) = next.strip_prefix("core   0: exception ") else {
+        let Some(_) = next.strip_prefix("core   0: exception ") else {
             let (privilege, retire) = parse_commit(next, true).map_err(|why| at(k + 1, &why))?;
             if (retire.pc, retire.insn) != (pc, insn) {
                 return Err(at(
@@ -1324,55 +1347,79 @@ pub fn parse_spike_m3_log(log: &str) -> Result<(Vec<Event>, SpikeTrap), String> 
             k += 2;
             continue;
         };
-        let (cause, epc) = rest
-            .split_once(", epc ")
-            .ok_or_else(|| at(k + 1, "no epc"))?;
-        if epc != format!("{pc:#010x}") {
-            return Err(at(
-                k + 1,
-                &format!("not a trap of the instruction at {pc:#010x}"),
-            ));
+        match trap_at(&lines, k + 1, pc, insn, &mut events, &at)? {
+            Next::Continue(j) => k = j,
+            Next::Trap(trap) => return Ok((events, trap)),
         }
-        let ours = SPIKE_CAUSES_M3
-            .iter()
-            .find(|(_, theirs)| *theirs == cause)
-            .map(|(ours, _)| *ours)
-            .ok_or_else(|| at(k + 1, "a cause no directed program raises"))?;
-        let mut j = k + 2;
-        let tval = if ours.starts_with("EnvironmentCall") {
-            0
-        } else {
-            let tval = lines
-                .get(j)
-                .and_then(|l| l.strip_prefix("core   0:           tval "))
-                .ok_or_else(|| at(j, "not the trap's tval line"))
-                .and_then(|t| word(t, 8).map_err(|why| at(j, &why)))?;
-            j += 1;
-            tval
-        };
-        let delegated = match (lines.get(j), lines.get(j + 1)) {
-            (Some(handler), Some(commit)) if instruction_line(handler).is_ok() => {
-                matches!(parse_commit(commit, true), Ok((1, _)))
-            }
-            _ => false,
-        };
-        if !delegated {
-            let trap = SpikeTrap {
-                pc,
-                insn,
-                cause: cause.to_owned(),
-                tval,
-            };
-            return Ok((events, trap));
+    }
+}
+
+/// Where [`parse_spike_m3_log`] goes after a trap.
+enum Next {
+    /// The trap was delegated; the log goes on at this line.
+    Continue(usize),
+    /// The trap was taken in M.
+    Trap(SpikeTrap),
+}
+
+/// Reads the trap line `t` of the instruction at `pc` with word `insn`: its tval line,
+/// unless it is an environment call, and where its handler runs.
+fn trap_at(
+    lines: &[&str],
+    t: usize,
+    pc: u32,
+    insn: u32,
+    events: &mut Vec<Event>,
+    at: &dyn Fn(usize, &str) -> String,
+) -> Result<Next, String> {
+    let rest = lines[t]
+        .strip_prefix("core   0: exception ")
+        .ok_or_else(|| at(t, "not a trap line"))?;
+    let (cause, epc) = rest.split_once(", epc ").ok_or_else(|| at(t, "no epc"))?;
+    if epc != format!("{pc:#010x}") {
+        return Err(at(
+            t,
+            &format!("not a trap of the instruction at {pc:#010x}"),
+        ));
+    }
+    let ours = SPIKE_CAUSES_M3
+        .iter()
+        .find(|(_, theirs)| *theirs == cause)
+        .map(|(ours, _)| *ours)
+        .ok_or_else(|| at(t, "a cause no directed program raises"))?;
+    let mut j = t + 1;
+    let tval = if ours.starts_with("EnvironmentCall") {
+        0
+    } else {
+        let tval = lines
+            .get(j)
+            .and_then(|l| l.strip_prefix("core   0:           tval "))
+            .ok_or_else(|| at(j, "not the trap's tval line"))
+            .and_then(|t| word(t, 8).map_err(|why| at(j, &why)))?;
+        j += 1;
+        tval
+    };
+    let delegated = match (lines.get(j), lines.get(j + 1)) {
+        (Some(handler), Some(commit)) if instruction_line(handler).is_ok() => {
+            matches!(parse_commit(commit, true), Ok((1, _)))
         }
-        events.push(Event::Exception {
+        _ => false,
+    };
+    if !delegated {
+        return Ok(Next::Trap(SpikeTrap {
             pc,
             insn,
-            cause: ours.to_owned(),
+            cause: cause.to_owned(),
             tval,
-        });
-        k = j;
+        }));
     }
+    events.push(Event::Exception {
+        pc,
+        insn,
+        cause: ours.to_owned(),
+        tval,
+    });
+    Ok(Next::Continue(j))
 }
 
 /// SystemScope's side of an M3 run: its events, and the `rv32.trap` record that ended it,
@@ -1387,9 +1434,11 @@ pub struct SystemScopeEvents {
 
 /// Reads SystemScope's M3 events from a traced run's canonical records
 /// (`docs/m3-design.md` §5.6), as [`from_trace`] reads M1 and M2 ones: `rv32.commit` has
-/// `priv` after `next_pc`, and a load or store `paddr` after `addr`, which must equal it
-/// without translation; `rv32.exception` is a delivered exception, always to S. An
-/// interrupt, the instruction limit, or a record after the trap is an error.
+/// `priv` after `next_pc`, and a load or store `paddr` after `addr`; `rv32.exception` is a
+/// delivered exception, always to S. An interrupt, the instruction limit, or a record
+/// after the trap is an error. Spike's commit log names the virtual address, so `addr` is
+/// what is compared; `paddr` must only be a 34-bit physical address with `addr`'s page
+/// offset, and equal `addr` in M, which never translates (§5.2).
 pub fn from_trace_m3(trace: &Trace) -> Result<SystemScopeEvents, String> {
     let mut out = SystemScopeEvents {
         events: Vec::new(),
@@ -1412,6 +1461,15 @@ pub fn from_trace_m3(trace: &Trace) -> Result<SystemScopeEvents, String> {
             Some((_, Value::Str(s))) => Ok(s.clone()),
             _ => Err(at("expected a Str field")),
         };
+        // Field 7 is a physical address for the address in field 6.
+        let paddr_ok = || -> Result<bool, String> {
+            let addr = u64::from(u32_at(6)?);
+            let Some((_, Value::U64(paddr))) = record.fields.get(7) else {
+                return Err(at("expected a U64 field"));
+            };
+            let in_m = u32_at(5)? == 3;
+            Ok(*paddr < 1 << 34 && paddr & 0xfff == addr & 0xfff && (!in_m || *paddr == addr))
+        };
         match record.kind {
             k if k == COMMIT_KIND => {
                 let head = ["pc", "insn", "rd", "rd_value", "next_pc", "priv"];
@@ -1431,8 +1489,8 @@ pub fn from_trace_m3(trace: &Trace) -> Result<SystemScopeEvents, String> {
                         csr = Some((number, u32_at(7)?));
                         Mem::None
                     }
-                    ["addr", "paddr"] if u32_at(6)? == u32_at(7)? => Mem::Load { addr: u32_at(6)? },
-                    ["addr", "paddr", "width", "value"] if u32_at(6)? == u32_at(7)? => {
+                    ["addr", "paddr"] if paddr_ok()? => Mem::Load { addr: u32_at(6)? },
+                    ["addr", "paddr", "width", "value"] if paddr_ok()? => {
                         let width = match u32_at(8)? {
                             w @ (1 | 2 | 4) => w as u8,
                             w => return Err(at(&format!("store width {w}"))),
@@ -1543,8 +1601,13 @@ fn run_m3_program(
     logs: &str,
     executed: &mut (bool, bool),
 ) -> Result<usize, String> {
-    let elf = format!("{logs}/privgen/{}.elf", program.name);
-    let log = format!("{logs}/privgen/{}.log", program.name);
+    let dir = if program.name.starts_with("m3-vm-") {
+        "vmgen"
+    } else {
+        "privgen"
+    };
+    let elf = format!("{logs}/{dir}/{}.elf", program.name);
+    let log = format!("{logs}/{dir}/{}.log", program.name);
     let path = root.join(&elf);
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -1568,7 +1631,22 @@ fn run_m3_program(
 /// profile and [`spike_m3_args`]: every [`privgen::programs`] program, up to the exception
 /// taken in M that ends it.
 pub fn run_m3(root: &Path, spike: &Path, logs: &str) -> DiffReport {
-    let results: Vec<Diff> = privgen::programs()
+    run_m3_programs(root, spike, logs, privgen::programs())
+}
+
+/// The directed M3.3 Sv32 programs against Spike, as [`run_m3`] runs the M3.2 ones: every
+/// [`vmgen::programs`] program.
+pub fn run_m3_sv32(root: &Path, spike: &Path, logs: &str) -> DiffReport {
+    run_m3_programs(root, spike, logs, vmgen::programs())
+}
+
+fn run_m3_programs(
+    root: &Path,
+    spike: &Path,
+    logs: &str,
+    programs: Vec<(Program, ExpectedTrap)>,
+) -> DiffReport {
+    let results: Vec<Diff> = programs
         .into_iter()
         .map(|(program, expected)| {
             program_differential_with(
@@ -2580,6 +2658,52 @@ core   0: exception trap_machine_ecall, epc 0x80000050
         assert!(judge_trap(&other, &theirs, &trap, &expected).is_err());
         // A passing program's run is no trap program's.
         assert!(judge_trap(&traced(&progen::generate(0)), &theirs, &trap, &expected).is_err());
+    }
+
+    /// A fetch fault has no instruction line in Spike's log: the trap line stands alone,
+    /// and is read as a trap of word 0 at its `epc`, delegated or taken in M.
+    #[test]
+    fn a_standalone_fetch_fault_line_is_a_trap_of_word_0() {
+        let log = "core   0: 0x800002ec (0x000300e7) jalr    t1
+core   0: 1 0x800002ec (0x000300e7) x1  0x800002f0
+core   0: exception trap_instruction_page_fault, epc 0x4040c000
+core   0:           tval 0x4040c000
+core   0: 0x80000374 (0x14202e73) csrr    t3, scause
+core   0: 1 0x80000374 (0x14202e73) x28 0x0000000c
+core   0: exception trap_instruction_access_fault, epc 0x40000000
+core   0:           tval 0x40000000
+core   0: 0x800002f0 (0x0ff0000f) fence   iorw,iorw
+core   0: 3 0x800002f0 (0x0ff0000f)
+";
+        let (events, trap) = parse_spike_m3_log(log).unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events[1],
+            Event::Exception {
+                pc: 0x4040_c000,
+                insn: 0,
+                cause: "InstructionPageFault".to_owned(),
+                tval: 0x4040_c000,
+            }
+        );
+        assert_eq!(
+            trap,
+            SpikeTrap {
+                pc: 0x4000_0000,
+                insn: 0,
+                cause: "trap_instruction_access_fault".to_owned(),
+                tval: 0x4000_0000,
+            }
+        );
+        // Only a fetch fault stands alone.
+        let load = log.replace(
+            "trap_instruction_page_fault, epc 0x4040c000",
+            "trap_load_page_fault, epc 0x4040c000",
+        );
+        assert!(parse_spike_m3_log(&load).is_err());
+        // Its epc must be a word address.
+        let bad = log.replace("epc 0x4040c000", "epc 0x4040c00");
+        assert!(parse_spike_m3_log(&bad).is_err());
     }
 
     #[test]

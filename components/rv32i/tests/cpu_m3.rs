@@ -1,8 +1,8 @@
 //! `Rv32iCpu` in the `M3` profile, driven directly (`docs/m3-design.md` §5.1, §5.3, §5.5,
 //! §5.6, M3.2): modes, the supervisor CSR subset and the access rule, delegated
-//! synchronous exceptions, `MRET` and `SRET`, `SFENCE.VMA`, `satp` Bare-only, the machine
-//! external interrupt with modes, inspect and trace, and snapshot schema 3 with its restore
-//! checks. Expected values are spelled out from the design; the interrupt's come from the
+//! synchronous exceptions, `MRET` and `SRET`, `SFENCE.VMA`, `satp` with Bare and Sv32 (the
+//! walk itself is `cpu_sv32.rs`'s), the machine external interrupt with modes, inspect and
+//! trace, and snapshot schema 3 with its restore checks. Expected values are spelled out from the design; the interrupt's come from the
 //! independent oracle [`common::mei_m3`].
 
 mod common;
@@ -463,8 +463,8 @@ fn every_whitelisted_csr_follows_its_m3_rule() {
         (SEPC, 0xffff_fffc),
         (SCAUSE, 0xffff_ffff),
         (STVAL, 0xffff_ffff),
-        // Sv32 is unsupported: satp keeps its old value, 0.
-        (SATP, 0),
+        // Sv32 is supported from M3.3: MODE and PPN stored, ASID 0. M stays bare.
+        (SATP, 0x803f_ffff),
         (MEDELEG, 0xB1FF),
         (MIDELEG, 0),
     ] {
@@ -549,31 +549,34 @@ fn medeleg_keeps_only_its_mask_and_mideleg_sie_sip_read_zero() {
 }
 
 #[test]
-fn m3_2_satp_accepts_bare_zeroes_asid_and_ignores_sv32() {
+fn satp_stores_bare_and_sv32_and_zeroes_asid() {
     let (mut cpu, mut ctx) = start();
     // Bare, PPN written, ASID dropped.
     csrw(&mut cpu, &mut ctx, SATP, 0x7fff_ffff);
     assert_eq!(read(&cpu, "satp"), 0x003f_ffff);
-    // Sv32 is not supported until M3.3: satp is unchanged, and the write still retires
-    // with rd = the old value.
-    li(&mut cpu, &mut ctx, 1, 0x8000_0123);
+    // Sv32 is supported from M3.3: MODE and PPN are stored, ASID reads 0, and rd gets
+    // the old value.
+    li(&mut cpu, &mut ctx, 1, 0xc000_0123);
     let pc = cpu.pc();
     let insn = csrrw(5, SATP, 1);
     let f = retire(&mut cpu, &mut ctx, insn);
     let mut want = fields(pc, insn, 5, 0x003f_ffff, pc + 4, M);
     want.push(("csr", u(u32::from(SATP))));
-    want.push(("csr_value", u(0x003f_ffff)));
+    want.push(("csr_value", u(0x8000_0123)));
     assert_eq!(f, want);
     assert_eq!(reg(&cpu, 5), 0x003f_ffff);
-    assert_eq!(read(&cpu, "satp"), 0x003f_ffff);
-    // Bare again, from S.
+    assert_eq!(read(&cpu, "satp"), 0x8000_0123);
+    // M stays bare under Sv32: the next fetch goes straight to the bus.
+    retire(&mut cpu, &mut ctx, addi(6, 0, 1));
+    // Bare again, then from S.
+    csrw(&mut cpu, &mut ctx, SATP, 0);
     enter(&mut cpu, &mut ctx, S, 0x8000_1000, 0);
     retire(&mut cpu, &mut ctx, csrrwi(0, SATP, 5));
     assert_eq!(read(&cpu, "satp"), 5);
 }
 
 #[test]
-fn m3_2_satp_is_s_level_and_illegal_from_u() {
+fn satp_is_s_level_and_illegal_from_u() {
     let (mut cpu, mut ctx) = start();
     enter(&mut cpu, &mut ctx, U, 0x8000_1000, 0);
     assert_illegal(&mut cpu, &mut ctx, csrrs(1, SATP, 0));
@@ -1307,7 +1310,9 @@ fn forge(
     w.into_bytes()
 }
 
+/// `FetchIssue`, untranslated.
 fn fetch_issue(w: &mut SnapshotWriter) {
+    w.u8(0);
     w.u8(0);
 }
 
@@ -1383,10 +1388,11 @@ fn the_schema_3_layout_is_schema_2_then_the_m3_block() {
         &m,
     );
     assert_eq!(snapshot_of(&cpu), want);
-    // Its length is schema 2's plus 7 bytes and 7 words.
+    // Its length is schema 2's plus the state's physical-address tag, 7 bytes, and 7
+    // words.
     assert_eq!(
         want.len(),
-        4 + 4 + 8 + 4 + 31 * 4 + 8 + 8 + 1 + 3 + 5 * 4 + 1 + 7 + 7 * 4
+        4 + 4 + 8 + 4 + 31 * 4 + 8 + 8 + 1 + 1 + 3 + 5 * 4 + 1 + 7 + 7 * 4
     );
     round_trip(&cpu);
 }
@@ -1505,6 +1511,12 @@ fn restore_checks_the_m3_block() {
     assert_eq!(snapshot_of(&cpu), ok);
     assert_eq!(mode(&cpu), U);
     assert_eq!(read(&cpu, "mstatus"), 0x000c_0922);
+    // Sv32 with any PPN restores; in M nothing is translated, so `FetchIssue` has no pa.
+    let sv32 = with(M3Csrs {
+        satp: 0x803f_ffff,
+        ..RESET_M3
+    });
+    assert_eq!(snapshot_of(&restore_m3(&sv32).unwrap()), sv32);
     for bad in [
         M3Csrs {
             privilege: 2,
@@ -1556,11 +1568,11 @@ fn restore_checks_the_m3_block() {
             ..RESET_M3
         },
         M3Csrs {
-            satp: 1 << 31,
+            satp: 1 << 22,
             ..RESET_M3
         },
         M3Csrs {
-            satp: 1 << 22,
+            satp: 0x8000_0000 | 1 << 30,
             ..RESET_M3
         },
     ] {
@@ -1600,7 +1612,7 @@ fn a_rejected_restore_changes_nothing() {
         &M3Csrs {
             privilege: U,
             sscratch: 5,
-            satp: 1 << 31,
+            satp: 1 << 22,
             ..RESET_M3
         },
     );
@@ -1636,6 +1648,8 @@ fn pending(
         w.u8(1);
         w.u32(insn);
         outcome(w);
+        // No physical address.
+        w.u8(0);
     }
 }
 
@@ -1677,7 +1691,7 @@ fn the_state_record_is_checked_against_the_mode_read_after_it() {
     assert!(at(S, Box::new(halted(3, ENTRY)), 1 << 3).is_err());
     at(M, Box::new(halted(2, ENTRY)), 1 << 2).unwrap();
     at(U, Box::new(halted(2, ENTRY)), 1 << 3).unwrap();
-    // Page faults are never raised yet: codes 11, 12, 13.
+    // A page fault needs translation, which is off here (satp Bare): codes 11, 12, 13.
     for code in 11..=13u8 {
         assert!(matches!(
             at(S, Box::new(halted(code, ENTRY)), 0),
