@@ -20,7 +20,14 @@
 
 pub mod config;
 pub mod core;
+pub mod frames;
+pub mod image;
 pub mod kernel;
+pub mod process;
+pub mod procop;
+pub mod pte;
+pub mod space;
 
 pub use config::{KernelConfig, KernelConfigError, Window};
+pub use image::{BootImage, PlanError, ProcessPlan, UserLayout};
 pub use kernel::ModeledKernel;

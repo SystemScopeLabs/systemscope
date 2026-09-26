@@ -11,6 +11,7 @@
 #![allow(dead_code)]
 
 pub mod platform;
+pub mod procs;
 
 use std::collections::BTreeMap;
 

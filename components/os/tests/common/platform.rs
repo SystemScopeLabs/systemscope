@@ -30,7 +30,9 @@ use std::num::NonZeroU64;
 
 use systemscope_contracts::time::{Frequency, Rounding, SimulationClock, Tick};
 use systemscope_contracts::topology::LinkLatency;
-use systemscope_os::{KernelConfig, KernelConfigError, ModeledKernel, Window};
+use systemscope_os::{
+    KernelConfig, KernelConfigError, ModeledKernel, PlanError, ProcessPlan, Window,
+};
 use systemscope_platform::{
     BlockMediaConfig, DmaBlockController, DmaBlockControllerConfig, IrqControllerConfig,
     MediaImage, MultiMasterBus, MultiMasterBusConfig, Ram, RamConfig, RamImage, Region, Segment,
@@ -108,6 +110,8 @@ pub enum BuildError {
     GateInAperture,
     /// The kernel rejected its configuration.
     Kernel(KernelConfigError),
+    /// The kernel rejected its process plan.
+    Plan(PlanError),
 }
 
 /// The disk: block 0 and 1 hold `i mod 251` at byte `i`, the rest zeros.
@@ -121,6 +125,24 @@ pub fn disk() -> Vec<u8> {
 
 /// The platform running `program` with the kernel `config`, after the builder checks.
 pub fn build(program: &Program, config: KernelConfig) -> Result<Runtime, BuildError> {
+    check(&config)?;
+    elaborate(program, config)
+}
+
+/// The platform running `program` with a kernel with processes, after the builder checks.
+pub fn build_procs(
+    program: &Program,
+    config: KernelConfig,
+    plan: ProcessPlan,
+) -> Result<Runtime, BuildError> {
+    check(&config)?;
+    elaborate_with(program, config, |config| {
+        ModeledKernel::with_processes(config, plan).map_err(BuildError::Plan)
+    })
+}
+
+/// The builder checks of §16 risk 2.
+fn check(config: &KernelConfig) -> Result<(), BuildError> {
     let gate = Window {
         base: KGATE_BASE,
         size: KGATE_SIZE,
@@ -139,11 +161,22 @@ pub fn build(program: &Program, config: KernelConfig) -> Result<Runtime, BuildEr
     if gate.overlaps(RAM_BASE, RAM_SIZE) {
         return Err(BuildError::GateInAperture);
     }
-    elaborate(program, config)
+    Ok(())
 }
 
 /// The platform running `program` with the kernel `config`, without the builder checks.
 pub fn elaborate(program: &Program, config: KernelConfig) -> Result<Runtime, BuildError> {
+    elaborate_with(program, config, |config| {
+        ModeledKernel::new(config).map_err(BuildError::Kernel)
+    })
+}
+
+/// The platform with the kernel `make` builds from `config` with the platform's clock.
+fn elaborate_with(
+    program: &Program,
+    config: KernelConfig,
+    make: impl FnOnce(KernelConfig) -> Result<ModeledKernel, BuildError>,
+) -> Result<Runtime, BuildError> {
     let mut t = TopologyBuilder::new(SimulationClock::default());
     let clock = t
         .add_clock(
@@ -161,7 +194,7 @@ pub fn elaborate(program: &Program, config: KernelConfig) -> Result<Runtime, Bui
         k: 1,
     };
     let config = KernelConfig { clock, ..config };
-    let kernel = ModeledKernel::new(config).map_err(BuildError::Kernel)?;
+    let kernel = make(config)?;
     let cpu = Rv32iCpu::new(Rv32iConfig {
         clock,
         entry: STUB,
@@ -324,6 +357,21 @@ pub mod asm {
 
     pub fn bne(rs1: u32, rs2: u32, offset: i32) -> u32 {
         b(offset, rs2, rs1, 1)
+    }
+
+    /// `jal rd, offset`.
+    pub fn jal(rd: u32, offset: i32) -> u32 {
+        let imm = offset as u32;
+        (imm >> 20 & 1) << 31
+            | (imm >> 1 & 0x3ff) << 21
+            | (imm >> 11 & 1) << 20
+            | (imm >> 12 & 0xff) << 12
+            | rd << 7
+            | 0x6f
+    }
+
+    pub fn add(rd: u32, rs1: u32, rs2: u32) -> u32 {
+        rs2 << 20 | rs1 << 15 | rd << 7 | 0x33
     }
 
     /// `csrrw rd, csr, rs1`.
@@ -534,3 +582,68 @@ pub fn machine(words: &[u32]) -> Program {
 
 /// `SRET`, re-exported for the tests.
 pub const SRET_WORD: u32 = SRET;
+
+/// The trampoline of §7.3 exactly, with no test glue, and the offset of its restore path
+/// (the instruction after the `ENTER` store), which `s_boot` falls into.
+pub fn proc_trampoline() -> (Vec<u32>, u32) {
+    let assemble = |shutdown: i32| {
+        let mut w = vec![csrrw(T6, SSCRATCH, T6)];
+        for r in 1..=30 {
+            w.push(sw(r, T6, 4 * (r as i32 - 1)));
+        }
+        w.push(csrrs(T5, SSCRATCH, 0));
+        w.push(sw(T5, T6, 0x78));
+        for (csr, off) in [(SEPC, 0x7C), (SSTATUS, 0x80), (SCAUSE, 0x84), (STVAL, 0x88)] {
+            w.push(csrrs(T5, csr, 0));
+            w.push(sw(T5, T6, off));
+        }
+        w.extend(li(T5, KGATE_BASE as u32));
+        w.push(sw(T6, T5, 0)); // ENTER: held until the kernel finishes
+        let restore = 4 * w.len() as u32;
+        let at = |w: &Vec<u32>| 4 * w.len() as i32;
+        w.push(lw(T5, T6, 0x90));
+        w.push(bne(T5, 0, shutdown - at(&w)));
+        w.push(lw(T5, T6, 0x8C));
+        w.push(csrrw(0, SATP, T5));
+        w.push(SFENCE_VMA);
+        w.push(lw(T5, T6, 0x7C));
+        w.push(csrrw(0, SEPC, T5));
+        w.push(lw(T5, T6, 0x80));
+        w.push(csrrw(0, SSTATUS, T5));
+        w.push(csrrw(0, SSCRATCH, T6));
+        for r in 1..=30 {
+            w.push(lw(r, T6, 4 * (r as i32 - 1)));
+        }
+        w.push(lw(T6, T6, 0x78));
+        w.push(SRET);
+        let here = at(&w);
+        srst(&mut w, lw(A1, T6, 0x94));
+        (w, here, restore)
+    };
+    let (_, shutdown, _) = assemble(0);
+    let (w, again, restore) = assemble(shutdown);
+    assert_eq!(again, shutdown);
+    (w, restore)
+}
+
+/// The M3 guest glue with staged user files (§7.1, §7.3): the stub, `s_boot` at
+/// [`S_START`] (store the frame address to `kgate.ENTER`, then fall into the
+/// trampoline's restore path), the §7.3 trampoline, and each file's bytes at its staging
+/// address.
+pub fn firmware(staged: &[(u32, Vec<u8>)]) -> Program {
+    let (tramp, restore) = proc_trampoline();
+    let mut s = Vec::new();
+    s.extend(li(T6, TRAP_FRAME));
+    s.extend(li(T5, KGATE_BASE as u32));
+    s.push(sw(T6, T5, 0));
+    let here = S_START + 4 * s.len() as u32;
+    s.push(jal(0, (TRAMPOLINE + restore) as i32 - here as i32));
+    let mut p = Program::default();
+    p.code(STUB, &stub());
+    p.code(S_START, &s);
+    p.code(TRAMPOLINE, &tramp);
+    for (at, bytes) in staged {
+        p.segments.push((u64::from(*at), bytes.clone()));
+    }
+    p
+}

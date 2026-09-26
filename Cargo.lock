@@ -462,6 +462,7 @@ version = "0.0.0"
 dependencies = [
  "proptest",
  "systemscope-contracts",
+ "systemscope-elf",
  "systemscope-platform",
  "systemscope-runtime",
  "systemscope-rv32i",
