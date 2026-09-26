@@ -1,0 +1,22 @@
+[package]
+name = "systemscope-os"
+description = "The SystemScope M3 modeled OS backend: the ModeledKernel component, its kgate held entry, and its bus-master state engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# Components depend only on contracts, never on the runtime (docs/m0-design.md §2), and
+# never on the CPU: the kernel's only inputs are memory accesses (docs/m3-design.md §6.1).
+[dependencies]
+systemscope-contracts.workspace = true
+
+[dev-dependencies]
+proptest = "1"
+# The gate tests run the M3 CPU, the multi-master bus, the RAM, and the UART against the
+# kernel in the real runtime; the library itself depends on none of them.
+systemscope-platform.workspace = true
+systemscope-runtime.workspace = true
+systemscope-rv32i.workspace = true
+
+[lints]
+workspace = true

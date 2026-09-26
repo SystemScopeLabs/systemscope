@@ -457,6 +457,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "systemscope-os"
+version = "0.0.0"
+dependencies = [
+ "proptest",
+ "systemscope-contracts",
+ "systemscope-platform",
+ "systemscope-runtime",
+ "systemscope-rv32i",
+]
+
+[[package]]
 name = "systemscope-platform"
 version = "0.0.0"
 dependencies = [
