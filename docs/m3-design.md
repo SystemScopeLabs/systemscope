@@ -1,6 +1,6 @@
 # M3 Design: Modeled OS Backend
 
-> Status: Design frozen (M3.0), with M3.2 clarifications to §5.1, §5.3, §5.5, §15.1, §15.3, and §17 from [m3-2-spike-appendix.md](m3-2-spike-appendix.md) · Parent: [plan.md](../plan.md) · Builds on: [m2-design.md](m2-design.md), [m1-design.md](m1-design.md), [m0-design.md](m0-design.md)
+> Status: Design frozen (M3.0), with M3.2 clarifications to §5.1, §5.3, §5.5, §15.1, §15.3, and §17 from [m3-2-spike-appendix.md](m3-2-spike-appendix.md), and the M3.4b, M3.5, and M3.6 clarifications in §17.1–§17.3 · Parent: [plan.md](../plan.md) · Builds on: [m2-design.md](m2-design.md), [m1-design.md](m1-design.md), [m0-design.md](m0-design.md)
 
 This document is the architecture contract for M3. It fixes the decisions the M3 implementation steps (§17) depend on. §19.1 records the design choices accepted at the freeze and the alternatives considered. Nothing in it is implemented yet: M3.0 changes documentation only. The M2 reference platform is frozen, and nothing here changes it.
 
@@ -917,6 +917,67 @@ M3.5 delivers the §6.5 syscall ABI on the M3.4b process model. These points ref
 - **Trace timing.** `os.syscall.enter` is traced when the syscall is decoded; `os.syscall.exit` when its result is decided (a `write` after its last byte or its refusal), before the `a0` and `sepc` writes; `sched_yield` traces its exit (`ret 0`) before `os.process.switch`. `exit` and `exit_group` trace `os.process.exit` instead of `os.syscall.exit`. `os.process.exit`'s `status` is `I64`, the signed 32-bit status.
 - **Snapshot.** A syscall in progress is a stage of the process-mode operation: 4 `Walk` (the buffer as `sepc`, `buf`, and `n`; the physical pages found; the table and level of the next PTE read), 5 `Output` (the buffer, the pages, and the bytes output so far), 6 `Return` (`sepc` and the result). The trap frame, the user bytes, and the UART's output are never copied into it: a chunk being output is the operation's working data, like the frame words. Restore rebuilds the running process's mapping from its image and frames and rejects a stage that no `write` of that process could be in: a bad buffer, pages or a table that are not its mapping, or a byte count that is not a chunk start. A restored kernel never reissues a request; a restored `Wait` continues from the response.
 - **Test programs.** The runtime tests' user programs are hand-assembled and gp-independent, building every address with `lui`/`addi` (§17.1 initial `gp`). They are test-only; the M3.6 reference programs must meet the same rule.
+
+### 17.3 M3.6 Clarifications
+
+M3.6 delivers `m3-reference` and the M3 scenario: boot from the executable table through the block controller (moved from M3.4b, §17.1), the firmware, the five programs, the disks, the manifest, and the expected output and `os.*` trace. These points refine §7, §8, §11, §12, and §15.2 for it. None adds a syscall, a guest-visible error, or a CPU, MMU, or DMA behavior.
+
+- **Disk mode.** `ModeledKernel::with_disk` takes the user layout and the disk's capacity in blocks, and the kernel boots from the disk instead of a host-validated plan. `new` and `with_processes` are unchanged, and so are their snapshot bytes. Where a plan kernel's configuration has the plan (marker `0xA5`), a disk kernel's has the marker `0xD5`, the layout, and the capacity. The `m3-reference` builder requires the kernel's boot capacity, the controller's capacity, and the media's to be equal.
+- **Driver.** Each transfer is exactly §8.2 on the unchanged M2 controller:
+  1. write `LBA`, `MEM_ADDR` (staging), and `BLOCK_COUNT`;
+  2. write `COMMAND = 1` (READ);
+  3. read `STATUS` until `DONE`;
+  4. write `ACK = 1`.
+
+  `IRQ_ENABLE` is never written, so the completion interrupt never rises, and no other register is read. A well-formed command is never rejected, so the kernel does not look at `REJECTED` and always writes `ACK`. The kernel has one access in flight at a time, so a `STATUS` poll can sit behind a DMA beat that is in flight.
+- **Table.** Block 0 is read first. Boot shuts down with reason 1 and a detail naming the error, before `os.boot`, if the controller reports an error reading it or if §8.1 refuses the table for the disk's capacity and the staging size. Nothing more is read. `os.boot` (`entries`) is traced once the table is valid.
+- **Entries.** Every entry is read whole into staging (`ceil(byte_len / 512)` blocks), in table order, one at a time. Entry `i` becomes PID `i + 1` or fails.
+  - **Header.** The kernel reads `min(52, byte_len)` bytes of the ELF header from staging. If `parse_user_elf32` reports `PrefixTooShort`, it reads exactly the prefix asked for and parses again. The resulting `UserImage` goes unchanged to the M3.4b creation path (§17.1).
+  - **Failure.** A controller error on an entry, or an ELF that §8.3 refuses, fails that creation with `entry = 0` and the error text. A megapage slot or an exhausted pool fails it as in §17.1, with the image's entry. Boot then continues with the next entry.
+  - **Shutdown reason.** A failed entry makes the empty-queue shutdown reason 1. The reason is 0 only when every entry became a process and every process exited with status 0.
+- **Snapshot.** The disk stages of the process-mode operation are:
+  - 7 `Command`;
+  - 8 `Poll`;
+  - 9 `Ack`, with the error code read;
+  - 10 `Staged`, with the header length being read;
+  - 11 `Load`, with the header bytes read and the reserved frames.
+
+  Each stage carries a cursor: the validated table, or none while block 0 is read, and the entry index. Staging's bytes are never copied. A restored `Load` rebuilds its mapping by parsing the recorded header bytes again. Restore rejects a disk stage that no boot of that disk could be in, for example:
+  - a length the header rule would not read;
+  - a cursor past the table, an invalid or overlapping table, or entries before the table is read;
+  - truncated or invalid header bytes;
+  - frames that are too few, not ascending, or outside the pool.
+
+  After boot, only the entry count is kept. A live process of a disk kernel is checked against the image its regions describe, because its ELF is no longer held anywhere. Its region frames and page-table frames are checked as in §17.2. Its permissions are checked only for validity (never `W` without `R`), not against a file.
+- **Firmware (§7).** `m3-firmware.elf` is the only image the host places in RAM, as a boot ROM would be.
+  - **`_start`** sets `medeleg = 0xB1FF` (every exception except `ecall` from S and M), points `stvec` at the trampoline and `sscratch` at the trap frame, then `MRET`s to `s_boot` in S with `satp` Bare.
+  - **`s_boot`** stores the frame's address to `ENTER` for the boot operation (§6.3), then runs the restore path.
+  - **The trampoline** saves `x1`–`x31`, `sepc`, `sstatus`, `scause`, and `stval` into the frame (§7.2) and stores to `ENTER`.
+  - **The restore path** carries out the frame's action. On Resume it writes `satp`, runs `SFENCE.VMA`, writes `sepc` and `sstatus`, reloads the registers, and `SRET`s. On Shutdown it issues the SRST `ecall` with `a1` = the reason.
+
+  The firmware is assembled with `.option norelax` and linked with `--no-relax`. The only instructions that name `x3` are the trampoline's save and restore of it.
+- **User programs (§12.2).** `hello`, `ping`, `pong`, `fault`, and `badptr` are RV32I assembly, assembled with `.option norelax` and linked at `USER_BASE` with `--no-relax`. Every address is built with `auipc`/`addi` or `lui`/`addi`, so nothing depends on `gp` (§17.1). `hello` has text, rodata, data, and bss segments (`user-data.ld`). The others have text and rodata (`user.ld`, which refuses a `.data` section). The build script rejects each of the following:
+  - an instruction outside RV32I, a `WFI`, or a program without an `ECALL`;
+  - an instruction that names `x3`, a relaxation or `gp`-relative relocation, or a `__global_pointer$` symbol;
+  - an empty or misplaced `PT_LOAD`;
+  - two builds from different paths that differ.
+
+  The tests check again that no text word names `x3`.
+- **Storage image.** `m3ref::storage_image` writes the `SSX0` table at LBA 0, then packs the files from LBA 1 in table order. Each file is zero-padded to whole blocks, and zeros fill the disk up to 256 blocks. The image depends only on the file bytes, and `parse_exec_table` checks it. The variant disk of §12.3 is the same without `fault`.
+- **Expected trace (§15.2).** `os-trace.txt` and `os-trace-nofault.txt` hold every `os.*` record except `os.gate.enter` and `os.gate.release`, one per line.
+  - **Fields.** Each line has every field in trace order: `pid`, `nr`, `ret`, `status`, `cause`, `tval`, and the rest. Values are rendered as traced, so `ret` is the `U64` of the 32-bit two's complement result.
+  - **Header.** It names the disk and the disk's `image_hash` (its BLAKE3).
+  - **Writing.** Only `cargo xtask rv32-fixtures build` or `cargo xtask m3-reference manifest` writes the files, and only from a run that passes every other §12.3 check. Tests compare them exactly.
+- **Resume.** M3.6 meets the every-event requirement in two parts:
+  - **Through boot:** a chained run restores the platform at every event from `init` through the first dispatch. Each restore goes into a freshly built platform, which replaces the running one. The chained run must dispatch exactly the uninterrupted run's events and end in its state. Its boundaries include:
+    - a DMA beat in flight behind a kernel `STATUS` poll;
+    - the media busy;
+    - a kernel access in flight under the held `ENTER`;
+    - every disk stage.
+  - **The whole scenario:** 20 checkpoints across it are each restored and run to completion with the trace prefix. Each must reproduce the uninterrupted run's end, events, snapshot, and trace.
+
+  A full every-event resume of the whole scenario (about 167,000 events), the §9.2 stress points, the portable snapshot, and the golden files are M3.7.
+- **Validation.** Twelve property tests check boot against an oracle, with an independent controller model. The oracle is built from §8.1–§8.3, the pure `systemscope-elf` validators, and the frame model, and never calls the kernel's boot state machine. The CI Linux job rebuilds the M3 fixtures with the pinned toolchain and requires them byte-identical. Linux and Windows both run the scenario and `cargo xtask m3-reference verify` from the committed bytes. The optional native-kernel feasibility check (§15.1) was not run.
 
 ---
 
