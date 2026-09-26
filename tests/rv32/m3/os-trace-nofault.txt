@@ -1,0 +1,70 @@
+# m3-reference os.* trace (docs/m3-design.md §12.3, §15.2)
+# disk disk-nofault.img image_hash 0298232c06efbf69bb3cded2167965555ae7ce499a513c8cc0498d587f75df10
+os.boot entries=4
+os.load.segment pid=1 va=65536 memsz=112 perms="r-x"
+os.load.segment pid=1 va=69632 memsz=15 perms="r--"
+os.load.segment pid=1 va=73728 memsz=1 perms="rw-"
+os.load.segment pid=1 va=77824 memsz=32 perms="rw-"
+os.process.create pid=1 entry=65536 root=525312 error=""
+os.load.segment pid=2 va=65536 memsz=56 perms="r-x"
+os.load.segment pid=2 va=69632 memsz=5 perms="r--"
+os.process.create pid=2 entry=65536 root=525323 error=""
+os.load.segment pid=3 va=65536 memsz=56 perms="r-x"
+os.load.segment pid=3 va=69632 memsz=5 perms="r--"
+os.process.create pid=3 entry=65536 root=525332 error=""
+os.load.segment pid=4 va=65536 memsz=104 perms="r-x"
+os.load.segment pid=4 va=69632 memsz=4 perms="r--"
+os.process.create pid=4 entry=65536 root=525341 error=""
+os.process.switch from=0 to=1
+os.syscall.enter pid=1 nr=172 a0=0 a1=0 a2=0
+os.syscall.exit pid=1 nr=172 ret=1
+os.syscall.enter pid=1 nr=64 a0=1 a1=77824 a2=17
+os.syscall.exit pid=1 nr=64 ret=17
+os.syscall.enter pid=1 nr=93 a0=0 a1=77824 a2=17
+os.process.exit pid=1 status=0
+os.process.switch from=1 to=2
+os.syscall.enter pid=2 nr=64 a0=1 a1=69632 a2=5
+os.syscall.exit pid=2 nr=64 ret=5
+os.syscall.enter pid=2 nr=124 a0=5 a1=69632 a2=5
+os.syscall.exit pid=2 nr=124 ret=0
+os.process.switch from=2 to=3
+os.syscall.enter pid=3 nr=64 a0=1 a1=69632 a2=5
+os.syscall.exit pid=3 nr=64 ret=5
+os.syscall.enter pid=3 nr=124 a0=5 a1=69632 a2=5
+os.syscall.exit pid=3 nr=124 ret=0
+os.process.switch from=3 to=4
+os.syscall.enter pid=4 nr=64 a0=1 a1=2147483648 a2=4
+os.syscall.exit pid=4 nr=64 ret=4294967282
+os.syscall.enter pid=4 nr=64 a0=7 a1=69632 a2=4
+os.syscall.exit pid=4 nr=64 ret=4294967287
+os.syscall.enter pid=4 nr=999 a0=4294967287 a1=69632 a2=4
+os.syscall.exit pid=4 nr=999 ret=4294967258
+os.syscall.enter pid=4 nr=93 a0=0 a1=69632 a2=4
+os.process.exit pid=4 status=0
+os.process.switch from=4 to=2
+os.syscall.enter pid=2 nr=64 a0=1 a1=69632 a2=5
+os.syscall.exit pid=2 nr=64 ret=5
+os.syscall.enter pid=2 nr=124 a0=5 a1=69632 a2=5
+os.syscall.exit pid=2 nr=124 ret=0
+os.process.switch from=2 to=3
+os.syscall.enter pid=3 nr=64 a0=1 a1=69632 a2=5
+os.syscall.exit pid=3 nr=64 ret=5
+os.syscall.enter pid=3 nr=124 a0=5 a1=69632 a2=5
+os.syscall.exit pid=3 nr=124 ret=0
+os.process.switch from=3 to=2
+os.syscall.enter pid=2 nr=64 a0=1 a1=69632 a2=5
+os.syscall.exit pid=2 nr=64 ret=5
+os.syscall.enter pid=2 nr=124 a0=5 a1=69632 a2=5
+os.syscall.exit pid=2 nr=124 ret=0
+os.process.switch from=2 to=3
+os.syscall.enter pid=3 nr=64 a0=1 a1=69632 a2=5
+os.syscall.exit pid=3 nr=64 ret=5
+os.syscall.enter pid=3 nr=124 a0=5 a1=69632 a2=5
+os.syscall.exit pid=3 nr=124 ret=0
+os.process.switch from=3 to=2
+os.syscall.enter pid=2 nr=93 a0=0 a1=69632 a2=5
+os.process.exit pid=2 status=0
+os.process.switch from=2 to=3
+os.syscall.enter pid=3 nr=93 a0=0 a1=69632 a2=5
+os.process.exit pid=3 status=0
+os.shutdown reason=0 detail="the run queue is empty"

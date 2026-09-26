@@ -1,0 +1,71 @@
+{
+  "schema": 1,
+  "toolchain": {
+    "distro": "Ubuntu 24.04 (noble)",
+    "packages": [
+      {
+        "name": "gcc-riscv64-unknown-elf",
+        "version": "13.2.0-11ubuntu1+12",
+        "deb_sha256": "47d4670801c391c65513e2002a19280c6bbdba158f5a467ac5100bff813de0e3",
+        "version_line": "riscv64-unknown-elf-gcc (13.2.0-11ubuntu1+12) 13.2.0"
+      },
+      {
+        "name": "binutils-riscv64-unknown-elf",
+        "version": "2.42-1ubuntu1+6",
+        "deb_sha256": "d42d42efdaa0563155d0e1263675852255b20864cc525db9265247a5dec2ce30",
+        "version_line": "GNU assembler (2.42-1ubuntu1+6) 2.42"
+      }
+    ]
+  },
+  "firmware_flags": [
+    "-march=rv32i_zicsr",
+    "-mabi=ilp32",
+    "-static",
+    "-mcmodel=medany",
+    "-fvisibility=hidden",
+    "-nostdlib",
+    "-nostartfiles",
+    "-Wl,--build-id=none",
+    "-Wl,--no-relax"
+  ],
+  "user_flags": [
+    "-march=rv32i",
+    "-mabi=ilp32",
+    "-static",
+    "-mcmodel=medany",
+    "-fvisibility=hidden",
+    "-nostdlib",
+    "-nostartfiles",
+    "-Wl,--build-id=none",
+    "-Wl,--no-relax"
+  ],
+  "ram": { "base": "0x80000000", "size": "0x01000000" },
+  "inputs": [
+    { "path": "tests/rv32/m3/badptr.S", "blake3": "7eec3042bb9113ef478c4ba3ffc5673e19c6f6c9c4ce55b0af7cc437bf9b9902" },
+    { "path": "tests/rv32/m3/build-m3.sh", "blake3": "b1b4e370bf2ca696dd1e7aeadc5e55f389032330b69842c416b51f58694e4389" },
+    { "path": "tests/rv32/m3/fault.S", "blake3": "44fa79c1931d452139b28f15b019115a1f556aa908b97dc7b32e481e238ea3f2" },
+    { "path": "tests/rv32/m3/firmware.S", "blake3": "5601035047c76e73520b9844b02d8be1e2bef6c95e05aa44b855d621258d5e45" },
+    { "path": "tests/rv32/m3/firmware.ld", "blake3": "07a57cb95370edcdaa1a935210d21c50fd43e43ad1a9a33733c3ffe196354023" },
+    { "path": "tests/rv32/m3/hello.S", "blake3": "bddd7fc3e9dc0d649f5938bb87d7c25c389b2933049e39491adf0d6cb268f40d" },
+    { "path": "tests/rv32/m3/ping.S", "blake3": "e8de31d45264316e9f42e73dcbe322a7049bd797b56ff3e5c34eca26637b5f35" },
+    { "path": "tests/rv32/m3/pong.S", "blake3": "e4700caae5cba9bfd9b9c767b23732537fdd7ea9be45cdcf05be234f45168cb9" },
+    { "path": "tests/rv32/m3/user-data.ld", "blake3": "75d61654bb59e3313963c59045952c1f909b0eedcaccbad93c79753b5871b567" },
+    { "path": "tests/rv32/m3/user.ld", "blake3": "ecff362cc98123aec3d52a22c15350ee7c4f6b2d39ecece62119ab1a88ca84f0" }
+  ],
+  "firmware": { "file": "m3-firmware.elf", "blake3": "c94800eaf70a4196d837c51181f203b6f171d15817b0cac3a65240263c4fae9e", "image_hash": "c94800eaf70a4196d837c51181f203b6f171d15817b0cac3a65240263c4fae9e", "entry": "0x80000000" },
+  "programs": [
+    { "file": "hello.elf", "blake3": "069f1768678be60c4ae510556fbe40f2e91a685f7cdf81ee4c8fc61c2c24e51a" },
+    { "file": "ping.elf", "blake3": "b91d05c4c38251cd10511c18b9b8c017dace474f05c782f42e784caff8ca2841" },
+    { "file": "pong.elf", "blake3": "8a62f0bdc1d2ef0b1a298fcc8711be29d2bfc660afca03a7e274919a2ba9d7aa" },
+    { "file": "fault.elf", "blake3": "5b934315c090701883eee4a3a6f89d9c560b7f52ac1c8f5eaf3b4b1b7582a022" },
+    { "file": "badptr.elf", "blake3": "4a314d0d90631724cbecd25bb7c8784418536afcc2a2d985b471471fbf5b4930" }
+  ],
+  "disks": [
+    { "file": "disk.img", "blocks": 256, "programs": ["hello", "ping", "pong", "fault", "badptr"], "blake3": "dfc505ed8cfe426b808db9144da28e603efec4030f2c22343b0567067d2f07d7" },
+    { "file": "disk-nofault.img", "blocks": 256, "programs": ["hello", "ping", "pong", "badptr"], "blake3": "0298232c06efbf69bb3cded2167965555ae7ce499a513c8cc0498d587f75df10" }
+  ],
+  "traces": [
+    { "file": "os-trace.txt", "blake3": "455c670eef7d19c3d133e92c3fd9d7897b441c854d054f7e8006e5b2e8865d34" },
+    { "file": "os-trace-nofault.txt", "blake3": "6e0fd00925dc1a4d72be316ccf14d8dd0fc958c2ddcf2ad0d13eab47b40b63f3" }
+  ]
+}
