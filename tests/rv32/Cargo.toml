@@ -1,6 +1,6 @@
 [package]
 name = "systemscope-rv32"
-description = "SystemScope M1 rv32ui fixtures, hello.elf, the ACT4 corpus, m2-reference and block_irq.elf, their manifests, and the runners"
+description = "SystemScope M1 rv32ui fixtures, hello.elf, the ACT4 corpus, m2-reference and block_irq.elf, m3-reference and the M3 scenario, their manifests, and the runners"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,6 +11,7 @@ blake3 = "1"
 serde_json = "1"
 systemscope-contracts.workspace = true
 systemscope-elf.workspace = true
+systemscope-os.workspace = true
 systemscope-platform.workspace = true
 systemscope-runtime.workspace = true
 systemscope-rv32i.workspace = true

@@ -508,6 +508,7 @@ dependencies = [
  "serde_json",
  "systemscope-contracts",
  "systemscope-elf",
+ "systemscope-os",
  "systemscope-platform",
  "systemscope-runtime",
  "systemscope-rv32i",

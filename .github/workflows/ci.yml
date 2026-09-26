@@ -91,7 +91,7 @@ jobs:
       # docs/m1-design.md §10.2, §10.6: the committed rv32ui ELFs and hello.elf, run from
       # the same bytes on both operating systems. No step builds anything or uses the
       # network.
-      - name: rv32ui fixtures, hello.elf, and block_irq.elf match their manifests
+      - name: rv32ui fixtures, hello.elf, block_irq.elf, and the M3 fixtures match their manifests
         run: cargo xtask rv32-fixtures verify
       - name: M1-A2 rv32ui (40 selected tests)
         run: cargo nextest run -p systemscope-rv32 --locked --profile ci --no-fail-fast --lib --test rv32ui --test fixtures
@@ -102,6 +102,14 @@ jobs:
       # handler, and determinism.
       - name: M2.8 m2-reference and block_irq.elf (builder, end to end, contention, determinism)
         run: cargo nextest run -p systemscope-rv32 --locked --profile ci --no-fail-fast --test block_irq
+      # docs/m3-design.md §11, §12, §17.3: m3-reference and the M3 scenario, end to end: the
+      # firmware, boot from the SSX0 table through the block controller by polled DMA, the
+      # five user programs in U-mode, syscalls through the trampoline and kgate, the UART
+      # output, shutdown, failure disks, determinism, and snapshot/restore through boot.
+      - name: M3.6 m3-reference and the M3 scenario (builder, end to end, failure paths, determinism, snapshots)
+        run: cargo nextest run -p systemscope-rv32 --locked --profile ci --no-fail-fast --test m3_reference
+      - name: M3.6 m3-reference verify (fixtures, both disks by §12.3, two identical runs)
+        run: cargo xtask m3-reference verify
       # docs/m1-design.md §10.4: the committed ACT4 corpus, generated with Sail on Linux by
       # the act4 job, run from the same bytes on both operating systems.
       - name: ACT4 corpus matches its manifest (pins, config, audit)
@@ -131,9 +139,9 @@ jobs:
         run: cargo nextest run -p systemscope-acceptance --locked --profile ci --no-fail-fast --test m2_golden
       - name: M2 golden verify
         run: cargo xtask m2-golden verify
-      - name: rv32ui fixtures, hello.elf, block_irq.elf, and the ACT4 corpus unchanged
+      - name: rv32ui fixtures, hello.elf, block_irq.elf, the M3 fixtures, and the ACT4 corpus unchanged
         shell: bash
-        run: git diff --exit-code -- tests/rv32/fixtures tests/rv32/hello tests/rv32/block_irq tests/act4
+        run: git diff --exit-code -- tests/rv32/fixtures tests/rv32/hello tests/rv32/block_irq tests/rv32/m3 tests/act4
       # Only `cargo xtask bless` writes golden files; a test that wrote one would show here.
       - name: Golden files unchanged
         shell: bash
@@ -235,8 +243,10 @@ jobs:
 
   # docs/m1-design.md §10.6: rebuilds the rv32ui fixtures from the pinned riscv-tests,
   # hello.elf from tests/rv32/hello, and block_irq.elf and its disk fixture from
-  # tests/rv32/block_irq (docs/m2-design.md §18), with the pinned toolchain on a clean
-  # machine, and requires the committed bytes and manifests back. The only job that installs a RISC-V toolchain or fetches riscv-tests.
+  # tests/rv32/block_irq (docs/m2-design.md §18), and the M3 firmware, user programs,
+  # disks, and expected traces from tests/rv32/m3 (docs/m3-design.md §12, §17.3), with
+  # the pinned toolchain on a clean machine, and requires the committed bytes and
+  # manifests back. The only job that installs a RISC-V toolchain or fetches riscv-tests.
   rv32-fixtures:
     name: rv32ui fixtures rebuild (Linux)
     runs-on: ubuntu-24.04

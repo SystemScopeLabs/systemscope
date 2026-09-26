@@ -6,7 +6,7 @@
 //! In [`ports()`](Component::ports) order: `gate`, a `mem.v1` target, the `kgate` window;
 //! and `mem`, a `mem.v1` initiator, the bus master `kernel0`.
 //!
-//! # Two modes
+//! # Modes
 //!
 //! - **Prototype** ([`ModeledKernel::new`]): the M3.4a gate prototype, unchanged. An
 //!   `ENTER` runs the scripted operation or the failure shutdown of [`crate::core`].
@@ -14,8 +14,12 @@
 //!   ABI of [`crate::procop`]. The first `ENTER` boots the plan's images; every later one
 //!   is a trap: a syscall, a fault, or an S-mode trap. The prototype operations never run
 //!   in this mode.
+//! - **Disk boot** ([`ModeledKernel::with_disk`]): the same process model and ABI, but the
+//!   first `ENTER` boots from the disk: the kernel reads the executable table and each
+//!   executable through the block controller and validates them itself (§8). This is
+//!   `m3-reference`'s kernel.
 //!
-//! Both share the gate, the engine, and the snapshot's first sections.
+//! All share the gate, the engine, and the snapshot's first sections.
 //!
 //! # The gate
 //!
@@ -77,14 +81,17 @@ use systemscope_contracts::snapshot::{RestoreError, SnapshotReader, SnapshotWrit
 use systemscope_contracts::topology::LinkLatency;
 use systemscope_contracts::trace::Value;
 
+use systemscope_elf::{BLOCK_SIZE, ExecEntry, ExecTable, parse_exec_table, parse_user_elf32};
+
+use crate::boot::Cursor;
 use crate::config::{KernelConfig, KernelConfigError};
 use crate::core::{Access, Completion, Op, Operation};
 use crate::frames::Frames;
-use crate::image::{PlanError, ProcessPlan, perm_bits};
+use crate::image::{BootImage, DiskBoot, MAX_PROCESSES, PlanError, ProcessPlan, perm_bits};
 use crate::process::{Context, Pcb, ProcState, Processes, perms_from_bits};
-use crate::procop::{Life, Model, Note, ProcOp, Stage};
+use crate::procop::{Life, Model, Note, ProcOp, Source, Stage};
 use crate::pte;
-use crate::space::{Region, Space, frames_needed, megapage_conflict};
+use crate::space::{Region, Space, frames_needed, megapage_conflict, region_image};
 use crate::syscall::Buffer;
 
 /// The offset of `ENTER` in the `kgate` window.
@@ -118,8 +125,8 @@ const PROC_OP_TAG: u8 = 2;
 enum Work {
     /// A prototype operation.
     Proto(Operation),
-    /// A process-mode operation.
-    Proc(ProcOp),
+    /// A process-mode operation, boxed: a disk load's stage is large.
+    Proc(Box<ProcOp>),
 }
 
 impl Work {
@@ -195,18 +202,26 @@ impl ModeledKernel {
         plan: ProcessPlan,
     ) -> Result<ModeledKernel, PlanError> {
         plan.validate(&config)?;
+        Ok(ModeledKernel::with_source(config, Source::Plan(plan)))
+    }
+
+    /// Creates a kernel that boots from disk, awaiting boot: no process, no table read
+    /// yet, an empty queue, and an all-free pool; or the first rule of
+    /// [`DiskBoot::validate`] the configuration and disk boot break.
+    pub fn with_disk(config: KernelConfig, disk: DiskBoot) -> Result<ModeledKernel, PlanError> {
+        disk.validate(&config)?;
+        Ok(ModeledKernel::with_source(config, Source::Disk(disk)))
+    }
+
+    fn with_source(config: KernelConfig, source: Source) -> ModeledKernel {
         let frames = Frames::new(config.frame_pool.base, config.frame_pool.size);
-        Ok(ModeledKernel {
+        ModeledKernel {
             config,
             state: State::Idle,
             held: None,
             next_txn: TxnId(0),
-            model: Some(Model {
-                plan,
-                procs: Processes::new(frames),
-                life: Life::AwaitBoot,
-            }),
-        })
+            model: Some(Model::new(source, Processes::new(frames))),
+        }
     }
 
     /// The configuration.
@@ -321,7 +336,7 @@ impl ModeledKernel {
                     .start(&self.config, value, &mut notes)
                     .map_err(violation)?;
                 Self::emit(notes, ctx);
-                Work::Proc(op)
+                Work::Proc(Box::new(op))
             }
             None => {
                 let op = Operation::start(&self.config, value);
@@ -435,10 +450,10 @@ impl ModeledKernel {
                     let model = self.model.as_mut().expect("a process op has a model");
                     let mut notes = Vec::new();
                     let next = model
-                        .advance(&self.config, op, &mut notes)
+                        .advance(&self.config, *op, &mut notes)
                         .map_err(violation)?;
                     Self::emit(notes, ctx);
-                    next.map(Work::Proc)
+                    next.map(|op| Work::Proc(Box::new(op)))
                 } else {
                     Some(Work::Proc(op))
                 }
@@ -527,7 +542,8 @@ impl Component for ModeledKernel {
 
     /// `phase` (`idle`, `issue`, `wait`), `op` (`none`, or the operation: `script` and
     /// `shutdown` in prototype mode, the stage `create`, `read_frame`, `walk`, `output`,
-    /// `return`, `dispatch`, or `shutdown` with processes), `step`, `held_txn` and `mem_txn` (the outstanding
+    /// `return`, `dispatch`, or `shutdown` with processes, and `blk_command`, `blk_poll`,
+    /// `blk_ack`, `read_staging`, or `load` while booting from disk), `step`, `held_txn` and `mem_txn` (the outstanding
     /// access's, `none` or the number), `next_txn`, and the due or outstanding access as
     /// `pending_kind` (`none`, `read`, `write`), `pending_addr`, and `pending_len` (0 with
     /// `none`).
@@ -615,11 +631,13 @@ impl Component for ModeledKernel {
     ///    femtoseconds or `u32` domain and `u64` cycles); the RAM and `kgate` windows
     ///    (`u64` base, `u64` size each); the trap frame (`u32`); staging, the frame pool,
     ///    and the block controller windows; UART TX (`u64`);
-    /// 2. with processes only, the plan: the marker `0xA5`; `USER_BASE`, `STACK_TOP`,
+    /// 2. with a plan only, the plan: the marker `0xA5`; `USER_BASE`, `STACK_TOP`,
     ///    `STACK_PAGES` (`u32` each); the images (count, then per image `staged`,
     ///    `file_len`, `entry`, and the segments: count, then `index` `u16`, `vaddr`,
     ///    `memsz`, permission bits `u8`, and the pages: count, then `va`, permission bits,
-    ///    and the copy as tag `u8` 0, or 1 then `file_offset`, `page_offset`, `len`);
+    ///    and the copy as tag `u8` 0, or 1 then `file_offset`, `page_offset`, `len`); with
+    ///    a disk boot only, the marker `0xD5`, `USER_BASE`, `STACK_TOP`, `STACK_PAGES`, and
+    ///    the disk capacity in blocks (`u32` each);
     /// 3. the state (`u8`: 0 `Idle`, 1 `Issue`, 2 `Wait` followed by the outstanding
     ///    `u64` txn), then, unless `Idle`, the operation: in prototype mode `u8` 0
     ///    `Script` or 1 `Shutdown`, its step (`u32`), and its working data
@@ -628,12 +646,17 @@ impl Component for ModeledKernel {
     ///    `Dispatch` with the PID and the 33 context words, 3 `Shutdown` with the
     ///    reason, 4 `Walk` with the buffer, the pages found as a count and PPNs, the
     ///    table PPN, and the level `u8`, 5 `Output` with the buffer, the pages, and the
-    ///    bytes output, 6 `Return` with `sepc` and the result; a buffer is `sepc`, `buf`,
-    ///    and `n`), its step, and its working data;
+    ///    bytes output, 6 `Return` with `sepc` and the result, 7 `Command`, 8 `Poll`, 9
+    ///    `Ack` with the cursor and then the error `u8`, 10 `Staged` with the cursor and
+    ///    then the length, 11 `Load` with the cursor, the headers (length-prefixed bytes),
+    ///    and the reserved frames; a buffer is `sepc`, `buf`, and `n`; a cursor is the
+    ///    table as tag `u8` 0, or 1 then the entries as a count and `start_lba`,
+    ///    `byte_len` pairs, then the entry index), its step, and its working data;
     /// 4. the held `ENTER` (tag `u8` 0, or 1 then the `u64` txn);
     /// 5. the next `mem` `TxnId` (`u64`);
-    /// 6. with processes only: the life (`u8`: 0 `AwaitBoot`, 1 `Up`, 2 `Down`); the
-    ///    PCBs in PID order (count, then per PCB the PID; the state `u8` 0 `Ready`, 1
+    /// 6. with processes only: the life (`u8`: 0 `AwaitBoot`, 1 `Up`, 2 `Down`); with a
+    ///    disk boot only, the number of table entries (`u32`, 0 until the table is
+    ///    validated); the PCBs in PID order (count, then per PCB the PID; the state `u8` 0 `Ready`, 1
     ///    `Running`, 2 `Exited` with the status as `u32`, 3 `Faulted` with `cause`,
     ///    `epc`, `tval`; the context as tag 0, or 1 then 33 words; the root PPN; the
     ///    table PPNs as a count and PPNs; the regions: count, then `va`, permission bits,
@@ -643,7 +666,7 @@ impl Component for ModeledKernel {
     fn snapshot(&self, w: &mut SnapshotWriter) {
         self.config.encode(w);
         if let Some(model) = &self.model {
-            model.plan.encode(w);
+            encode_source(&model.source, w);
         }
         match &self.state {
             State::Idle => w.u8(0),
@@ -704,13 +727,17 @@ impl Component for ModeledKernel {
     /// one, a shutdown that was not decided, or a syscall stage with no process running,
     /// with a buffer no `write` produces, with pages or a table that are not the running
     /// process's mapping of the buffer, or with a count of bytes output that is not where
-    /// a chunk starts.
+    /// a chunk starts. A disk boot also rejects a table count above the limit or before
+    /// boot, a live process whose regions no creation assigns, and a boot stage out of
+    /// boot, with a table the configured disk rejects or not the one counted, an entry
+    /// past it or a process at or after it, a staging read length no boot reads, or a
+    /// load whose headers do not parse or whose frames do not fit their image.
     fn restore(&mut self, r: &mut SnapshotReader<'_>, _: u32) -> Result<(), RestoreError> {
         let invalid = RestoreError::InvalidState;
         let mut config = SnapshotWriter::new();
         self.config.encode(&mut config);
         if let Some(model) = &self.model {
-            model.plan.encode(&mut config);
+            encode_source(&model.source, &mut config);
         }
         if r.raw(config.as_bytes().len())? != config.as_bytes() {
             return Err(invalid("modeled kernel: snapshot has a different config"));
@@ -740,7 +767,7 @@ impl Component for ModeledKernel {
         let next_txn = r.u64()?;
         let model = match &self.model {
             None => None,
-            Some(m) => Some(decode_model(r, &self.config, &m.plan)?),
+            Some(m) => Some(decode_model(r, &self.config, &m.source)?),
         };
         let work = match (raw_op, &model) {
             (None, _) => None,
@@ -749,9 +776,9 @@ impl Component for ModeledKernel {
                     "modeled kernel: operation step or working data not reachable",
                 ))?,
             )),
-            (Some(RawOp::Proc(stage, step, data)), Some(model)) => {
-                Some(Work::Proc(proc_op(&self.config, model, stage, step, data)?))
-            }
+            (Some(RawOp::Proc(stage, step, data)), Some(model)) => Some(Work::Proc(Box::new(
+                proc_op(&self.config, model, stage, step, data)?,
+            ))),
             _ => {
                 return Err(invalid("modeled kernel: operation of the other mode"));
             }
@@ -831,6 +858,70 @@ enum RawStage {
         sepc: u32,
         value: u32,
     },
+    Command {
+        cursor: RawCursor,
+    },
+    Poll {
+        cursor: RawCursor,
+    },
+    Ack {
+        cursor: RawCursor,
+        error: u8,
+    },
+    Staged {
+        cursor: RawCursor,
+        len: u32,
+    },
+    Load {
+        cursor: RawCursor,
+        headers: Vec<u8>,
+        frames: Vec<u32>,
+    },
+}
+
+/// A decoded cursor before it is checked: the table's entries, if read, and the index.
+type RawCursor = (Option<Vec<ExecEntry>>, u32);
+
+fn encode_source(source: &Source, w: &mut SnapshotWriter) {
+    match source {
+        Source::Plan(plan) => plan.encode(w),
+        Source::Disk(disk) => disk.encode(w),
+    }
+}
+
+fn encode_cursor(c: &Cursor, w: &mut SnapshotWriter) {
+    match &c.table {
+        None => w.u8(0),
+        Some(t) => {
+            w.u8(1);
+            w.len(t.entries.len());
+            for e in &t.entries {
+                w.u32(e.start_lba);
+                w.u32(e.byte_len);
+            }
+        }
+    }
+    w.u32(c.index as u32);
+}
+
+fn decode_cursor(r: &mut SnapshotReader<'_>) -> Result<RawCursor, RestoreError> {
+    let table = match r.u8()? {
+        0 => None,
+        1 => {
+            let n = count(r, 8)?;
+            let entries = (0..n)
+                .map(|_| {
+                    Ok(ExecEntry {
+                        start_lba: r.u32()?,
+                        byte_len: r.u32()?,
+                    })
+                })
+                .collect::<Result<Vec<_>, RestoreError>>()?;
+            Some(entries)
+        }
+        tag => return Err(bad_tag("modeled kernel boot table", tag)),
+    };
+    Ok((table, r.u32()?))
 }
 
 fn encode_buffer(b: &Buffer, w: &mut SnapshotWriter) {
@@ -927,6 +1018,35 @@ fn encode_stage(stage: &Stage, w: &mut SnapshotWriter) {
             w.u32(*sepc);
             w.u32(*value);
         }
+        Stage::Command { cursor } => {
+            w.u8(7);
+            encode_cursor(cursor, w);
+        }
+        Stage::Poll { cursor } => {
+            w.u8(8);
+            encode_cursor(cursor, w);
+        }
+        Stage::Ack { cursor, error } => {
+            w.u8(9);
+            encode_cursor(cursor, w);
+            w.u8(*error);
+        }
+        Stage::Staged { cursor, len } => {
+            w.u8(10);
+            encode_cursor(cursor, w);
+            w.u32(*len);
+        }
+        Stage::Load {
+            cursor,
+            headers,
+            space,
+            ..
+        } => {
+            w.u8(11);
+            encode_cursor(cursor, w);
+            w.bytes(headers);
+            encode_ppns(space.frames(), w);
+        }
     }
 }
 
@@ -971,6 +1091,25 @@ fn decode_op(r: &mut SnapshotReader<'_>) -> Result<RawOp, RestoreError> {
                 sepc: r.u32()?,
                 value: r.u32()?,
             },
+            7 => RawStage::Command {
+                cursor: decode_cursor(r)?,
+            },
+            8 => RawStage::Poll {
+                cursor: decode_cursor(r)?,
+            },
+            9 => RawStage::Ack {
+                cursor: decode_cursor(r)?,
+                error: r.u8()?,
+            },
+            10 => RawStage::Staged {
+                cursor: decode_cursor(r)?,
+                len: r.u32()?,
+            },
+            11 => RawStage::Load {
+                cursor: decode_cursor(r)?,
+                headers: r.bytes()?.to_vec(),
+                frames: decode_ppns(r)?,
+            },
             tag => {
                 return Err(RestoreError::Decode(DecodeError::InvalidTag {
                     what: "modeled kernel stage",
@@ -994,6 +1133,9 @@ fn encode_model(model: &Model, w: &mut SnapshotWriter) {
         Life::Up => 1,
         Life::Down => 2,
     });
+    if let Source::Disk(_) = model.source {
+        w.u32(model.entries as u32);
+    }
     let procs = &model.procs;
     w.len(procs.pcbs().len());
     for p in procs.pcbs() {
@@ -1050,7 +1192,7 @@ fn bad_tag(what: &'static str, tag: u8) -> RestoreError {
 fn decode_model(
     r: &mut SnapshotReader<'_>,
     config: &KernelConfig,
-    plan: &ProcessPlan,
+    source: &Source,
 ) -> Result<Model, RestoreError> {
     let invalid = RestoreError::InvalidState;
     let life = match r.u8()? {
@@ -1058,6 +1200,18 @@ fn decode_model(
         1 => Life::Up,
         2 => Life::Down,
         tag => return Err(bad_tag("modeled kernel life", tag)),
+    };
+    let entries = match source {
+        Source::Plan(plan) => plan.images.len(),
+        Source::Disk(_) => {
+            let n = r.u32()? as usize;
+            if n > MAX_PROCESSES || (life == Life::AwaitBoot && n != 0) {
+                return Err(invalid(
+                    "modeled kernel: a table count above the limit or before boot",
+                ));
+            }
+            n
+        }
     };
     let n = count(r, 4)?;
     let mut pcbs = Vec::with_capacity(n);
@@ -1138,6 +1292,16 @@ fn decode_model(
         if p.state.is_terminal() {
             continue;
         }
+        let Source::Plan(plan) = source else {
+            if disk_space(config, source, p).is_none_or(|space| {
+                space.root != p.root || space.tables != p.tables || space.regions != p.regions
+            }) {
+                return Err(invalid(
+                    "modeled kernel: a process's tables or regions are not a creation's",
+                ));
+            }
+            continue;
+        };
         let Some(boot) = p
             .pid
             .checked_sub(1)
@@ -1162,7 +1326,8 @@ fn decode_model(
         }
     }
     Ok(Model {
-        plan: plan.clone(),
+        source: source.clone(),
+        entries,
         procs: Processes::from_parts(
             pcbs,
             queue,
@@ -1170,6 +1335,72 @@ fn decode_model(
             Frames::from_owners(pool.base(), owners),
         ),
         life,
+    })
+}
+
+/// For a disk boot, the address space the image `pcb`'s regions describe builds in its
+/// frames (§6.8: the kernel keeps no image after boot); `None` if no creation could have
+/// assigned them.
+fn disk_space(config: &KernelConfig, source: &Source, pcb: &Pcb) -> Option<Space> {
+    let layout = source.layout();
+    let boot = BootImage {
+        staged: config.staging.base as u32,
+        file_len: 0,
+        image: region_image(&pcb.regions, layout)?,
+    };
+    let mut frames = pcb.frames();
+    frames.sort_unstable();
+    (frames.len() == frames_needed(&boot.image, layout) && !megapage_conflict(&boot.image, config))
+        .then(|| Space::build(config, layout, &boot, &frames))
+}
+
+/// Checks a decoded disk boot cursor against the restored model: a boot in progress,
+/// nothing running; block 0 only before the table is counted; else a table the configured
+/// disk accepts, the one counted, an entry in it, and no process at or after it.
+fn boot_cursor(
+    config: &KernelConfig,
+    model: &Model,
+    (entries, index): RawCursor,
+) -> Result<Cursor, RestoreError> {
+    let invalid = RestoreError::InvalidState;
+    let Source::Disk(disk) = &model.source else {
+        return Err(invalid("modeled kernel: a disk boot stage without a disk"));
+    };
+    let procs = &model.procs;
+    if model.life != Life::Up || procs.current().is_some() {
+        return Err(invalid("modeled kernel: a disk boot stage out of boot"));
+    }
+    let index = index as usize;
+    let Some(entries) = entries else {
+        if index != 0 || model.entries != 0 {
+            return Err(invalid(
+                "modeled kernel: a block 0 read after the table was counted",
+            ));
+        }
+        return Ok(Cursor::table());
+    };
+    let table = ExecTable { entries };
+    let staging = DiskBoot::staging_size(config);
+    let valid = table
+        .encode()
+        .ok()
+        .and_then(|block| parse_exec_table(&block, disk.capacity_blocks, staging).ok());
+    if valid.as_ref() != Some(&table)
+        || model.entries != table.entries.len()
+        || index >= table.entries.len()
+    {
+        return Err(invalid(
+            "modeled kernel: a disk boot stage with a table no boot validated",
+        ));
+    }
+    if procs.pcbs().iter().any(|p| p.pid as usize > index) {
+        return Err(invalid(
+            "modeled kernel: a disk boot stage out of boot order",
+        ));
+    }
+    Ok(Cursor {
+        table: Some(table),
+        index,
     })
 }
 
@@ -1186,10 +1417,10 @@ fn proc_op(
     let procs = &model.procs;
     let stage = match stage {
         RawStage::Create { pid, frames } => {
-            let Some(boot) = pid
-                .checked_sub(1)
-                .and_then(|i| model.plan.images.get(i as usize))
-            else {
+            let Source::Plan(plan) = &model.source else {
+                return Err(invalid("modeled kernel: a plan creation without a plan"));
+            };
+            let Some(boot) = pid.checked_sub(1).and_then(|i| plan.images.get(i as usize)) else {
                 return Err(invalid(
                     "modeled kernel: creation of a PID outside the plan",
                 ));
@@ -1202,7 +1433,7 @@ fn proc_op(
             }
             let ascending = frames.windows(2).all(|w| w[0] < w[1]);
             if !ascending
-                || frames.len() != frames_needed(&boot.image, &model.plan.layout)
+                || frames.len() != frames_needed(&boot.image, &plan.layout)
                 || megapage_conflict(&boot.image, config)
             {
                 return Err(invalid(
@@ -1211,7 +1442,59 @@ fn proc_op(
             }
             Stage::Create {
                 pid,
-                space: Space::build(config, &model.plan.layout, boot, &frames),
+                space: Space::build(config, &plan.layout, boot, &frames),
+            }
+        }
+        RawStage::Command { cursor } => Stage::Command {
+            cursor: boot_cursor(config, model, cursor)?,
+        },
+        RawStage::Poll { cursor } => Stage::Poll {
+            cursor: boot_cursor(config, model, cursor)?,
+        },
+        RawStage::Ack { cursor, error } => Stage::Ack {
+            cursor: boot_cursor(config, model, cursor)?,
+            error,
+        },
+        RawStage::Staged { cursor, len } => {
+            let cursor = boot_cursor(config, model, cursor)?;
+            let reachable = match cursor.entry() {
+                None => len == BLOCK_SIZE as u32,
+                Some(e) => (cursor.first_read()..=e.byte_len).contains(&len),
+            };
+            if !reachable {
+                return Err(invalid("modeled kernel: a staging read no boot makes"));
+            }
+            Stage::Staged { cursor, len }
+        }
+        RawStage::Load {
+            cursor,
+            headers,
+            frames,
+        } => {
+            let cursor = boot_cursor(config, model, cursor)?;
+            let (Some(entry), Source::Disk(disk)) = (cursor.entry(), &model.source) else {
+                return Err(invalid("modeled kernel: a load before the table"));
+            };
+            let image = parse_user_elf32(&headers, entry.byte_len, disk.layout.image_range())
+                .map_err(|_| invalid("modeled kernel: a load whose headers do not parse"))?;
+            let ascending = frames.windows(2).all(|w| w[0] < w[1]);
+            if !ascending
+                || frames.len() != frames_needed(&image, &disk.layout)
+                || megapage_conflict(&image, config)
+            {
+                return Err(invalid("modeled kernel: load frames do not fit the image"));
+            }
+            let boot = BootImage {
+                staged: config.staging.base as u32,
+                file_len: entry.byte_len,
+                image,
+            };
+            let space = Space::build(config, &disk.layout, &boot, &frames);
+            Stage::Load {
+                cursor,
+                headers,
+                image: boot.image,
+                space,
             }
         }
         RawStage::ReadFrame => {
@@ -1298,8 +1581,9 @@ fn proc_op(
 }
 
 /// For a `write` stage: the buffer, which must be one a `write` produces; the running
-/// process's address space, rebuilt from its image; and the physical page of each buffer
-/// page from the first, as far as the pages are mapped readable.
+/// process's address space, rebuilt from its image (for a disk boot, the one its regions
+/// describe); and the physical page of each buffer page from the first, as far as the
+/// pages are mapped readable.
 fn syscall_space(
     config: &KernelConfig,
     model: &Model,
@@ -1314,10 +1598,16 @@ fn syscall_space(
         .ok_or(invalid("modeled kernel: a write with no process running"))?;
     let buffer = Buffer::new(sepc, buf, n)
         .ok_or(invalid("modeled kernel: a write buffer no write produces"))?;
-    let boot = &model.plan.images[pcb.pid as usize - 1];
-    let mut frames = pcb.frames();
-    frames.sort_unstable();
-    let space = Space::build(config, &model.plan.layout, boot, &frames);
+    let space = match &model.source {
+        Source::Plan(plan) => {
+            let boot = &plan.images[pcb.pid as usize - 1];
+            let mut frames = pcb.frames();
+            frames.sort_unstable();
+            Space::build(config, &plan.layout, boot, &frames)
+        }
+        Source::Disk(_) => disk_space(config, &model.source, pcb)
+            .ok_or(invalid("modeled kernel: a write with no process running"))?,
+    };
     let expected = (0..buffer.pages())
         .map_while(|i| {
             let va = buffer.page_va(i);
@@ -1339,6 +1629,7 @@ fn check_life(model: &mut Model, work: Option<&Work>) -> Result<(), RestoreError
     let creating = match work {
         Some(Work::Proc(op)) => match op.stage() {
             Stage::Create { pid, space } => Some((*pid, space.frames())),
+            Stage::Load { cursor, space, .. } => Some((cursor.pid(), space.frames())),
             _ => None,
         },
         _ => None,
@@ -1387,7 +1678,7 @@ fn check_life(model: &mut Model, work: Option<&Work>) -> Result<(), RestoreError
         Frames::from_owners(base, owners),
     );
     checked
-        .check(model.plan.images.len(), creating)
+        .check(model.entries, creating)
         .map_err(|v| invalid(v.0))?;
     match (model.life, work) {
         (Life::AwaitBoot, Some(_)) => {

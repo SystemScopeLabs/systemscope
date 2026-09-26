@@ -11,17 +11,20 @@
 //! - [`core`] is the M3.4a prototype core: the scripted gate operation and the shutdown
 //!   for a bad `ENTER` value.
 //! - [`image`], [`frames`], [`space`], [`pte`], and [`process`] are the process model:
-//!   validated boot images, the frame pool, address spaces, PTE encoding, and the PCBs
-//!   and run queue.
+//!   the process sources (staged images or a boot disk), the frame pool, address spaces,
+//!   PTE encoding, and the PCBs and run queue.
 //! - [`syscall`] is the syscall ABI (§6.5) and the kernel's user-copy walk.
+//! - [`boot`] is booting from disk: the block controller registers the kernel drives and
+//!   where boot is on the disk.
 //! - [`procop`] is the process-mode pure core: boot, traps, syscalls, dispatch, and
 //!   shutdown as chains of bus accesses.
 //! - [`kernel`] is the component: the held entry, the Issue/Wait engine, its snapshot
 //!   (schema 1), inspect, and trace.
 //!
 //! Like the platform components, it depends only on `systemscope-contracts`, plus the
-//! pure `systemscope-elf` types of the validated images it is given.
+//! pure `systemscope-elf` parsers and types of the executables it loads.
 
+pub mod boot;
 pub mod config;
 pub mod core;
 pub mod frames;
@@ -34,5 +37,5 @@ pub mod space;
 pub mod syscall;
 
 pub use config::{KernelConfig, KernelConfigError, Window};
-pub use image::{BootImage, PlanError, ProcessPlan, UserLayout};
+pub use image::{BootImage, DiskBoot, PlanError, ProcessPlan, UserLayout};
 pub use kernel::ModeledKernel;

@@ -25,11 +25,11 @@
 //! Every frame is therefore written before any PTE points at it, and every level-0
 //! table is complete before the level-1 entry that points at it (§8.3).
 
-use systemscope_elf::{Perms, UserImage};
+use systemscope_elf::{PagePlan, Perms, UserImage, UserSegment};
 
 use crate::config::KernelConfig;
 use crate::core::{Access, MAX_ACCESS, PAGE};
-use crate::image::{BootImage, MMIO_MEGAPAGE, UserLayout, kernel_megapage, vpn1};
+use crate::image::{BootImage, MMIO_MEGAPAGE, UserLayout, kernel_megapage, valid_perms, vpn1};
 use crate::pte;
 
 /// The stack's permissions: read and write.
@@ -92,6 +92,54 @@ pub fn megapage_conflict(image: &UserImage, config: &KernelConfig) -> bool {
         .iter()
         .flat_map(|s| &s.pages)
         .any(|p| slots.contains(&vpn1(u64::from(p.va))))
+}
+
+/// The image a live process's segment regions describe, with no file bytes: what a
+/// restored process is checked against by a kernel that no longer holds the image it was
+/// built from (a disk boot keeps no executable after boot, §6.8). Building it in the
+/// process's frames gives the process's tables and regions exactly when they are those a
+/// creation assigns. `None` if the regions cannot be a process's: no segment region before
+/// the stack, a region with no frame or with invalid permissions, or a page that is
+/// misplaced, outside the image range, out of order, or shared.
+pub fn region_image(regions: &[Region], layout: &UserLayout) -> Option<UserImage> {
+    let (_, segments) = regions.split_last()?;
+    let first = segments.first()?;
+    let range = layout.image_range();
+    let page = PAGE as u32;
+    let mut last: Option<u32> = None;
+    let mut out = Vec::with_capacity(segments.len());
+    for (i, r) in segments.iter().enumerate() {
+        if r.frames.is_empty() || !valid_perms(r.perms) {
+            return None;
+        }
+        let mut pages = Vec::with_capacity(r.frames.len());
+        for k in 0..r.frames.len() {
+            let va = u32::try_from(k)
+                .ok()
+                .and_then(|k| k.checked_mul(page))
+                .and_then(|off| r.va.checked_add(off))?;
+            if !va.is_multiple_of(page) || !range.contains(&va) || last.is_some_and(|l| va <= l) {
+                return None;
+            }
+            last = Some(va);
+            pages.push(PagePlan {
+                va,
+                perms: r.perms,
+                copy: None,
+            });
+        }
+        out.push(UserSegment {
+            index: u16::try_from(i).ok()?,
+            vaddr: r.va,
+            memsz: u32::try_from(pages.len()).ok()?.checked_mul(page)?,
+            perms: r.perms,
+            pages,
+        });
+    }
+    Some(UserImage {
+        entry: first.va,
+        segments: out,
+    })
 }
 
 /// A process's address space: its frames and the creation's accesses.

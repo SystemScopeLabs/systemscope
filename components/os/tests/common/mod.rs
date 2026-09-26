@@ -10,6 +10,7 @@
 
 #![allow(dead_code)]
 
+pub mod disk;
 pub mod platform;
 pub mod procs;
 

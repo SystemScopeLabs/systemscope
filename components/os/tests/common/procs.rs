@@ -22,8 +22,9 @@ use systemscope_contracts::time::ClockDomainId;
 use systemscope_contracts::trace::Value;
 use systemscope_elf::parse_user_elf32;
 use systemscope_os::kernel::{GATE_PORT, ISSUE, MEM_PORT};
-use systemscope_os::{BootImage, KernelConfig, ModeledKernel, ProcessPlan, UserLayout};
+use systemscope_os::{BootImage, DiskBoot, KernelConfig, ModeledKernel, ProcessPlan, UserLayout};
 
+use super::disk::MockBlk;
 use super::layout::*;
 use super::{MockCtx, Traced};
 
@@ -269,6 +270,9 @@ pub fn l1_entry(mem: &PageMem, root_ppn: u32, va: u32) -> u32 {
 /// The downstream txn the bus gave every `ENTER` in harness tests.
 pub const HELD: TxnId = TxnId(500);
 pub const CLOCK: ClockDomainId = ClockDomainId(3);
+/// The accesses a harness operation may take: far more than any test's, so a kernel that
+/// never releases fails the test instead of hanging it.
+pub const MAX_OP_ACCESSES: usize = 100_000;
 
 pub fn config() -> KernelConfig {
     super::layout::config(CLOCK)
@@ -297,6 +301,8 @@ pub struct Harness {
     pub seen: Vec<Seen>,
     /// The request sent and not yet answered.
     pub pending: Option<MemMsg>,
+    /// The block controller behind `blk`, for a kernel that boots from disk.
+    pub blk: Option<MockBlk>,
 }
 
 /// Where an operation stopped.
@@ -320,7 +326,27 @@ impl Harness {
             next_txn: 0,
             seen: Vec::new(),
             pending: None,
+            blk: None,
         }
+    }
+
+    /// A harness for a kernel that boots from `blk`'s disk as `boot` says.
+    pub fn with_disk(config: KernelConfig, boot: DiskBoot, blk: MockBlk) -> Harness {
+        Harness {
+            k: ModeledKernel::with_disk(config, boot).unwrap(),
+            ctx: MockCtx::new(),
+            mem: PageMem::default(),
+            next_txn: 0,
+            seen: Vec::new(),
+            pending: None,
+            blk: Some(blk),
+        }
+    }
+
+    /// The block controller register `addr` names, if it is in the controller's window.
+    fn blk_register(&self, addr: u64) -> Option<u64> {
+        let w = self.k.config().blk;
+        (self.blk.is_some() && addr >= w.base && addr < w.base + w.size).then(|| addr - w.base)
     }
 
     /// Delivers `ENTER` of `value`.
@@ -367,7 +393,14 @@ impl Harness {
         let req = self.pending.take().expect("a request is pending");
         let resp = match &req {
             MemMsg::ReadReq { txn, addr, len } => {
-                let data = self.mem.read(*addr, *len as usize);
+                let data = match self.blk_register(*addr) {
+                    Some(reg) if !fault => {
+                        let blk = self.blk.as_mut().unwrap();
+                        blk.read(reg, *len as usize, &mut self.mem)
+                    }
+                    Some(_) => vec![0; *len as usize],
+                    None => self.mem.read(*addr, *len as usize),
+                };
                 self.seen.push((false, *addr, data.clone()));
                 MemMsg::ReadResp {
                     txn: *txn,
@@ -383,7 +416,10 @@ impl Harness {
             MemMsg::WriteReq { txn, addr, data } => {
                 self.seen.push((true, *addr, data.clone()));
                 if !fault {
-                    self.mem.write(*addr, data);
+                    match self.blk_register(*addr) {
+                        Some(reg) => self.blk.as_mut().unwrap().write(reg, data),
+                        None => self.mem.write(*addr, data),
+                    }
                 }
                 MemMsg::WriteResp {
                     txn: *txn,
@@ -428,7 +464,7 @@ impl Harness {
         if let Err(e) = self.enter(value) {
             return Stop::Fault(e);
         }
-        for i in 0.. {
+        for i in 0..MAX_OP_ACCESSES {
             if let Err(e) = self.issue() {
                 return Stop::Fault(e);
             }
@@ -438,7 +474,7 @@ impl Harness {
                 Ok(false) => {}
             }
         }
-        unreachable!()
+        panic!("the operation did not end within {MAX_OP_ACCESSES} accesses")
     }
 
     /// Boots: the first `ENTER`, to its release.
@@ -624,6 +660,59 @@ pub mod ksnap {
             sepc: u32,
             value: u32,
         },
+        Command {
+            cursor: Cursor,
+        },
+        Poll {
+            cursor: Cursor,
+        },
+        Ack {
+            cursor: Cursor,
+            error: u8,
+        },
+        Staged {
+            cursor: Cursor,
+            len: u32,
+        },
+        Load {
+            cursor: Cursor,
+            headers: Vec<u8>,
+            frames: Vec<u32>,
+        },
+    }
+
+    /// A boot cursor: the table's `(start_lba, byte_len)` entries once read, and the
+    /// entry index.
+    pub type Cursor = (Option<Vec<(u32, u32)>>, u32);
+
+    fn cursor(d: &mut Decoder<'_>) -> Result<Cursor, DecodeError> {
+        let table = match d.u8()? {
+            0 => None,
+            _ => {
+                let n = d.len()?;
+                Some(
+                    (0..n)
+                        .map(|_| Ok((d.u32()?, d.u32()?)))
+                        .collect::<Result<_, _>>()?,
+                )
+            }
+        };
+        Ok((table, d.u32()?))
+    }
+
+    fn put_cursor(e: &mut Encoder, (table, index): &Cursor) {
+        match table {
+            None => e.u8(0),
+            Some(t) => {
+                e.u8(1);
+                e.len(t.len());
+                for &(lba, len) in t {
+                    e.u32(lba);
+                    e.u32(len);
+                }
+            }
+        }
+        e.u32(*index);
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -654,6 +743,8 @@ pub mod ksnap {
         pub held: Option<u64>,
         pub next_txn: u64,
         pub life: u8,
+        /// A disk kernel's table entry count; `None` for a kernel with a plan.
+        pub entries: Option<u32>,
         pub pcbs: Vec<Pcb>,
         pub queue: Vec<u32>,
         pub current: Option<u32>,
@@ -681,6 +772,15 @@ pub mod ksnap {
     impl Snap {
         /// Decodes `bytes`, whose first `prefix` bytes are the configuration and plan.
         pub fn decode(bytes: &[u8], prefix: usize) -> Result<Snap, DecodeError> {
+            Snap::decode_in(bytes, prefix, false)
+        }
+
+        /// [`Snap::decode`] for a kernel that boots from disk.
+        pub fn decode_disk(bytes: &[u8], prefix: usize) -> Result<Snap, DecodeError> {
+            Snap::decode_in(bytes, prefix, true)
+        }
+
+        fn decode_in(bytes: &[u8], prefix: usize, disk: bool) -> Result<Snap, DecodeError> {
             let mut d = Decoder::new(bytes);
             let pre = d.raw(prefix)?.to_vec();
             let state = d.u8()?;
@@ -715,6 +815,25 @@ pub mod ksnap {
                         sepc: d.u32()?,
                         value: d.u32()?,
                     },
+                    7 => Stage::Command {
+                        cursor: cursor(&mut d)?,
+                    },
+                    8 => Stage::Poll {
+                        cursor: cursor(&mut d)?,
+                    },
+                    9 => Stage::Ack {
+                        cursor: cursor(&mut d)?,
+                        error: d.u8()?,
+                    },
+                    10 => Stage::Staged {
+                        cursor: cursor(&mut d)?,
+                        len: d.u32()?,
+                    },
+                    11 => Stage::Load {
+                        cursor: cursor(&mut d)?,
+                        headers: d.bytes()?.to_vec(),
+                        frames: words(&mut d)?,
+                    },
                     t => panic!("stage {t}"),
                 };
                 Some(Op {
@@ -726,6 +845,7 @@ pub mod ksnap {
             let held = if d.u8()? == 1 { Some(d.u64()?) } else { None };
             let next_txn = d.u64()?;
             let life = d.u8()?;
+            let entries = if disk { Some(d.u32()?) } else { None };
             let mut pcbs = Vec::new();
             for _ in 0..d.len()? {
                 let pid = d.u32()?;
@@ -766,6 +886,7 @@ pub mod ksnap {
                 held,
                 next_txn,
                 life,
+                entries,
                 pcbs,
                 queue,
                 current,
@@ -827,6 +948,34 @@ pub mod ksnap {
                         e.u32(*sepc);
                         e.u32(*value);
                     }
+                    Stage::Command { cursor } => {
+                        e.u8(7);
+                        put_cursor(&mut e, cursor);
+                    }
+                    Stage::Poll { cursor } => {
+                        e.u8(8);
+                        put_cursor(&mut e, cursor);
+                    }
+                    Stage::Ack { cursor, error } => {
+                        e.u8(9);
+                        put_cursor(&mut e, cursor);
+                        e.u8(*error);
+                    }
+                    Stage::Staged { cursor, len } => {
+                        e.u8(10);
+                        put_cursor(&mut e, cursor);
+                        e.u32(*len);
+                    }
+                    Stage::Load {
+                        cursor,
+                        headers,
+                        frames,
+                    } => {
+                        e.u8(11);
+                        put_cursor(&mut e, cursor);
+                        e.bytes(headers);
+                        put_words(&mut e, frames);
+                    }
                 }
                 e.u32(op.step);
                 e.bytes(&op.data);
@@ -840,6 +989,9 @@ pub mod ksnap {
             }
             e.u64(self.next_txn);
             e.u8(self.life);
+            if let Some(n) = self.entries {
+                e.u32(n);
+            }
             e.len(self.pcbs.len());
             for p in &self.pcbs {
                 e.u32(p.pid);

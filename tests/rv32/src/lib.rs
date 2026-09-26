@@ -35,6 +35,12 @@
 //! - [`block_irq`] is `block_irq.elf` (§12), built from `block_irq/block_irq.S` with the
 //!   same toolchain, with its disk fixture, pinned by `block_irq/manifest.json`, and run on
 //!   `m2-reference`.
+//! - [`m3ref`] builds `m3-reference`, the M3 reference platform (`docs/m3-design.md`
+//!   §11): the `M2` platform with the M3 CPU, the `kgate` window, and the modeled kernel
+//!   booting from the disk, plus the deterministic storage image with its `SSX0` table.
+//! - [`m3`] is the M3 scenario (§12, §17.3): `m3-firmware.elf` and the five user
+//!   programs, built from `m3/*.S` by `m3/build-m3.sh`, the disks and expected `os.*`
+//!   traces, pinned by `m3/manifest.json`, and the §12.3 judge and metrics.
 //!
 //! Tests only read the committed fixtures. `cargo xtask rv32-fixtures build` rebuilds
 //! them on Linux, and `cargo xtask rv32-fixtures verify` checks them without a network or
@@ -47,6 +53,8 @@ pub mod block_irq;
 pub mod csrgen;
 pub mod hello;
 pub mod m2ref;
+pub mod m3;
+pub mod m3ref;
 pub mod manifest;
 pub mod privgen;
 pub mod progen;

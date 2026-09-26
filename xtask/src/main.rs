@@ -19,15 +19,27 @@
 //!   40 `rv32ui` fixtures from the pinned `riscv-tests` with `tests/rv32/build-fixtures.sh`
 //!   (the only step that uses the network), `hello.elf` with
 //!   `tests/rv32/hello/build-hello.sh`, and `block_irq.elf` with
-//!   `tests/rv32/block_irq/build-block-irq.sh`, then runs the `manifest` step. Tests never
+//!   `tests/rv32/block_irq/build-block-irq.sh`, and the M3 firmware and user programs
+//!   with `tests/rv32/m3/build-m3.sh`, then runs the `manifest` step. Tests never
 //!   rebuild fixtures; the commit that changes them must say why in its body.
 //! - `rv32-fixtures manifest [<cache-dir>]`: the second half of `build`, for a build run
 //!   by hand. Checks the upstream checkout in the cache (default `target/rv32-fixtures`),
 //!   rewrites `tests/rv32/fixtures/manifest.json` and `tests/rv32/hello/manifest.json`,
 //!   writes the `block_irq.elf` disk fixture `tests/rv32/block_irq/disk.img` and rewrites
-//!   `tests/rv32/block_irq/manifest.json`, and verifies.
+//!   `tests/rv32/block_irq/manifest.json`, runs the `m3-reference manifest` step, and
+//!   verifies.
 //! - `rv32-fixtures verify`: checks the committed fixtures, `hello.elf`, `block_irq.elf`,
-//!   and its disk fixture against their manifests, with no network and no compiler.
+//!   and its disk fixture, and the M3 fixtures against their manifests, with no network
+//!   and no compiler.
+//! - `m3-reference manifest`: the M3 half of `rv32-fixtures manifest`, which needs no
+//!   compiler and no upstream checkout: writes the M3 disks `tests/rv32/m3/disk.img` and
+//!   `disk-nofault.img` from the committed user ELFs, runs each on `m3-reference` and,
+//!   if the run passes every other §12.3 check, writes its expected `os.*` trace, then
+//!   rewrites `tests/rv32/m3/manifest.json` and verifies.
+//! - `m3-reference run`: runs both M3 disks on `m3-reference`, judges each by §12.3, and
+//!   prints the output and the metrics.
+//! - `m3-reference verify`: `rv32-fixtures verify` for the M3 fixtures, then `run`, then
+//!   a second run of each disk, whose digests must equal the first's.
 //! - `spike build [<dir>]`: Linux only, with git, a C++ compiler, make, and dtc. Fetches
 //!   and builds the pinned Spike into `<dir>` (default `target/spike`) with
 //!   `tests/rv32/build-spike.sh`, then runs `verify`.
@@ -75,8 +87,10 @@ use systemscope_rv32::block_irq::{
     self, BLOCK_IRQ_DIR, BLOCK_IRQ_MANIFEST, BLOCK_IRQ_SCRIPT, BlockIrqManifest,
 };
 use systemscope_rv32::hello::{self, HELLO_DIR, HELLO_MANIFEST, HELLO_SCRIPT, HelloManifest};
+use systemscope_rv32::m3::{self, M3_DIR, M3_MANIFEST, M3_SCRIPT, M3Manifest, Metrics, Scenario};
 use systemscope_rv32::manifest::{Manifest, verify};
 use systemscope_rv32::progen::{self, FIXED_SEEDS, MISALIGNED};
+use systemscope_rv32::runner::Start;
 use systemscope_rv32::spike::{
     self, DiffReport, SPIKE_COMMIT, SPIKE_DIR, SPIKE_ISA_M2, SPIKE_LOGS, SPIKE_PRIV_M3,
     SPIKE_SCRIPT,
@@ -121,6 +135,9 @@ fn main() -> ExitCode {
         ["rv32-fixtures", "manifest"] => rv32_manifest(&root().join(RV32_CACHE)),
         ["rv32-fixtures", "manifest", cache] => rv32_manifest(Path::new(cache)),
         ["rv32-fixtures", "verify"] => rv32_verify(),
+        ["m3-reference", "manifest"] => m3_manifest(),
+        ["m3-reference", "run"] => m3_run(),
+        ["m3-reference", "verify"] => m3_verify(),
         ["act4", "build"] => act4_build(&root().join(ACT4_CACHE)),
         ["act4", "build", cache] => act4_build(Path::new(cache)),
         ["act4", "install", out] => act4_install(Path::new(out)),
@@ -447,6 +464,7 @@ fn rv32_build() -> ExitCode {
         (BUILD_SCRIPT, rv32ui),
         (HELLO_SCRIPT, vec![RV32_CACHE, HELLO_DIR]),
         (BLOCK_IRQ_SCRIPT, vec![RV32_CACHE, BLOCK_IRQ_DIR]),
+        (M3_SCRIPT, vec![RV32_CACHE, M3_DIR]),
     ] {
         match Command::new("bash")
             .arg(script)
@@ -527,6 +545,10 @@ fn rv32_manifest(cache: &Path) -> ExitCode {
     } else {
         println!("wrote {BLOCK_IRQ_MANIFEST}");
     }
+    if let Err(e) = m3_write(&root) {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
     match &old {
         None => println!("wrote a new {MANIFEST_PATH}"),
         Some(old) => {
@@ -592,11 +614,125 @@ fn rv32_verify() -> ExitCode {
             }
         }
     }
+    ok &= m3_verify_fixtures(&root);
     if ok {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// Writes the M3 disks, their expected traces, and the M3 manifest under `root`.
+fn m3_write(root: &Path) -> Result<(), String> {
+    m3::write_disks(root).map_err(|e| format!("cannot write the M3 disks: {e}"))?;
+    eprintln!("running the M3 disks on m3-reference...");
+    m3::write_traces(root).map_err(|e| format!("cannot write the M3 traces: {e}"))?;
+    let old = M3Manifest::read(root).ok();
+    let new =
+        M3Manifest::generate(root).map_err(|e| format!("cannot generate the M3 manifest: {e}"))?;
+    fs::write(root.join(M3_MANIFEST), new.render())
+        .map_err(|e| format!("cannot write {M3_MANIFEST}: {e}"))?;
+    if old.as_ref() == Some(&new) {
+        println!("{M3_MANIFEST} is up to date");
+    } else {
+        println!("wrote {M3_MANIFEST}");
+    }
+    Ok(())
+}
+
+fn m3_verify_fixtures(root: &Path) -> bool {
+    match m3::verify(root) {
+        Ok(manifest) => {
+            println!(
+                "{}, {} user programs, {} disks, and {} traces match {M3_MANIFEST}",
+                manifest.firmware.file,
+                manifest.programs.len(),
+                manifest.disks.len(),
+                manifest.traces.len()
+            );
+            true
+        }
+        Err(errors) => {
+            eprintln!("the M3 fixtures do not match {M3_MANIFEST}:");
+            for e in errors {
+                eprintln!("  {e}");
+            }
+            false
+        }
+    }
+}
+
+fn m3_manifest() -> ExitCode {
+    let root = root();
+    if let Err(e) = m3_write(&root) {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
+    if m3_verify_fixtures(&root) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// Runs and judges every M3 disk; returns each one's metrics, or `None` if one failed.
+fn m3_runs(root: &Path) -> Option<Vec<Metrics>> {
+    let mut all = Vec::new();
+    let mut ok = true;
+    for scenario in Scenario::ALL {
+        let (firmware, disk, expected) = match m3::read_fixture(root, scenario) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("{}: {e}", scenario.name());
+                return None;
+            }
+        };
+        let run = m3::run(&firmware, &disk, Start::Init { traced: true }, Vec::new());
+        let metrics = Metrics::of(&run);
+        match m3::judge(&run, scenario, &expected) {
+            Ok(()) => println!(
+                "{} ({}): PASS, output {:?}
+  {}",
+                scenario.name(),
+                scenario.disk_file(),
+                String::from_utf8_lossy(scenario.expected_output()),
+                metrics.line()
+            ),
+            Err(e) => {
+                ok = false;
+                eprintln!("{} ({}): FAIL: {e}", scenario.name(), scenario.disk_file());
+            }
+        }
+        all.push(metrics);
+    }
+    ok.then_some(all)
+}
+
+fn m3_run() -> ExitCode {
+    match m3_runs(&root()) {
+        Some(_) => ExitCode::SUCCESS,
+        None => ExitCode::FAILURE,
+    }
+}
+
+fn m3_verify() -> ExitCode {
+    let root = root();
+    if !m3_verify_fixtures(&root) {
+        return ExitCode::FAILURE;
+    }
+    let (Some(first), Some(second)) = (m3_runs(&root), m3_runs(&root)) else {
+        return ExitCode::FAILURE;
+    };
+    if first != second {
+        eprintln!(
+            "two runs of the M3 disks differ:
+  {first:?}
+  {second:?}"
+        );
+        return ExitCode::FAILURE;
+    }
+    println!("two runs of each M3 disk are identical");
+    ExitCode::SUCCESS
 }
 
 fn spike_task(task: &str, dir: &Path) -> ExitCode {

@@ -1,13 +1,17 @@
-//! The process plan: the user layout and the boot images the kernel creates processes
-//! from (`docs/m3-design.md` §6.2, §6.4, §8.3, §17 M3.4b).
+//! Where a kernel's processes come from (`docs/m3-design.md` §6.2, §6.4, §8, §17): a
+//! [`ProcessPlan`] of already-staged images (M3.4b), or a [`DiskBoot`] that loads them from
+//! the boot disk through the block controller (M3.6).
 //!
 //! A [`BootImage`] is a user executable that is already in the staging area and already
 //! validated: `staged` and `file_len` locate its bytes, and `image` is the mapping plan
 //! `systemscope_elf::parse_user_elf32` made from its headers. The kernel never parses the
 //! ELF again. It only copies the [`FileCopy`](systemscope_elf::FileCopy) ranges the plan
 //! names from staging into frames, through its own bus accesses (§8.3). How the bytes
-//! reached staging (the executable table and the block controller, §8.1, §8.2) is a later
-//! step; M3.4b starts from staged bytes.
+//! reached staging does not matter to a plan: M3.4b starts from staged bytes.
+//!
+//! A [`DiskBoot`] is the M3.6 source: the kernel reads the executable table and every
+//! executable itself (§8.1, §8.2) and validates the headers it read with
+//! `parse_user_elf32`, so nothing about the images is known before boot.
 //!
 //! The plan is fixed at construction and is part of the snapshot, like the configuration.
 //! [`ProcessPlan::validate`] checks it once: everything a well-formed `UserImage` already
@@ -18,7 +22,7 @@ use std::fmt;
 use std::ops::Range;
 
 use systemscope_contracts::snapshot::SnapshotWriter;
-use systemscope_elf::{Perms, UserImage};
+use systemscope_elf::{BLOCK_SIZE, Perms, UserImage};
 
 use crate::config::{KernelConfig, KernelConfigError};
 use crate::core::PAGE;
@@ -34,6 +38,11 @@ pub const PHYS_LIMIT: u64 = 1 << 34;
 /// The first byte of the plan's snapshot encoding. No M3.4a state tag has this value, so
 /// a kernel without processes rejects a snapshot with them, and the reverse.
 pub(crate) const PLAN_MARKER: u8 = 0xA5;
+/// The first byte of a disk boot's snapshot encoding: neither a state tag nor
+/// [`PLAN_MARKER`], so each kind of kernel rejects the others' snapshots.
+pub(crate) const DISK_MARKER: u8 = 0xD5;
+/// The block controller registers the kernel uses end at `ACK` + 4 (§8.2).
+const BLK_REGISTERS: u64 = 0x1C;
 
 /// The user layout (§6.2, §6.4): where user segments may lie and where the stack is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -104,6 +113,8 @@ pub enum PlanError {
     Config(KernelConfigError),
     /// The configuration breaks a rule that only processes need; the text names it.
     Layout(&'static str),
+    /// The configuration breaks a rule that only a disk boot needs; the text names it.
+    Disk(&'static str),
     /// There is no boot image, or more than [`MAX_PROCESSES`].
     ImageCount(usize),
     /// Boot image `index` breaks the named rule.
@@ -120,6 +131,7 @@ impl fmt::Display for PlanError {
         match self {
             PlanError::Config(e) => write!(f, "{e}"),
             PlanError::Layout(rule) => write!(f, "layout: {rule}"),
+            PlanError::Disk(rule) => write!(f, "disk boot: {rule}"),
             PlanError::ImageCount(n) => {
                 write!(f, "{n} boot images, not 1 to {MAX_PROCESSES}")
             }
@@ -141,15 +153,72 @@ pub fn kernel_megapage(config: &KernelConfig) -> u64 {
     config.ram.base
 }
 
+/// Checks the configuration and the user layout: the rules every kernel with processes
+/// needs, whatever the source of its images. Beyond [`KernelConfig::validate`]:
+///
+/// - **Megapages:** the RAM base is 4 MiB aligned and below the Sv32 physical limit; the
+///   trap frame and staging lie in the kernel megapage, so the trampoline reaches them
+///   under any `satp`; the frame pool is page-aligned, below the limit, and outside the
+///   kernel megapage.
+/// - **Layout:** `USER_BASE` and `STACK_TOP` page-aligned, at least one stack page,
+///   `USER_BASE` below the stack, and no stack page in the slot of either megapage.
+fn validate_layout(config: &KernelConfig, layout: &UserLayout) -> Result<(), PlanError> {
+    config.validate().map_err(PlanError::Config)?;
+    let layout_err = |rule| Err(PlanError::Layout(rule));
+    let kernel = kernel_megapage(config);
+    let mega = crate::config::Window {
+        base: kernel,
+        size: MEGAPAGE,
+    };
+    if !kernel.is_multiple_of(MEGAPAGE) || kernel + MEGAPAGE > PHYS_LIMIT {
+        return layout_err("the RAM base is not a 4 MiB aligned Sv32 address");
+    }
+    let frame = config.frame();
+    if !mega.contains(frame.base, frame.size) {
+        return layout_err("the trap frame is outside the kernel megapage");
+    }
+    if !mega.contains(config.staging.base, config.staging.size) {
+        return layout_err("staging is outside the kernel megapage");
+    }
+    let pool = config.frame_pool;
+    if !pool.base.is_multiple_of(PAGE) || !pool.size.is_multiple_of(PAGE) {
+        return layout_err("the frame pool is not page-aligned");
+    }
+    if pool.base + pool.size > PHYS_LIMIT || pool.size / PAGE > u64::from(u32::MAX) {
+        return layout_err("the frame pool is not reachable by Sv32");
+    }
+    if mega.overlaps(pool.base, pool.size) {
+        return layout_err("the frame pool overlaps the kernel megapage");
+    }
+    let l = layout;
+    let page = PAGE as u32;
+    if !l.user_base.is_multiple_of(page) || !l.stack_top.is_multiple_of(page) {
+        return layout_err("USER_BASE or STACK_TOP is not page-aligned");
+    }
+    if l.stack_pages == 0 {
+        return layout_err("there is no stack page");
+    }
+    let Some(stack_base) = l.stack_base() else {
+        return layout_err("the stack runs below address 0");
+    };
+    if l.user_base >= stack_base {
+        return layout_err("USER_BASE is not below the stack");
+    }
+    let slots = [vpn1(kernel), vpn1(MMIO_MEGAPAGE)];
+    if l.stack_vas().any(|va| slots.contains(&vpn1(u64::from(va)))) {
+        return layout_err("a stack page is in a megapage slot");
+    }
+    Ok(())
+}
+
 impl ProcessPlan {
-    /// Checks the configuration and the plan. Beyond [`KernelConfig::validate`]:
+    /// Checks the configuration and the plan: the megapage and layout rules every kernel
+    /// with processes needs, beyond [`KernelConfig::validate`] (the RAM base 4 MiB aligned
+    /// and below the Sv32 physical limit; the trap frame and staging in the kernel
+    /// megapage; the frame pool page-aligned, reachable, and outside it; `USER_BASE` and
+    /// `STACK_TOP` page-aligned, at least one stack page, `USER_BASE` below the stack, and
+    /// no stack page in a megapage slot), and:
     ///
-    /// - **Megapages:** the RAM base is 4 MiB aligned and below the Sv32 physical limit;
-    ///   the trap frame and staging lie in the kernel megapage, so the trampoline reaches
-    ///   them under any `satp`; the frame pool is page-aligned, below the limit, and
-    ///   outside the kernel megapage.
-    /// - **Layout:** `USER_BASE` and `STACK_TOP` page-aligned, at least one stack page,
-    ///   `USER_BASE` below the stack, and no stack page in the slot of either megapage.
     /// - **Images:** 1 to [`MAX_PROCESSES`]; each file non-empty and inside staging; an
     ///   entry 4-byte aligned in the image range; at least one segment; every page
     ///   page-aligned, in the image range, with its segment's valid permissions, in strictly
@@ -159,57 +228,13 @@ impl ProcessPlan {
     /// A segment in a megapage's slot is not rejected here: `parse_user_elf32` accepts it,
     /// so it is a guest error, and creating that process fails at boot (§6.4).
     pub fn validate(&self, config: &KernelConfig) -> Result<(), PlanError> {
-        config.validate().map_err(PlanError::Config)?;
-        let layout_err = |rule| Err(PlanError::Layout(rule));
-        let kernel = kernel_megapage(config);
-        let mega = crate::config::Window {
-            base: kernel,
-            size: MEGAPAGE,
-        };
-        if !kernel.is_multiple_of(MEGAPAGE) || kernel + MEGAPAGE > PHYS_LIMIT {
-            return layout_err("the RAM base is not a 4 MiB aligned Sv32 address");
-        }
-        let frame = config.frame();
-        if !mega.contains(frame.base, frame.size) {
-            return layout_err("the trap frame is outside the kernel megapage");
-        }
-        if !mega.contains(config.staging.base, config.staging.size) {
-            return layout_err("staging is outside the kernel megapage");
-        }
-        let pool = config.frame_pool;
-        if !pool.base.is_multiple_of(PAGE) || !pool.size.is_multiple_of(PAGE) {
-            return layout_err("the frame pool is not page-aligned");
-        }
-        if pool.base + pool.size > PHYS_LIMIT || pool.size / PAGE > u64::from(u32::MAX) {
-            return layout_err("the frame pool is not reachable by Sv32");
-        }
-        if mega.overlaps(pool.base, pool.size) {
-            return layout_err("the frame pool overlaps the kernel megapage");
-        }
-        let l = &self.layout;
-        let page = PAGE as u32;
-        if !l.user_base.is_multiple_of(page) || !l.stack_top.is_multiple_of(page) {
-            return layout_err("USER_BASE or STACK_TOP is not page-aligned");
-        }
-        if l.stack_pages == 0 {
-            return layout_err("there is no stack page");
-        }
-        let Some(stack_base) = l.stack_base() else {
-            return layout_err("the stack runs below address 0");
-        };
-        if l.user_base >= stack_base {
-            return layout_err("USER_BASE is not below the stack");
-        }
-        let slots = [vpn1(kernel), vpn1(MMIO_MEGAPAGE)];
-        if l.stack_vas().any(|va| slots.contains(&vpn1(u64::from(va)))) {
-            return layout_err("a stack page is in a megapage slot");
-        }
+        validate_layout(config, &self.layout)?;
         if self.images.is_empty() || self.images.len() > MAX_PROCESSES {
             return Err(PlanError::ImageCount(self.images.len()));
         }
         for (index, image) in self.images.iter().enumerate() {
             image
-                .check(config, l)
+                .check(config, &self.layout)
                 .map_err(|rule| PlanError::Image { index, rule })?;
         }
         Ok(())
@@ -248,6 +273,61 @@ impl ProcessPlan {
                 }
             }
         }
+    }
+}
+
+/// What a kernel that boots from disk is configured with, besides its [`KernelConfig`]
+/// (§6.2): the user layout and the boot disk's capacity. The images are whatever the
+/// executable table on the disk names (§8.1); the kernel reads and validates them at boot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DiskBoot {
+    /// The user layout.
+    pub layout: UserLayout,
+    /// The boot disk's capacity in 512-byte blocks, the bound of the table's check (§8.1).
+    pub capacity_blocks: u32,
+}
+
+impl DiskBoot {
+    /// Checks the configuration and the disk boot: the megapage and layout rules of
+    /// [`ProcessPlan::validate`], and what the block controller needs (§8.2): a disk of at
+    /// least one block; staging 16-byte aligned (the controller's `MEM_ADDR` rule), able to
+    /// hold block 0, and below 4 GiB (`MEM_ADDR` is 32 bits); and a block controller
+    /// window that holds every register up to `ACK`.
+    pub fn validate(&self, config: &KernelConfig) -> Result<(), PlanError> {
+        validate_layout(config, &self.layout)?;
+        let staging = config.staging;
+        if self.capacity_blocks == 0 {
+            return Err(PlanError::Disk("the disk has no block"));
+        }
+        if !staging.base.is_multiple_of(16) {
+            return Err(PlanError::Disk("staging is not 16-byte aligned"));
+        }
+        if staging.size < BLOCK_SIZE as u64 {
+            return Err(PlanError::Disk("staging cannot hold block 0"));
+        }
+        if staging.base + staging.size > 1 << 32 {
+            return Err(PlanError::Disk("staging is not below 4 GiB"));
+        }
+        if config.blk.size < BLK_REGISTERS {
+            return Err(PlanError::Disk(
+                "the block controller window does not hold its registers",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The staging size, as the table check takes it (below 4 GiB, checked above).
+    pub fn staging_size(config: &KernelConfig) -> u32 {
+        u32::try_from(config.staging.size).unwrap_or(u32::MAX)
+    }
+
+    /// The canonical encoding, as the snapshot stores it after the configuration.
+    pub(crate) fn encode(&self, w: &mut SnapshotWriter) {
+        w.u8(DISK_MARKER);
+        w.u32(self.layout.user_base);
+        w.u32(self.layout.stack_top);
+        w.u32(self.layout.stack_pages);
+        w.u32(self.capacity_blocks);
     }
 }
 
