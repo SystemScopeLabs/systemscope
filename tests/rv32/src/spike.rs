@@ -35,6 +35,14 @@
 //! `c<number>_<name> <value>` commit tokens. Spike's `mstatush` and `tcontrol` are not
 //! compared. A passing program's log ends with the `ECALL` Spike starts before its HTIF
 //! exits ([`pass_end`]); a trap program's is read up to its first trap.
+//!
+//! **M3 programs** ([`run_m3`], `docs/m3-design.md` §15.3) run with the M3 CPU profile,
+//! and Spike with `--priv=msu`, the device tree, and a budget that never ends a run
+//! ([`spike_m3_args`], m3-2-spike-appendix B.0). The compared stream is an [`Event`]
+//! list: each retirement with its mode, and each exception delivered to S. Spike's log
+//! does not say where a trap went, so the mode of the handler's first commit does: S for
+//! a delegated exception, which the stream continues through; M for the first exception
+//! taken in M, where SystemScope halts and the comparison ends (appendix D11).
 
 use std::fmt;
 use std::fs;
@@ -45,14 +53,14 @@ use systemscope_contracts::observe::StateView;
 use systemscope_contracts::trace::Value;
 use systemscope_elf::LoadImage;
 use systemscope_runtime::trace::Trace;
-use systemscope_rv32i::cpu::{COMMIT_KIND, HALT_KIND, TRAP_KIND};
-use systemscope_rv32i::{Rv32iProfile, csr};
+use systemscope_rv32i::cpu::{COMMIT_KIND, EXCEPTION_KIND, HALT_KIND, INTERRUPT_KIND, TRAP_KIND};
+use systemscope_rv32i::{Rv32iProfile, csr, privilege};
 
-use crate::csrgen;
 use crate::manifest::{Fixture, Manifest, load};
 use crate::progen::{self, ExpectedTrap, MISALIGNED, Program};
 use crate::runner::{self, CPU, End, Finished, PASS_CAUSE, Start};
 use crate::{FIXTURE_DIR, MAX_INSTRUCTIONS, RAM_BASE, RAM_SIZE, SELECTED, hex};
+use crate::{csrgen, privgen};
 
 /// The upstream Spike repository.
 pub const SPIKE_REPO: &str = "https://github.com/riscv-software-src/riscv-isa-sim.git";
@@ -304,9 +312,25 @@ pub fn parse_spike_log(log: &str) -> Result<Vec<Retire>, String> {
 }
 
 fn parse_spike_line(line: &str) -> Result<Retire, String> {
-    let rest = line
-        .strip_prefix("core   0: 3 ")
-        .ok_or("not a hart 0, machine-mode commit line")?;
+    parse_commit(line, false).map(|(_, retire)| retire)
+}
+
+/// A commit line and the mode it retired in (`0` U, `1` S, `3` M). Without `m3`, only
+/// machine mode and the M2 CSRs ([`csr_write`]); with it, any of the three modes and the
+/// M3 CSRs ([`csr_write_m3`]).
+fn parse_commit(line: &str, m3: bool) -> Result<(u8, Retire), String> {
+    let (privilege, rest) = match line.strip_prefix("core   0: ") {
+        Some(rest) if !m3 => (
+            3,
+            rest.strip_prefix("3 ")
+                .ok_or("not a hart 0, machine-mode commit line")?,
+        ),
+        Some(rest) => match rest.as_bytes() {
+            [p @ (b'0' | b'1' | b'3'), b' ', ..] => (p - b'0', &rest[2..]),
+            _ => return Err("not a hart 0 commit line in U, S, or M".to_owned()),
+        },
+        None => return Err("not a hart 0, machine-mode commit line".to_owned()),
+    };
     let mut tokens = rest.split(' ').filter(|t| !t.is_empty()).peekable();
     let pc = word(tokens.next().ok_or("no pc")?, 8)?;
     let insn = tokens
@@ -363,7 +387,7 @@ fn parse_spike_line(line: &str) -> Result<Retire, String> {
     }
     // The tokens say what the line means; the exact spacing must be Spike's too, so a
     // change in the log's layout fails here rather than parsing by luck.
-    let mut canonical = format!("core   0: 3 {pc:#010x} ({insn:#010x})");
+    let mut canonical = format!("core   0: {privilege} {pc:#010x} ({insn:#010x})");
     if let Some((rd, value)) = reg {
         canonical.push_str(&format!(" {:<3} {value:#010x}", format!("x{rd}")));
     }
@@ -381,13 +405,21 @@ fn parse_spike_line(line: &str) -> Result<Retire, String> {
     if line != canonical {
         return Err(format!("not laid out as Spike writes it: {canonical:?}"));
     }
-    Ok(Retire {
-        pc,
-        insn,
-        reg_write: reg.and_then(|(rd, value)| reg_write(rd, value)),
-        mem,
-        csr: csr_write(insn, &csrs)?,
-    })
+    let csr = if m3 {
+        csr_write_m3(insn, &csrs)?
+    } else {
+        csr_write(insn, &csrs)?
+    };
+    Ok((
+        privilege,
+        Retire {
+            pc,
+            insn,
+            reg_write: reg.and_then(|(rd, value)| reg_write(rd, value)),
+            mem,
+            csr,
+        },
+    ))
 }
 
 /// A CSR number, 12 bits.
@@ -428,6 +460,50 @@ fn csr_write(insn: u32, csrs: &[(u16, &str, u32)]) -> Result<Option<(u16, u32)>,
             ));
         }
         if write.replace((number, value)).is_some() {
+            return Err("more than one whitelisted CSR written".to_owned());
+        }
+    }
+    Ok(write)
+}
+
+/// The M3 CSR write among the CSRs a Spike commit line reports, as [`csr_write`] does for
+/// M2 but on the M3 whitelist ([`privilege::is_supported`]). Spike logs a write of
+/// `sstatus` as `mstatus`: it becomes `sstatus` = the logged value's S bits, the value
+/// SystemScope's trace records. `MRET` must report exactly `mstatus` and `mstatush` = 0,
+/// and `SRET` exactly `mstatus`; neither update is compared here (see [`crate::privgen`]).
+fn csr_write_m3(insn: u32, csrs: &[(u16, &str, u32)]) -> Result<Option<(u16, u32)>, String> {
+    if insn == csr::MRET {
+        return match csrs {
+            [
+                (csr::MSTATUS, "mstatus", _),
+                (SPIKE_MSTATUSH, "mstatush", 0),
+            ] => Ok(None),
+            _ => Err("MRET's CSR updates are not mstatus, mstatush = 0".to_owned()),
+        };
+    }
+    if insn == privilege::SRET {
+        return match csrs {
+            [(csr::MSTATUS, "mstatus", _)] => Ok(None),
+            _ => Err("SRET's CSR update is not mstatus".to_owned()),
+        };
+    }
+    let field = (insn >> 20) as u16;
+    let mut write = None;
+    for &(number, name, value) in csrs {
+        if number == SPIKE_MSTATUSH || number == SPIKE_TCONTROL {
+            continue;
+        }
+        if !privilege::is_supported(number) {
+            return Err(format!(
+                "{name} ({number:#05x}) is outside the M3 whitelist"
+            ));
+        }
+        let stored = if number == csr::MSTATUS && field == privilege::SSTATUS {
+            (privilege::SSTATUS, value & privilege::SSTATUS_MASK)
+        } else {
+            (number, value)
+        };
+        if write.replace(stored).is_some() {
             return Err("more than one whitelisted CSR written".to_owned());
         }
     }
@@ -482,12 +558,12 @@ pub fn check_boundary(spike: &[Retire], entry: u32, tohost: u32) -> Result<usize
 /// Compares the two streams record by record, over their whole length. The first
 /// difference, or the first record only one side has, is an error showing that index,
 /// both records, and up to three records before and after it.
-pub fn compare(systemscope: &[Retire], spike: &[Retire]) -> Result<(), String> {
+pub fn compare<T: PartialEq + fmt::Display>(systemscope: &[T], spike: &[T]) -> Result<(), String> {
     let n = systemscope.len().max(spike.len());
     let Some(i) = (0..n).find(|&i| systemscope.get(i) != spike.get(i)) else {
         return Ok(());
     };
-    let show = |r: Option<&Retire>| {
+    let show = |r: Option<&T>| {
         r.map_or(
             "(none: the stream has ended)".to_owned(),
             ToString::to_string,
@@ -627,7 +703,8 @@ fn run_both(
 }
 
 /// Runs `image` traced on SystemScope with the CPU `profile`, then the ELF at `elf` on
-/// Spike, with `-l` if `trap` or M2 ([`spike_m2_args`]), writing Spike's log to `log`.
+/// Spike, with `-l` if `trap` or M2 ([`spike_m2_args`]), or as M3 needs
+/// ([`spike_m3_args`]), writing Spike's log to `log`.
 /// Returns SystemScope's run and Spike's log. Both sides run before either is judged, so a
 /// divergence is reported where it starts.
 fn run_sides(
@@ -653,6 +730,7 @@ fn run_sides(
     }
     let _ = fs::remove_file(root.join(log));
     let args = match (profile, trap) {
+        (Rv32iProfile::M3, _) => spike_m3_args(image.entry, elf, log),
         (Rv32iProfile::M2, _) => spike_m2_args(image.entry, elf, log),
         (Rv32iProfile::M1, true) => spike_trap_args(image.entry, elf, log),
         (Rv32iProfile::M1, false) => spike_args(image.entry, elf, log),
@@ -975,7 +1053,9 @@ pub fn program_differential(
 }
 
 /// [`program_differential`] with the CPU `profile`. An M2 program runs on Spike with
-/// [`spike_m2_args`], and one that must pass must not trap.
+/// [`spike_m2_args`], and one that must pass must not trap. An M3 program runs with
+/// [`spike_m3_args`] and must have `expected`, the exception taken in M that ends it
+/// ([`judge_m3`]).
 pub fn program_differential_with(
     root: &Path,
     program: &Program,
@@ -990,14 +1070,22 @@ pub fn program_differential_with(
         executed: (false, false),
         verdict: Ok(0),
     };
-    diff.verdict = run_program(
-        root,
-        program,
-        (expected, profile),
-        spike,
-        logs,
-        &mut diff.executed,
-    );
+    diff.verdict = match (profile, expected) {
+        (Rv32iProfile::M3, Some(expected)) => {
+            run_m3_program(root, program, expected, spike, logs, &mut diff.executed)
+        }
+        (Rv32iProfile::M3, None) => {
+            Err("an M3 program must end with an exception taken in M".to_owned())
+        }
+        _ => run_program(
+            root,
+            program,
+            (expected, profile),
+            spike,
+            logs,
+            &mut diff.executed,
+        ),
+    };
     diff
 }
 
@@ -1031,6 +1119,7 @@ fn run_program(
         (Rv32iProfile::M1, Some(_)) => parse_spike_trap_log(&text).map(|(r, t)| (r, Some(t)))?,
         (Rv32iProfile::M2, Some(_)) => parse_spike_l_log(&text)?,
         (Rv32iProfile::M2, None) => (pass_end(&text)?, None),
+        (Rv32iProfile::M3, _) => return Err("M3 programs run through run_m3_program".to_owned()),
     };
     match (expected, trap) {
         (None, _) => {
@@ -1089,6 +1178,404 @@ pub fn run_m2(root: &Path, spike: &Path, logs: &str) -> DiffReport {
                 &program,
                 expected.as_ref(),
                 Rv32iProfile::M2,
+                spike,
+                logs,
+            )
+        })
+        .collect();
+    DiffReport {
+        selected: results.len(),
+        results,
+    }
+}
+
+/// `--priv` for the M3 CPU profile: machine, supervisor, and user modes.
+pub const SPIKE_PRIV_M3: &str = "msu";
+
+/// Spike's instruction budget for an M3 program. Each trap ends one of Spike's step
+/// chunks and costs the whole chunk, so the budget is far above any program; every run
+/// ends at `write_tohost` instead (m3-2-spike-appendix B.0).
+pub const SPIKE_INSTRUCTIONS_M3: u64 = 100_000_000;
+
+/// Spike's command line for a program run with the M3 CPU profile: `-l`,
+/// [`SPIKE_ISA_M2`], [`SPIKE_PRIV_M3`], and [`SPIKE_INSTRUCTIONS_M3`]. It keeps the
+/// device tree, without which the pinned Spike configures no MMU and drops `medeleg`'s
+/// page-fault bits; Spike then needs `dtc` on `PATH` when it starts.
+pub fn spike_m3_args(entry: u32, elf: &str, log: &str) -> Vec<String> {
+    vec![
+        "-l".to_owned(),
+        format!("--isa={SPIKE_ISA_M2}"),
+        format!("--priv={SPIKE_PRIV_M3}"),
+        format!("--pcs=0:{entry:#x}"),
+        format!("-m{RAM_BASE:#x}:{RAM_SIZE:#x}"),
+        "--log-commits".to_owned(),
+        format!("--log={log}"),
+        format!("--instructions={SPIKE_INSTRUCTIONS_M3}"),
+        elf.to_owned(),
+    ]
+}
+
+/// One step of an M3 stream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Event {
+    /// A retirement, in the mode it ran in (`0` U, `1` S, `3` M).
+    Retire {
+        /// The mode.
+        privilege: u8,
+        /// The retirement.
+        retire: Retire,
+    },
+    /// An exception delivered to S.
+    Exception {
+        /// The trapping instruction's address.
+        pc: u32,
+        /// Its word.
+        insn: u32,
+        /// SystemScope's M3 cause name.
+        cause: String,
+        /// The trap value.
+        tval: u32,
+    },
+}
+
+impl fmt::Display for Event {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Event::Retire { privilege, retire } => write!(f, "p{privilege} {retire}"),
+            Event::Exception {
+                pc,
+                insn,
+                cause,
+                tval,
+            } => write!(
+                f,
+                "exception {cause} to S at pc {pc:#010x} insn {insn:#010x}, tval {tval:#010x}"
+            ),
+        }
+    }
+}
+
+/// The retirements of an M3 stream.
+fn retirements(events: &[Event]) -> Vec<Retire> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Retire { retire, .. } => Some(*retire),
+            Event::Exception { .. } => None,
+        })
+        .collect()
+}
+
+/// Spike's name for each SystemScope M3 trap cause the directed programs raise
+/// (`docs/m3-design.md` §5.3), as its `-l` log writes it.
+pub const SPIKE_CAUSES_M3: [(&str, &str); 11] = [
+    (
+        "InstructionAddressMisaligned",
+        "trap_instruction_address_misaligned",
+    ),
+    ("InstructionAccessFault", "trap_instruction_access_fault"),
+    ("IllegalInstruction", "trap_illegal_instruction"),
+    ("Breakpoint", "trap_breakpoint"),
+    ("LoadAddressMisaligned", "trap_load_address_misaligned"),
+    ("LoadAccessFault", "trap_load_access_fault"),
+    ("StoreAddressMisaligned", "trap_store_address_misaligned"),
+    ("StoreAccessFault", "trap_store_access_fault"),
+    ("EnvironmentCallFromU", "trap_user_ecall"),
+    ("EnvironmentCallFromS", "trap_supervisor_ecall"),
+    ("EnvironmentCallFromM", SPIKE_ECALL),
+];
+
+/// Parses a pinned-Spike `-l --log-commits` log of an M3 program, strictly, up to its
+/// first exception taken in M. As in [`parse_spike_l_log`], each instruction is an
+/// instruction line, then its commit line, now in any of the three modes, or its trap.
+/// Spike writes no tval line for the three environment calls. A trap whose handler's
+/// first instruction commits in S was delegated: it is an [`Event::Exception`], and the
+/// log goes on. Any other trap is the one taken in M, returned with the events before
+/// it; the lines after it, Spike's handler, are not compared. A log without one is an
+/// error.
+pub fn parse_spike_m3_log(log: &str) -> Result<(Vec<Event>, SpikeTrap), String> {
+    let lines: Vec<&str> = log.lines().collect();
+    let at = |i: usize, why: &str| {
+        format!(
+            "Spike log line {}: {why}: {:?}",
+            i + 1,
+            lines.get(i).copied().unwrap_or("")
+        )
+    };
+    let mut events = Vec::new();
+    let mut k = 0;
+    loop {
+        let line = lines
+            .get(k)
+            .ok_or_else(|| "Spike's log has no exception taken in M".to_owned())?;
+        let (pc, insn) = instruction_line(line).map_err(|why| at(k, &why))?;
+        let next = lines
+            .get(k + 1)
+            .ok_or_else(|| at(k, "the log ends after an instruction line"))?;
+        let Some(rest) = next.strip_prefix("core   0: exception ") else {
+            let (privilege, retire) = parse_commit(next, true).map_err(|why| at(k + 1, &why))?;
+            if (retire.pc, retire.insn) != (pc, insn) {
+                return Err(at(
+                    k + 1,
+                    "not the commit of the instruction line before it",
+                ));
+            }
+            events.push(Event::Retire { privilege, retire });
+            k += 2;
+            continue;
+        };
+        let (cause, epc) = rest
+            .split_once(", epc ")
+            .ok_or_else(|| at(k + 1, "no epc"))?;
+        if epc != format!("{pc:#010x}") {
+            return Err(at(
+                k + 1,
+                &format!("not a trap of the instruction at {pc:#010x}"),
+            ));
+        }
+        let ours = SPIKE_CAUSES_M3
+            .iter()
+            .find(|(_, theirs)| *theirs == cause)
+            .map(|(ours, _)| *ours)
+            .ok_or_else(|| at(k + 1, "a cause no directed program raises"))?;
+        let mut j = k + 2;
+        let tval = if ours.starts_with("EnvironmentCall") {
+            0
+        } else {
+            let tval = lines
+                .get(j)
+                .and_then(|l| l.strip_prefix("core   0:           tval "))
+                .ok_or_else(|| at(j, "not the trap's tval line"))
+                .and_then(|t| word(t, 8).map_err(|why| at(j, &why)))?;
+            j += 1;
+            tval
+        };
+        let delegated = match (lines.get(j), lines.get(j + 1)) {
+            (Some(handler), Some(commit)) if instruction_line(handler).is_ok() => {
+                matches!(parse_commit(commit, true), Ok((1, _)))
+            }
+            _ => false,
+        };
+        if !delegated {
+            let trap = SpikeTrap {
+                pc,
+                insn,
+                cause: cause.to_owned(),
+                tval,
+            };
+            return Ok((events, trap));
+        }
+        events.push(Event::Exception {
+            pc,
+            insn,
+            cause: ours.to_owned(),
+            tval,
+        });
+        k = j;
+    }
+}
+
+/// SystemScope's side of an M3 run: its events, and the `rv32.trap` record that ended it,
+/// as `(pc, cause)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SystemScopeEvents {
+    /// One per `rv32.commit` or `rv32.exception` record, in order.
+    pub events: Vec<Event>,
+    /// The halt trap.
+    pub trap: Option<(u32, String)>,
+}
+
+/// Reads SystemScope's M3 events from a traced run's canonical records
+/// (`docs/m3-design.md` §5.6), as [`from_trace`] reads M1 and M2 ones: `rv32.commit` has
+/// `priv` after `next_pc`, and a load or store `paddr` after `addr`, which must equal it
+/// without translation; `rv32.exception` is a delivered exception, always to S. An
+/// interrupt, the instruction limit, or a record after the trap is an error.
+pub fn from_trace_m3(trace: &Trace) -> Result<SystemScopeEvents, String> {
+    let mut out = SystemScopeEvents {
+        events: Vec::new(),
+        trap: None,
+    };
+    for (i, record) in trace.records.iter().enumerate() {
+        if !record.kind.starts_with("rv32.") {
+            continue;
+        }
+        let at = |why: &str| format!("trace record {i} ({}): {why}", record.kind);
+        if out.trap.is_some() {
+            return Err(at("after the trap"));
+        }
+        let fields: Vec<&str> = record.fields.iter().map(|f| f.0).collect();
+        let u32_at = |n: usize| match record.fields.get(n) {
+            Some((_, Value::U64(v))) => u32::try_from(*v).map_err(|_| at("value above 32 bits")),
+            _ => Err(at("expected a U64 field")),
+        };
+        let str_at = |n: usize| match record.fields.get(n) {
+            Some((_, Value::Str(s))) => Ok(s.clone()),
+            _ => Err(at("expected a Str field")),
+        };
+        match record.kind {
+            k if k == COMMIT_KIND => {
+                let head = ["pc", "insn", "rd", "rd_value", "next_pc", "priv"];
+                if fields.get(..6) != Some(&head[..]) {
+                    return Err(at(&format!("unexpected fields {fields:?}")));
+                }
+                let mut csr = None;
+                let mem = match &fields[6..] {
+                    [] => Mem::None,
+                    ["csr"] => {
+                        csr_number(u32_at(6)?).ok_or_else(|| at("csr out of range"))?;
+                        Mem::None
+                    }
+                    ["csr", "csr_value"] => {
+                        let number =
+                            csr_number(u32_at(6)?).ok_or_else(|| at("csr out of range"))?;
+                        csr = Some((number, u32_at(7)?));
+                        Mem::None
+                    }
+                    ["addr", "paddr"] if u32_at(6)? == u32_at(7)? => Mem::Load { addr: u32_at(6)? },
+                    ["addr", "paddr", "width", "value"] if u32_at(6)? == u32_at(7)? => {
+                        let width = match u32_at(8)? {
+                            w @ (1 | 2 | 4) => w as u8,
+                            w => return Err(at(&format!("store width {w}"))),
+                        };
+                        Mem::Store {
+                            addr: u32_at(6)?,
+                            width,
+                            value: u32_at(9)?,
+                        }
+                    }
+                    other => return Err(at(&format!("unexpected fields {other:?}"))),
+                };
+                let rd = u8::try_from(u32_at(2)?)
+                    .ok()
+                    .filter(|rd| *rd < 32)
+                    .ok_or_else(|| at("rd out of range"))?;
+                let privilege = match u32_at(5)? {
+                    p @ (0 | 1 | 3) => p as u8,
+                    p => return Err(at(&format!("priv {p}"))),
+                };
+                out.events.push(Event::Retire {
+                    privilege,
+                    retire: Retire {
+                        pc: u32_at(0)?,
+                        insn: u32_at(1)?,
+                        reg_write: reg_write(rd, u32_at(3)?),
+                        mem,
+                        csr,
+                    },
+                });
+            }
+            k if k == EXCEPTION_KIND => {
+                if fields != ["pc", "insn", "cause", "tval", "from", "to"] {
+                    return Err(at(&format!("unexpected fields {fields:?}")));
+                }
+                if str_at(5)? != "S" {
+                    return Err(at("not delivered to S"));
+                }
+                out.events.push(Event::Exception {
+                    pc: u32_at(0)?,
+                    insn: u32_at(1)?,
+                    cause: str_at(2)?,
+                    tval: u32_at(3)?,
+                });
+            }
+            k if k == TRAP_KIND => {
+                if fields != ["pc", "insn", "cause", "tval"] {
+                    return Err(at(&format!("unexpected fields {fields:?}")));
+                }
+                out.trap = Some((u32_at(0)?, str_at(2)?));
+            }
+            k if k == INTERRUPT_KIND => return Err(at("an interrupt")),
+            k if k == HALT_KIND => return Err(at("the instruction limit")),
+            _ => return Err(at("unknown CPU record kind")),
+        }
+    }
+    Ok(out)
+}
+
+/// The verdict for an M3 program: the event streams are equal up to the first exception
+/// taken in M, both sides take it at the same instruction with the same cause and `tval`,
+/// and it is `expected`. SystemScope halts on it, having retired exactly Spike's
+/// retirements, with the registers they leave. Returns the event count.
+pub fn judge_m3(
+    finished: &Finished,
+    theirs: &[Event],
+    trap: &SpikeTrap,
+    expected: &ExpectedTrap,
+) -> Result<usize, String> {
+    let ours = finished
+        .trace
+        .as_ref()
+        .ok_or_else(|| "SystemScope recorded no trace".to_owned())
+        .and_then(from_trace_m3)?;
+    compare(&ours.events, theirs)?;
+    let spike_cause = SPIKE_CAUSES_M3
+        .iter()
+        .find(|(ours, _)| *ours == expected.cause)
+        .map(|(_, theirs)| *theirs)
+        .ok_or_else(|| format!("no Spike name for {}", expected.cause))?;
+    let spike_says = (trap.pc, trap.insn, trap.cause.as_str(), trap.tval);
+    if spike_says != (expected.pc, expected.insn, spike_cause, expected.tval) {
+        return Err(format!(
+            "Spike traps in M with {trap:?}, not {spike_cause} at {:#010x} ({:#010x}), tval              {:#010x}",
+            expected.pc, expected.insn, expected.tval
+        ));
+    }
+    match &finished.outcome.end {
+        End::Trap { cause, pc, tval }
+            if (cause.as_str(), *pc, *tval) == (expected.cause, expected.pc, expected.tval)
+                && ours.trap.as_ref().map(|t| t.0) == Some(expected.pc) => {}
+        other => {
+            return Err(format!(
+                "SystemScope ends with {other}, not Trap({}) at {:#010x}, tval {:#010x}",
+                expected.cause, expected.pc, expected.tval
+            ));
+        }
+    }
+    check_end_state(finished, &retirements(theirs))?;
+    Ok(theirs.len())
+}
+
+fn run_m3_program(
+    root: &Path,
+    program: &Program,
+    expected: &ExpectedTrap,
+    spike: &Path,
+    logs: &str,
+    executed: &mut (bool, bool),
+) -> Result<usize, String> {
+    let elf = format!("{logs}/privgen/{}.elf", program.name);
+    let log = format!("{logs}/privgen/{}.log", program.name);
+    let path = root.join(&elf);
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    fs::write(&path, &program.elf).map_err(|e| format!("{elf}: {e}"))?;
+    let image = load(&program.name, &program.elf)?;
+    let (finished, text) = run_sides(
+        root,
+        &image,
+        &elf,
+        spike,
+        &log,
+        (Rv32iProfile::M3, true),
+        executed,
+    )?;
+    let (theirs, trap) = parse_spike_m3_log(&text)?;
+    judge_m3(&finished, &theirs, &trap, expected)
+}
+
+/// The directed M3.2 programs against Spike (`docs/m3-design.md` §15.3), with the M3 CPU
+/// profile and [`spike_m3_args`]: every [`privgen::programs`] program, up to the exception
+/// taken in M that ends it.
+pub fn run_m3(root: &Path, spike: &Path, logs: &str) -> DiffReport {
+    let results: Vec<Diff> = privgen::programs()
+        .into_iter()
+        .map(|(program, expected)| {
+            program_differential_with(
+                root,
+                &program,
+                Some(&expected),
+                Rv32iProfile::M3,
                 spike,
                 logs,
             )

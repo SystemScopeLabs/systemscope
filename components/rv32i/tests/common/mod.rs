@@ -5,10 +5,12 @@
 //! - [`MockCtx`] drives the CPU directly, recording what it sends, wakes, and traces, so
 //!   protocol tests can deliver responses no real memory would produce.
 //! - [`mei`] is the pure machine-external-interrupt oracle (`docs/m2-design.md` §5.8).
+//! - [`mei_m3`] is its independent `M3` counterpart, with modes (`docs/m3-design.md` §5.1).
 
 #![allow(dead_code)]
 
 pub mod mei;
+pub mod mei_m3;
 
 use systemscope_contracts::component::{
     Component, ComponentId, Delivered, InitContext, PortId, SimContext,

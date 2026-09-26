@@ -24,6 +24,9 @@
 //! - [`csrgen`] is the M2 part of the Spike differential: directed Zicsr, CSR, and `MRET`
 //!   programs run with the M2 CPU profile (`docs/m2-design.md` §4), and one program per
 //!   rejected CSR that must trap on both sides.
+//! - [`privgen`] is the M3.2 part of the Spike differential: directed privilege, CSR,
+//!   `MRET`/`SRET`, and delegation programs run with the M3 CPU profile
+//!   (`docs/m3-design.md` §5.1, §5.3), each compared up to its first trap taken in M.
 //! - [`m2ref`] builds `m2-reference`, the M2 reference platform (`docs/m2-design.md`
 //!   §11): the `M2` CPU, the multi-master bus, the RAM, the UART, the IRQ controller, the
 //!   DMA block controller, and the block media.
@@ -43,13 +46,15 @@ pub mod csrgen;
 pub mod hello;
 pub mod m2ref;
 pub mod manifest;
+pub mod privgen;
 pub mod progen;
 pub mod runner;
 pub mod spike;
 pub mod upstream;
 
 /// The CPU profile the harnesses run: `M1` is `m1-reference`'s, and every M1 check keeps
-/// it; the `M2` profile runs the same suites (`docs/m2-design.md` §15.4).
+/// it; the `M2` and `M3` profiles run the same suites (`docs/m2-design.md` §15.4,
+/// `docs/m3-design.md` §15.4).
 pub use systemscope_rv32i::Rv32iProfile;
 
 /// The upstream repository the tests come from.

@@ -73,16 +73,17 @@ use systemscope_rv32::act4::{self, ACT4_MANIFEST, ACT4_SCRIPT};
 use systemscope_rv32::block_irq::{
     self, BLOCK_IRQ_DIR, BLOCK_IRQ_MANIFEST, BLOCK_IRQ_SCRIPT, BlockIrqManifest,
 };
-use systemscope_rv32::csrgen;
 use systemscope_rv32::hello::{self, HELLO_DIR, HELLO_MANIFEST, HELLO_SCRIPT, HelloManifest};
 use systemscope_rv32::manifest::{Manifest, verify};
 use systemscope_rv32::progen::{self, FIXED_SEEDS, MISALIGNED};
 use systemscope_rv32::spike::{
-    self, DiffReport, SPIKE_COMMIT, SPIKE_DIR, SPIKE_ISA_M2, SPIKE_LOGS, SPIKE_SCRIPT,
+    self, DiffReport, SPIKE_COMMIT, SPIKE_DIR, SPIKE_ISA_M2, SPIKE_LOGS, SPIKE_PRIV_M3,
+    SPIKE_SCRIPT,
 };
 use systemscope_rv32::{
     BUILD_SCRIPT, FIXTURE_DIR, MANIFEST_PATH, Rv32iProfile, SELECTED, upstream,
 };
+use systemscope_rv32::{csrgen, privgen};
 
 const USAGE: &str = "usage: cargo xtask bless\n       \
                      cargo xtask m1-golden bless | verify | emit <dir> | check <dir>\n       \
@@ -707,6 +708,16 @@ fn spike_diff(dir: &Path) -> ExitCode {
          {SPIKE_COMMIT} with --isa={SPIKE_ISA_M2}, CSR writes included, and both trap \
          alike on every rejected CSR"
     );
+    let m3 = spike::run_m3(&root(), &spike, SPIKE_LOGS);
+    if !print_diff_report("M3 privilege", "m3-priv", &m3, privgen::programs().len()) {
+        return ExitCode::FAILURE;
+    }
+    println!(
+        "M3 privilege: every directed privilege, CSR, MRET/SRET, and delegation program \
+         retires exactly as on Spike {SPIKE_COMMIT} with --isa={SPIKE_ISA_M2} \
+         --priv={SPIKE_PRIV_M3}, modes, CSR writes, and delegated exceptions included, up \
+         to the same exception taken in M"
+    );
     ExitCode::SUCCESS
 }
 
@@ -936,16 +947,42 @@ fn act4_run() -> ExitCode {
         report.passed(),
         report.failed()
     );
+    if let Err(e) = report.accept(manifest.count) {
+        eprintln!("the M2 CPU profile fails the ACT4 corpus: {e}");
+        return ExitCode::FAILURE;
+    }
+    println!(
+        "all {} ACT4 RV32I tests also pass with the M2 CPU profile",
+        manifest.count
+    );
+    // docs/m3-design.md §15.4: the M3 CPU profile passes it too, in M-mode.
+    let report = match act4::run_corpus_with(&root(), Rv32iProfile::M3) {
+        Ok((_, r)) => r,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    for result in report.results.iter().filter(|r| r.verdict.is_err()) {
+        println!("{}", result.line());
+    }
+    println!(
+        "M3 CPU profile: selected {}, executed {}, passed {}, failed {}",
+        report.selected,
+        report.executed(),
+        report.passed(),
+        report.failed()
+    );
     match report.accept(manifest.count) {
         Ok(()) => {
             println!(
-                "all {} ACT4 RV32I tests also pass with the M2 CPU profile",
+                "all {} ACT4 RV32I tests also pass with the M3 CPU profile",
                 manifest.count
             );
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("the M2 CPU profile fails the ACT4 corpus: {e}");
+            eprintln!("the M3 CPU profile fails the ACT4 corpus: {e}");
             ExitCode::FAILURE
         }
     }

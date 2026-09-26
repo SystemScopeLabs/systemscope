@@ -13,6 +13,10 @@
 //! The `M2` profile ([`Rv32iProfile`]) adds the privileged subset of `docs/m2-design.md`
 //! §4 in [`csr`]: the Zicsr instructions on eight machine CSRs ([`CsrFile`]) and `MRET`,
 //! and the machine external interrupt of §5, taken from its `irq.v0` port.
+//!
+//! The `M3` profile adds the privilege and trap boundary of `docs/m3-design.md` §5 in
+//! [`privilege`]: M, S, and U modes ([`Privilege`]), the supervisor CSR subset
+//! ([`M3State`]), `SRET`, `SFENCE.VMA`, delegated exceptions, and the interrupt with modes.
 
 pub mod cpu;
 pub mod csr;
@@ -21,6 +25,7 @@ pub mod execute;
 pub mod immediate;
 pub mod instr;
 pub mod memory;
+pub mod privilege;
 pub mod regfile;
 
 pub use cpu::{CpuConfigError, Halt, Rv32iConfig, Rv32iCpu, Rv32iProfile, RvTrap};
@@ -35,4 +40,5 @@ pub use memory::{
     LoadExtension, LoadPlan, MemWidth, MemoryCompletionError, MemoryPlan, MemoryPrep, NotMemory,
     StorePlan, complete_load, complete_memory, complete_store, prepare_memory,
 };
+pub use privilege::{M3State, Privilege, Spp};
 pub use regfile::RegisterFile;

@@ -6,7 +6,7 @@ use std::rc::Rc;
 use systemscope_contracts::observe::{Control, EventView, Observer, WorldView};
 use systemscope_rv32::manifest::Manifest;
 use systemscope_rv32::runner::{
-    End, PASS_CAUSE, judge, run, run_fixture, run_suite, run_suite_with,
+    End, PASS_CAUSE, PASS_CAUSE_M3, judge, run, run_fixture, run_suite, run_suite_with,
 };
 use systemscope_rv32::{Rv32iProfile, SELECTED, hex, workspace_root};
 
@@ -69,6 +69,24 @@ fn the_selected_rv32ui_suite_passes_with_the_m2_cpu_profile() {
     for r in &report.results {
         assert!(
             matches!(&r.outcome.end, End::Trap { cause, .. } if cause == PASS_CAUSE),
+            "{}",
+            r.line()
+        );
+    }
+}
+
+/// The M3 CPU profile passes the same 40 tests in M-mode, ending with the M3 name of the
+/// same cause (`docs/m3-design.md` §5.3, §15.4).
+#[test]
+fn the_selected_rv32ui_suite_passes_with_the_m3_cpu_profile() {
+    let report = run_suite_with(&workspace_root(), Rv32iProfile::M3).unwrap();
+    for r in &report.results {
+        println!("{}", r.line());
+    }
+    report.accept(SELECTED.len()).unwrap();
+    for r in &report.results {
+        assert!(
+            matches!(&r.outcome.end, End::Trap { cause, .. } if cause == PASS_CAUSE_M3),
             "{}",
             r.line()
         );

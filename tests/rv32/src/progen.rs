@@ -114,11 +114,11 @@ impl Draw {
 // Encoders, RV32I base formats.
 const OP: u32 = 0x33;
 pub(crate) const OP_IMM: u32 = 0x13;
-const LOAD: u32 = 0x03;
+pub(crate) const LOAD: u32 = 0x03;
 const STORE: u32 = 0x23;
 const BRANCH: u32 = 0x63;
 const JAL: u32 = 0x6f;
-const JALR: u32 = 0x67;
+pub(crate) const JALR: u32 = 0x67;
 const LUI: u32 = 0x37;
 const AUIPC: u32 = 0x17;
 const MISC_MEM: u32 = 0x0f;
@@ -137,7 +137,7 @@ pub(crate) fn i(opcode: u32, funct3: u32, rd: u8, rs1: u8, imm: i32) -> u32 {
     (imm as u32 & 0xfff) << 20 | u32::from(rs1) << 15 | funct3 << 12 | u32::from(rd) << 7 | opcode
 }
 
-fn s(funct3: u32, rs1: u8, rs2: u8, imm: i32) -> u32 {
+pub(crate) fn s(funct3: u32, rs1: u8, rs2: u8, imm: i32) -> u32 {
     let imm = imm as u32;
     (imm >> 5 & 0x7f) << 25
         | u32::from(rs2) << 20

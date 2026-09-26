@@ -49,6 +49,24 @@
 //! in `inspect` and `csr`/`csr_value` in CSR commits (§6.5); and checked `TxnId`
 //! allocation (§6.2). A synchronous trap still halts and writes no CSR (§5.6).
 //!
+//! [`Rv32iProfile::M3`] adds the privilege and trap boundary of `docs/m3-design.md` §5
+//! ([`crate::privilege`]) to everything `M2` has; see below. Every M3 rule is selected by
+//! the profile, so the `M1` and `M2` behavior is unchanged.
+//!
+//! # Privilege and traps (`M3`)
+//!
+//! The hart has a mode, M, S, or U, reset to M, with `mstatus` = 0 (`MPP` = U). Each
+//! fetched word is decoded against the current mode, so the pending outcome already holds
+//! the CSR access rule, whether `MRET`, `SRET`, and `SFENCE.VMA` are legal, and the
+//! mode-dependent `ECALL` cause (§5.1, §5.3). In `Commit`, a pending exception raised
+//! below M whose `medeleg` bit is set is delivered to S: `sepc`, `scause`, `stval`, and
+//! `mstatus` are written, the mode becomes S, and the CPU fetches at `stvec`, without
+//! retiring or sampling the interrupt; it traces `rv32.exception`. Any other exception
+//! halts exactly as in M2 and writes no CSR. The interrupt is eligible below M whatever
+//! `MIE` says, and its entry saves the mode in `MPP`. Snapshot schema 3 is schema 2 plus
+//! the mode and the new CSRs (§5.5); `satp` supports only Bare until M3.3, and no page
+//! fault is raised.
+//!
 //! # Machine external interrupt (`M2`)
 //!
 //! The `M2` profile has a second port, `irq`, an `irq.v0` target. A `Level` delivered on
@@ -90,6 +108,7 @@ use crate::instr::{Instr, Reg};
 use crate::memory::{
     MemoryCompletionError, MemoryPlan, MemoryPrep, complete_memory, prepare_memory,
 };
+use crate::privilege::{self, M3State, Privilege, Spp, SupervisorInstr, decode_supervisor};
 use crate::regfile::RegisterFile;
 
 /// The `mem` port: a `mem.v1` initiator, for fetches and data alike. It is the CPU's only
@@ -114,6 +133,10 @@ pub const SNAPSHOT_SCHEMA: u32 = 1;
 /// Layout of [`Rv32iCpu`]'s snapshot in the `M2` profile: schema 1, then the CSRs.
 pub const SNAPSHOT_SCHEMA_M2: u32 = 2;
 
+/// Layout of [`Rv32iCpu`]'s snapshot in the `M3` profile: schema 2, then the mode and the
+/// CSRs the `M3` profile adds (`docs/m3-design.md` §5.5).
+pub const SNAPSHOT_SCHEMA_M3: u32 = 3;
+
 /// Trace kind of a retired instruction.
 pub const COMMIT_KIND: &str = "rv32.commit";
 
@@ -123,8 +146,11 @@ pub const TRAP_KIND: &str = "rv32.trap";
 /// Trace kind of an instruction-limit halt.
 pub const HALT_KIND: &str = "rv32.halt";
 
-/// Trace kind of a machine external interrupt entry (`M2`).
+/// Trace kind of a machine external interrupt entry (`M2`, `M3`).
 pub const INTERRUPT_KIND: &str = "rv32.interrupt";
+
+/// Trace kind of a delegated exception's delivery to S (`M3`).
+pub const EXCEPTION_KIND: &str = "rv32.exception";
 
 /// Which CPU an [`Rv32iCpu`] is (`docs/m2-design.md` §6.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -134,6 +160,10 @@ pub enum Rv32iProfile {
     /// The M1 CPU plus the M2 privileged subset (Zicsr on eight CSRs, `MRET`), the `irq`
     /// port and the machine external interrupt, snapshot schema 2.
     M2,
+    /// The `M2` CPU plus M, S, and U modes, the supervisor CSRs, `SRET`, `SFENCE.VMA`,
+    /// delegated exceptions, and the interrupt with modes (`docs/m3-design.md` §5),
+    /// snapshot schema 3.
+    M3,
 }
 
 /// Construction parameters of an [`Rv32iCpu`].
@@ -146,7 +176,7 @@ pub struct Rv32iConfig {
     /// The CPU halts right after this many instructions retire.
     pub max_instructions: NonZeroU64,
     /// The profile. It is never encoded in the snapshot's configuration block: the
-    /// snapshot schema implies it (1 is `M1`, 2 is `M2`).
+    /// snapshot schema implies it (1 is `M1`, 2 is `M2`, 3 is `M3`).
     pub profile: Rv32iProfile,
 }
 
@@ -231,10 +261,12 @@ impl State {
 enum Outcome {
     /// An RV32I retirement or a trap, as in M1.
     Exec(ExecOutcome),
-    /// A CSR instruction on a supported CSR (`M2` only).
+    /// A CSR instruction on a supported CSR (`M2`, `M3`).
     Csr(PendingCsr),
-    /// `MRET` (`M2` only). It reads `mepc` and `mstatus` in `Commit`.
+    /// `MRET` (`M2`, `M3`). It reads `mepc` and `mstatus` in `Commit`.
     Mret,
+    /// `SRET` (`M3` only). It reads `sepc` and `mstatus` in `Commit`.
+    Sret,
 }
 
 /// A CSR instruction decoded and executed in `Complete`, applied in `Commit`
@@ -263,13 +295,30 @@ enum Step {
     Memory(MemoryPlan),
 }
 
-/// Decodes and executes `word` at `pc` against `regs` in `profile`, through the pure
-/// layers only.
-fn step(profile: Rv32iProfile, word: u32, pc: u32, regs: &RegisterFile) -> Step {
-    if profile == Rv32iProfile::M2
-        && let Some(instr) = decode_privileged(word)
-    {
-        return Step::Done(privileged(instr, word, pc, regs));
+/// What decides how a word executes: the profile, and in the `M3` profile the mode the
+/// hart is in before the instruction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Isa {
+    M1,
+    M2,
+    M3(Privilege),
+}
+
+/// Decodes and executes `word` at `pc` against `regs` for `isa`, through the pure layers
+/// only.
+fn step(isa: Isa, word: u32, pc: u32, regs: &RegisterFile) -> Step {
+    match isa {
+        Isa::M1 => {}
+        Isa::M2 => {
+            if let Some(instr) = decode_privileged(word) {
+                return Step::Done(privileged(instr, word, pc, regs));
+            }
+        }
+        Isa::M3(mode) => {
+            if let Some(outcome) = privileged_m3(mode, word, pc, regs) {
+                return Step::Done(outcome);
+            }
+        }
     }
     let instr = match decode(word) {
         Ok(instr) => instr,
@@ -298,7 +347,7 @@ fn step(profile: Rv32iProfile, word: u32, pc: u32, regs: &RegisterFile) -> Step 
         }
         Instr::Fence | Instr::Ecall | Instr::Ebreak => execute_system(&instr, pc)
             .ok()
-            .map(|o| Step::Done(Outcome::Exec(o))),
+            .map(|o| Step::Done(Outcome::Exec(ecall_cause(isa, o)))),
         Instr::Load { .. } | Instr::Store { .. } => {
             prepare_memory(&instr, pc, a, b)
                 .ok()
@@ -317,23 +366,96 @@ fn step(profile: Rv32iProfile, word: u32, pc: u32, regs: &RegisterFile) -> Step 
 fn privileged(instr: PrivInstr, word: u32, pc: u32, regs: &RegisterFile) -> Outcome {
     match instr {
         PrivInstr::Mret => Outcome::Mret,
-        PrivInstr::Csr { csr, .. } if !csr::is_supported(csr) => {
-            Outcome::Exec(ExecOutcome::Trap(PendingTrap {
-                cause: TrapCause::IllegalInstruction,
-                tval: word,
-            }))
+        PrivInstr::Csr { csr, .. } if !csr::is_supported(csr) => illegal(word),
+        PrivInstr::Csr { op, rd, src, csr } => {
+            Outcome::Csr(csr_operation(op, rd, src, csr, instr.writes(), pc, regs))
         }
-        PrivInstr::Csr { op, rd, src, csr } => Outcome::Csr(PendingCsr {
-            csr,
-            op,
-            write: instr.writes(),
-            operand: match src {
-                CsrSource::Reg(rs1) => regs.read(rs1),
-                CsrSource::Imm(uimm) => u32::from(uimm),
-            },
-            rd,
+    }
+}
+
+/// The pending outcome of a privileged instruction in the `M3` profile, run in `mode`
+/// (`docs/m3-design.md` §5.1); `None` if `word` is not one, so it decodes as RV32I.
+///
+/// A CSR instruction is illegal on a CSR off the `M3` whitelist, from a mode below the
+/// CSR's, or when it writes a read-only CSR; `MRET` is legal only in M; `SRET` and
+/// `SFENCE.VMA` are illegal in U. `SFENCE.VMA` retires as a no-op: there is no TLB.
+fn privileged_m3(mode: Privilege, word: u32, pc: u32, regs: &RegisterFile) -> Option<Outcome> {
+    if let Some(instr) = decode_privileged(word) {
+        return Some(match instr {
+            PrivInstr::Mret if mode == Privilege::Machine => Outcome::Mret,
+            PrivInstr::Mret => illegal(word),
+            PrivInstr::Csr { csr, .. }
+                if !privilege::is_supported(csr)
+                    || !privilege::accessible(csr, mode, instr.writes()) =>
+            {
+                illegal(word)
+            }
+            PrivInstr::Csr { op, rd, src, csr } => {
+                Outcome::Csr(csr_operation(op, rd, src, csr, instr.writes(), pc, regs))
+            }
+        });
+    }
+    Some(match decode_supervisor(word)? {
+        _ if mode == Privilege::User => illegal(word),
+        SupervisorInstr::Sret => Outcome::Sret,
+        SupervisorInstr::SfenceVma => Outcome::Exec(ExecOutcome::Effect(PendingEffect {
+            reg_write: None,
             next_pc: pc.wrapping_add(4),
+        })),
+    })
+}
+
+/// `IllegalInstruction` for `word`.
+fn illegal(word: u32) -> Outcome {
+    Outcome::Exec(ExecOutcome::Trap(PendingTrap {
+        cause: TrapCause::IllegalInstruction,
+        tval: word,
+    }))
+}
+
+/// A CSR instruction on a supported CSR, with its operand read now.
+fn csr_operation(
+    op: CsrOp,
+    rd: Reg,
+    src: CsrSource,
+    csr: u16,
+    write: bool,
+    pc: u32,
+    regs: &RegisterFile,
+) -> PendingCsr {
+    PendingCsr {
+        csr,
+        op,
+        write,
+        operand: match src {
+            CsrSource::Reg(rs1) => regs.read(rs1),
+            CsrSource::Imm(uimm) => u32::from(uimm),
+        },
+        rd,
+        next_pc: pc.wrapping_add(4),
+    }
+}
+
+/// In the `M3` profile, `ECALL`'s cause names the mode it runs in (`docs/m3-design.md`
+/// §5.3): `EnvironmentCallFromU` in U, `EnvironmentCallFromS` in S, and `EnvironmentCall`
+/// (code 11) in M. Every other outcome, and every outcome in `M1` and `M2`, is unchanged.
+fn ecall_cause(isa: Isa, outcome: ExecOutcome) -> ExecOutcome {
+    match (isa, outcome) {
+        (
+            Isa::M3(mode),
+            ExecOutcome::Trap(PendingTrap {
+                cause: TrapCause::EnvironmentCall,
+                tval,
+            }),
+        ) => ExecOutcome::Trap(PendingTrap {
+            cause: match mode {
+                Privilege::User => TrapCause::EnvironmentCallFromU,
+                Privilege::Supervisor => TrapCause::EnvironmentCallFromS,
+                Privilege::Machine => TrapCause::EnvironmentCall,
+            },
+            tval,
         }),
+        (_, outcome) => outcome,
     }
 }
 
@@ -375,6 +497,9 @@ pub struct Rv32iCpu {
     state: State,
     /// The machine CSRs. Always at reset in the `M1` profile, which cannot reach them.
     csrs: CsrFile,
+    /// The mode and the CSRs the `M3` profile adds. Always at reset in `M1` and `M2`,
+    /// which cannot reach them.
+    m3: M3State,
 }
 
 impl Rv32iCpu {
@@ -392,12 +517,53 @@ impl Rv32iCpu {
             next_txn: 0,
             state: State::FetchIssue,
             csrs: CsrFile::new(),
+            m3: M3State::new(),
         })
     }
 
-    /// The machine CSRs (`M2`; at reset and unused in `M1`).
+    /// The machine CSRs (`M2`, `M3`; at reset and unused in `M1`). In the `M3` profile
+    /// `mstatus` also has the fields in [`Rv32iCpu::m3`].
     pub fn csrs(&self) -> &CsrFile {
         &self.csrs
+    }
+
+    /// The mode and the CSRs the `M3` profile adds (at reset and unused in `M1` and
+    /// `M2`).
+    pub fn m3(&self) -> &M3State {
+        &self.m3
+    }
+
+    /// How the next word executes.
+    fn isa(&self) -> Isa {
+        match self.config.profile {
+            Rv32iProfile::M1 => Isa::M1,
+            Rv32iProfile::M2 => Isa::M2,
+            Rv32iProfile::M3 => Isa::M3(self.m3.privilege),
+        }
+    }
+
+    /// `cause`'s name in this profile's traces and inspect.
+    fn cause_name(&self, cause: TrapCause) -> &'static str {
+        match self.config.profile {
+            Rv32iProfile::M1 | Rv32iProfile::M2 => cause.name(),
+            Rv32iProfile::M3 => cause.m3_name(),
+        }
+    }
+
+    /// Reads a supported CSR under this profile's rules.
+    fn read_csr(&self, csr: u16) -> Option<u32> {
+        match self.config.profile {
+            Rv32iProfile::M1 | Rv32iProfile::M2 => self.csrs.read(csr),
+            Rv32iProfile::M3 => self.m3.read(&self.csrs, csr),
+        }
+    }
+
+    /// Writes a supported CSR under this profile's rules.
+    fn write_csr(&mut self, csr: u16, value: u32) -> Option<()> {
+        match self.config.profile {
+            Rv32iProfile::M1 | Rv32iProfile::M2 => self.csrs.write(csr, value),
+            Rv32iProfile::M3 => self.m3.write(&mut self.csrs, csr, value),
+        }
     }
 
     /// The architectural `pc`.
@@ -433,8 +599,9 @@ impl Rv32iCpu {
     }
 
     /// Sends a request under the next `TxnId`, which is consumed only if the send succeeds.
-    /// In the `M2` profile the counter never wraps: if it cannot advance, nothing is sent
-    /// and the session faults (`docs/m2-design.md` §6.2). `M1` keeps its M1 arithmetic.
+    /// In the `M2` and `M3` profiles the counter never wraps: if it cannot advance, nothing
+    /// is sent and the session faults (`docs/m2-design.md` §6.2). `M1` keeps its M1
+    /// arithmetic.
     fn send(
         &mut self,
         ctx: &mut dyn SimContext,
@@ -446,7 +613,7 @@ impl Rv32iCpu {
                 ctx.send(PORT, msg(txn).into(), ScheduleWhen::Now, Phase::Request)?;
                 self.next_txn += 1;
             }
-            Rv32iProfile::M2 => {
+            Rv32iProfile::M2 | Rv32iProfile::M3 => {
                 let next = self
                     .next_txn
                     .checked_add(1)
@@ -533,10 +700,7 @@ impl Rv32iCpu {
                         SimError::ComponentFault("rv32 cpu: fetch returned other than 4 bytes")
                     })?;
                     let word = u32::from_le_bytes(bytes);
-                    (
-                        Some(word),
-                        step(self.config.profile, word, self.pc, &self.regs),
-                    )
+                    (Some(word), step(self.isa(), word, self.pc, &self.regs))
                 }
                 MemMsg::ReadResp {
                     outcome:
@@ -584,12 +748,33 @@ impl Rv32iCpu {
         ctx: &mut dyn SimContext,
     ) -> Result<(), SimError> {
         if let Outcome::Exec(ExecOutcome::Trap(PendingTrap { cause, tval })) = outcome {
+            // A delegated exception (`M3`, docs/m3-design.md §5.3) is delivered to S: not a
+            // retirement, so no instret, no instruction limit, and no interrupt sampling.
+            if self.config.profile == Rv32iProfile::M3 {
+                let (pc, from) = (self.pc, self.m3.privilege);
+                if let Some(handler) = self.m3.take_exception(cause, pc, tval) {
+                    ctx.trace(
+                        EXCEPTION_KIND,
+                        vec![
+                            ("pc", Value::U64(u64::from(pc))),
+                            ("insn", Value::U64(u64::from(insn.unwrap_or(0)))),
+                            ("cause", Value::Str(cause.m3_name().to_owned())),
+                            ("tval", Value::U64(u64::from(tval))),
+                            ("from", Value::Str(from.name().to_owned())),
+                            ("to", Value::Str(self.m3.privilege.name().to_owned())),
+                        ],
+                    );
+                    self.pc = handler;
+                    self.state = State::FetchIssue;
+                    return self.wake_next_cycle(ctx, FETCH);
+                }
+            }
             ctx.trace(
                 TRAP_KIND,
                 vec![
                     ("pc", Value::U64(u64::from(self.pc))),
                     ("insn", Value::U64(u64::from(insn.unwrap_or(0)))),
-                    ("cause", Value::Str(cause.name().to_owned())),
+                    ("cause", Value::Str(self.cause_name(cause).to_owned())),
                     ("tval", Value::U64(u64::from(tval))),
                 ],
             );
@@ -621,7 +806,19 @@ impl Rv32iCpu {
                     next_pc: self.csrs.mepc,
                 };
                 let fields = self.commit_fields(insn, effect);
-                self.pc = self.csrs.mret();
+                self.pc = match self.config.profile {
+                    Rv32iProfile::M1 | Rv32iProfile::M2 => self.csrs.mret(),
+                    Rv32iProfile::M3 => self.m3.mret(&mut self.csrs),
+                };
+                fields
+            }
+            Outcome::Sret => {
+                let effect = PendingEffect {
+                    reg_write: None,
+                    next_pc: self.m3.sepc,
+                };
+                let fields = self.commit_fields(insn, effect);
+                self.pc = self.m3.sret();
                 fields
             }
         };
@@ -644,12 +841,25 @@ impl Rv32iCpu {
                     ("handler", Value::U64(u64::from(self.pc))),
                 ],
             );
+        } else if self.config.profile == Rv32iProfile::M3 && self.m3.mei_eligible(&self.csrs) {
+            // docs/m3-design.md §5.1: eligible below M whatever MIE says; taken in M.
+            let from = self.m3.privilege;
+            self.pc = self.m3.take_mei(&mut self.csrs, self.pc);
+            ctx.trace(
+                INTERRUPT_KIND,
+                vec![
+                    ("mepc", Value::U64(u64::from(self.csrs.mepc))),
+                    ("mcause", Value::U64(u64::from(self.csrs.mcause))),
+                    ("handler", Value::U64(u64::from(self.pc))),
+                    ("from", Value::Str(from.name().to_owned())),
+                ],
+            );
         }
         self.state = State::FetchIssue;
         self.wake_next_cycle(ctx, FETCH)
     }
 
-    /// Takes an `irq.v0` level on the `irq` port (`M2`): valid only in `Complete`, in any
+    /// Takes an `irq.v0` level on the `irq` port (`M2`, `M3`): valid only in `Complete`, in any
     /// execution state. It changes the level and nothing else; the interrupt is sampled
     /// only when an instruction retires.
     fn irq(&mut self, msg: &IrqMsg, ctx: &mut dyn SimContext) -> Result<(), SimError> {
@@ -674,7 +884,7 @@ impl Rv32iCpu {
     ) -> Result<Vec<(&'static str, Value)>, SimError> {
         let unsupported =
             || SimError::ComponentFault("rv32 cpu: pending CSR operation on an unsupported CSR");
-        let old = self.csrs.read(op.csr).ok_or_else(unsupported)?;
+        let old = self.read_csr(op.csr).ok_or_else(unsupported)?;
         let effect = PendingEffect {
             reg_write: Some(RegWrite {
                 rd: op.rd,
@@ -685,10 +895,9 @@ impl Rv32iCpu {
         let mut fields = self.commit_fields(insn, effect);
         fields.push(("csr", Value::U64(u64::from(op.csr))));
         if op.write {
-            self.csrs
-                .write(op.csr, op.op.apply(old, op.operand))
+            self.write_csr(op.csr, op.op.apply(old, op.operand))
                 .ok_or_else(unsupported)?;
-            let stored = self.csrs.read(op.csr).ok_or_else(unsupported)?;
+            let stored = self.read_csr(op.csr).ok_or_else(unsupported)?;
             fields.push(("csr_value", Value::U64(u64::from(stored))));
         }
         self.regs.write(op.rd, old);
@@ -696,7 +905,10 @@ impl Rv32iCpu {
         Ok(fields)
     }
 
-    /// The `rv32.commit` fields (§5.7), computed before the effect is applied.
+    /// The `rv32.commit` fields (§5.7), computed before the effect is applied. The `M3`
+    /// profile adds `priv`, the mode the instruction ran in, after `next_pc`, and for
+    /// loads and stores `paddr` after `addr` (`docs/m3-design.md` §5.6): without
+    /// translation (M3.2) it is the address itself.
     fn commit_fields(&self, insn: u32, effect: PendingEffect) -> Vec<(&'static str, Value)> {
         // A write to x0 writes nothing, and is reported as no write.
         let (rd, rd_value) = effect
@@ -710,9 +922,19 @@ impl Rv32iCpu {
             ("rd_value", Value::U64(u64::from(rd_value))),
             ("next_pc", Value::U64(u64::from(effect.next_pc))),
         ];
-        match step(self.config.profile, insn, self.pc, &self.regs) {
+        let isa = self.isa();
+        let m3 = if let Isa::M3(mode) = isa {
+            fields.push(("priv", Value::U64(u64::from(mode.bits()))));
+            true
+        } else {
+            false
+        };
+        match step(isa, insn, self.pc, &self.regs) {
             Step::Memory(MemoryPlan::Load(load)) => {
                 fields.push(("addr", Value::U64(u64::from(load.addr))));
+                if m3 {
+                    fields.push(("paddr", Value::U64(u64::from(load.addr))));
+                }
             }
             Step::Memory(MemoryPlan::Store(store)) => {
                 let value = store
@@ -721,6 +943,9 @@ impl Rv32iCpu {
                     .rev()
                     .fold(0u64, |v, &b| (v << 8) | u64::from(b));
                 fields.push(("addr", Value::U64(u64::from(store.addr))));
+                if m3 {
+                    fields.push(("paddr", Value::U64(u64::from(store.addr))));
+                }
                 fields.push(("width", Value::U64(store.data.len() as u64)));
                 fields.push(("value", Value::U64(value)));
             }
@@ -735,7 +960,8 @@ impl Rv32iCpu {
         w.u64(self.config.max_instructions.get());
     }
 
-    /// The restored state, checked against the instruction it belongs to.
+    /// The restored state, checked against the instruction it belongs to (schemas 1 and
+    /// 2; schema 3 restores through [`Rv32iCpu::restore_m3`]).
     fn read_state(
         &self,
         r: &mut SnapshotReader<'_>,
@@ -756,7 +982,12 @@ impl Rv32iCpu {
             }
         };
         let profile = self.config.profile;
-        let memory = |insn: u32| match step(profile, insn, pc, regs) {
+        let isa = match profile {
+            Rv32iProfile::M1 => Isa::M1,
+            Rv32iProfile::M2 => Isa::M2,
+            Rv32iProfile::M3 => unreachable!("schema 3 restores through restore_m3"),
+        };
+        let memory = |insn: u32| match step(isa, insn, pc, regs) {
             Step::Memory(plan) => Ok(plan),
             Step::Done(_) => Err(invalid(
                 "rv32 cpu: pending memory instruction is not an aligned load or store",
@@ -790,7 +1021,7 @@ impl Rv32iCpu {
                     t => return Err(tag("rv32 cpu instruction", t)),
                 };
                 let outcome = read_outcome(r, profile)?;
-                if !consistent(profile, insn, outcome, pc, regs) {
+                if !consistent(isa, insn, outcome, pc, regs) {
                     return Err(invalid(
                         "rv32 cpu: pending outcome does not match its instruction",
                     ));
@@ -799,7 +1030,7 @@ impl Rv32iCpu {
             }
             5 => State::Halted(match r.u8()? {
                 0 => {
-                    let cause = read_cause(r)?;
+                    let cause = read_cause(r, profile)?;
                     let trap = RvTrap {
                         cause,
                         pc: r.u32()?,
@@ -816,18 +1047,262 @@ impl Rv32iCpu {
             t => return Err(tag("rv32 cpu state", t)),
         })
     }
+
+    /// Restores a schema 3 snapshot (`docs/m3-design.md` §5.5) in three steps: decode every
+    /// field to the end, checking only encodings; validate every invariant on the decoded
+    /// values together; then replace the state at once. The state record comes before the
+    /// mode and the CSRs it depends on, so nothing about it is checked until all are read.
+    fn restore_m3(&mut self, r: &mut SnapshotReader<'_>) -> Result<(), RestoreError> {
+        let invalid = RestoreError::InvalidState;
+        let flag = |r: &mut SnapshotReader<'_>| {
+            r.bool()
+                .map_err(|_| RestoreError::InvalidState("rv32 cpu: a CSR flag is not 0 or 1"))
+        };
+
+        // 1. Decode.
+        let mut config = SnapshotWriter::new();
+        self.write_config(&mut config);
+        let config_matches = r.raw(config.as_bytes().len())? == config.as_bytes();
+        let pc = r.u32()?;
+        let mut regs = RegisterFile::new();
+        for reg in stored_registers() {
+            regs.write(reg, r.u32()?);
+        }
+        let instret = r.u64()?;
+        let next_txn = r.u64()?;
+        let record = decode_state_m3(r)?;
+        let (mie, mpie, meie) = (flag(r)?, flag(r)?, flag(r)?);
+        let csrs = CsrFile {
+            mie,
+            mpie,
+            meie,
+            mtvec: r.u32()?,
+            mscratch: r.u32()?,
+            mepc: r.u32()?,
+            mcause: r.u32()?,
+            mtval: r.u32()?,
+            irq_level: flag(r)?,
+        };
+        let mode = r.u8()?;
+        let (sie, spie) = (flag(r)?, flag(r)?);
+        let (spp, mpp) = (r.u8()?, r.u8()?);
+        let (sum, mxr) = (flag(r)?, flag(r)?);
+        let (medeleg, stvec, sscratch, sepc, scause, stval, satp) = (
+            r.u32()?,
+            r.u32()?,
+            r.u32()?,
+            r.u32()?,
+            r.u32()?,
+            r.u32()?,
+            r.u32()?,
+        );
+
+        // 2. Validate.
+        if !config_matches {
+            return Err(invalid(
+                "rv32 cpu: snapshot was taken with a different configuration",
+            ));
+        }
+        if !pc.is_multiple_of(4) {
+            return Err(invalid("rv32 cpu: misaligned pc"));
+        }
+        if csrs.mtvec & 0b11 != 0 {
+            return Err(invalid("rv32 cpu: mtvec MODE is not 0"));
+        }
+        if csrs.mepc & 0b11 != 0 {
+            return Err(invalid("rv32 cpu: misaligned mepc"));
+        }
+        let m3 = M3State {
+            privilege: Privilege::from_bits(mode)
+                .ok_or(invalid("rv32 cpu: priv is not U, S, or M"))?,
+            sie,
+            spie,
+            spp: Spp::from_bits(spp).ok_or(invalid("rv32 cpu: SPP is not U or S"))?,
+            mpp: Privilege::from_bits(mpp).ok_or(invalid("rv32 cpu: MPP is not U, S, or M"))?,
+            sum,
+            mxr,
+            medeleg,
+            stvec,
+            sscratch,
+            sepc,
+            scause,
+            stval,
+            satp,
+        };
+        if medeleg & !privilege::MEDELEG_MASK != 0 {
+            return Err(invalid("rv32 cpu: medeleg has a bit outside its mask"));
+        }
+        if stvec & 0b11 != 0 {
+            return Err(invalid("rv32 cpu: stvec MODE is not 0"));
+        }
+        if sepc & 0b11 != 0 {
+            return Err(invalid("rv32 cpu: misaligned sepc"));
+        }
+        if !privilege::satp_reachable(satp) {
+            return Err(invalid("rv32 cpu: satp is not a value a write can produce"));
+        }
+        let state = validate_state_m3(record, &m3, pc, &regs, next_txn)?;
+        let limit = self.config.max_instructions.get();
+        let consistent_count = match state {
+            State::Halted(Halt::InstructionLimit) => instret == limit,
+            _ => instret < limit,
+        };
+        if !consistent_count {
+            return Err(invalid(
+                "rv32 cpu: instret does not match the instruction limit",
+            ));
+        }
+
+        // 3. Construct.
+        self.pc = pc;
+        self.regs = regs;
+        self.instret = instret;
+        self.next_txn = next_txn;
+        self.state = state;
+        self.csrs = csrs;
+        self.m3 = m3;
+        Ok(())
+    }
 }
 
-/// Whether `outcome` can be the result of `insn` at `pc` with `regs` in `profile`: exactly
-/// the pure result when memory is not involved (including a pending CSR operation or
-/// `MRET`), and a retirement or the matching access fault when it is.
-fn consistent(
-    profile: Rv32iProfile,
-    insn: Option<u32>,
-    outcome: Outcome,
+/// A schema 3 state record, decoded but not yet checked against anything.
+enum StateRecord {
+    FetchIssue,
+    FetchWait { txn: u64 },
+    MemIssue { insn: u32 },
+    MemWait { txn: u64, insn: u32 },
+    CommitPending { insn: Option<u32>, outcome: Outcome },
+    Trap(RvTrap),
+    InstructionLimit,
+}
+
+/// Decodes a schema 3 state record, checking only its tags.
+fn decode_state_m3(r: &mut SnapshotReader<'_>) -> Result<StateRecord, RestoreError> {
+    let tag = |what, tag| RestoreError::Decode(DecodeError::InvalidTag { what, tag });
+    Ok(match r.u8()? {
+        0 => StateRecord::FetchIssue,
+        1 => StateRecord::FetchWait { txn: r.u64()? },
+        2 => StateRecord::MemIssue { insn: r.u32()? },
+        3 => StateRecord::MemWait {
+            txn: r.u64()?,
+            insn: r.u32()?,
+        },
+        4 => {
+            let insn = match r.u8()? {
+                0 => None,
+                1 => Some(r.u32()?),
+                t => return Err(tag("rv32 cpu instruction", t)),
+            };
+            StateRecord::CommitPending {
+                insn,
+                outcome: read_outcome(r, Rv32iProfile::M3)?,
+            }
+        }
+        5 => match r.u8()? {
+            0 => StateRecord::Trap(RvTrap {
+                cause: read_cause(r, Rv32iProfile::M3)?,
+                pc: r.u32()?,
+                tval: r.u32()?,
+            }),
+            1 => StateRecord::InstructionLimit,
+            t => return Err(tag("rv32 cpu halt", t)),
+        },
+        t => return Err(tag("rv32 cpu state", t)),
+    })
+}
+
+/// Checks a decoded schema 3 state record against the decoded mode, CSRs, `pc`, registers,
+/// and next `TxnId`, and builds the state.
+fn validate_state_m3(
+    record: StateRecord,
+    m3: &M3State,
     pc: u32,
     regs: &RegisterFile,
-) -> bool {
+    next_txn: u64,
+) -> Result<State, RestoreError> {
+    let invalid = RestoreError::InvalidState;
+    let isa = Isa::M3(m3.privilege);
+    let outstanding = |txn: u64| {
+        if next_txn.checked_sub(1) == Some(txn) {
+            Ok(TxnId(txn))
+        } else {
+            Err(invalid(
+                "rv32 cpu: outstanding txn is not the latest issued",
+            ))
+        }
+    };
+    let memory = |insn: u32| match step(isa, insn, pc, regs) {
+        Step::Memory(plan) => Ok(plan),
+        Step::Done(_) => Err(invalid(
+            "rv32 cpu: pending memory instruction is not an aligned load or store",
+        )),
+    };
+    let raised = |cause| {
+        if privilege::raised(cause) {
+            Ok(())
+        } else {
+            Err(invalid("rv32 cpu: trap cause is not raised at this step"))
+        }
+    };
+    Ok(match record {
+        StateRecord::FetchIssue => State::FetchIssue,
+        StateRecord::FetchWait { txn } => State::FetchWait {
+            txn: outstanding(txn)?,
+        },
+        StateRecord::MemIssue { insn } => State::MemIssue {
+            insn,
+            plan: memory(insn)?,
+        },
+        StateRecord::MemWait { txn, insn } => State::MemWait {
+            txn: outstanding(txn)?,
+            insn,
+            plan: memory(insn)?,
+        },
+        StateRecord::CommitPending { insn, outcome } => {
+            if let Outcome::Exec(ExecOutcome::Trap(t)) = outcome {
+                raised(t.cause)?;
+            }
+            if !consistent(isa, insn, outcome, pc, regs) {
+                return Err(invalid(
+                    "rv32 cpu: pending outcome does not match its instruction",
+                ));
+            }
+            State::CommitPending { insn, outcome }
+        }
+        StateRecord::Trap(trap) => {
+            raised(trap.cause)?;
+            if trap.pc != pc {
+                return Err(invalid("rv32 cpu: trap pc is not the architectural pc"));
+            }
+            // A halt never changes the mode, so the halted trap is one taken in it: not
+            // delegated, and an `ECALL` names it.
+            if m3.delegates(trap.cause) {
+                return Err(invalid("rv32 cpu: halted on a delegated exception"));
+            }
+            let ecall = match m3.privilege {
+                Privilege::User => TrapCause::EnvironmentCallFromU,
+                Privilege::Supervisor => TrapCause::EnvironmentCallFromS,
+                Privilege::Machine => TrapCause::EnvironmentCall,
+            };
+            let is_ecall = matches!(
+                trap.cause,
+                TrapCause::EnvironmentCallFromU
+                    | TrapCause::EnvironmentCallFromS
+                    | TrapCause::EnvironmentCall
+            );
+            if is_ecall && trap.cause != ecall {
+                return Err(invalid("rv32 cpu: ecall cause does not match priv"));
+            }
+            State::Halted(Halt::Trap(trap))
+        }
+        StateRecord::InstructionLimit => State::Halted(Halt::InstructionLimit),
+    })
+}
+
+/// Whether `outcome` can be the result of `insn` at `pc` with `regs` for `isa`: exactly
+/// the pure result when memory is not involved (including a pending CSR operation,
+/// `MRET`, or `SRET`), and a retirement or the matching access fault when it is.
+fn consistent(isa: Isa, insn: Option<u32>, outcome: Outcome, pc: u32, regs: &RegisterFile) -> bool {
     let Some(word) = insn else {
         return outcome
             == Outcome::Exec(ExecOutcome::Trap(PendingTrap {
@@ -835,7 +1310,7 @@ fn consistent(
                 tval: pc,
             }));
     };
-    let plan = match step(profile, word, pc, regs) {
+    let plan = match step(isa, word, pc, regs) {
         Step::Done(expected) => return expected == outcome,
         Step::Memory(plan) => plan,
     };
@@ -867,7 +1342,8 @@ fn consistent(
     }
 }
 
-/// Snapshot codes for trap causes, in `docs/m1-design.md` §6 table order.
+/// Snapshot codes for trap causes in schemas 1 and 2, in `docs/m1-design.md` §6 table
+/// order.
 const CAUSES: [TrapCause; 9] = [
     TrapCause::InstructionAddressMisaligned,
     TrapCause::InstructionAccessFault,
@@ -880,17 +1356,49 @@ const CAUSES: [TrapCause; 9] = [
     TrapCause::StoreAccessFault,
 ];
 
+/// Snapshot codes for trap causes in schema 3: [`CAUSES`], then the causes `M3` adds
+/// (`docs/m3-design.md` §5.5).
+const CAUSES_M3: [TrapCause; 14] = [
+    TrapCause::InstructionAddressMisaligned,
+    TrapCause::InstructionAccessFault,
+    TrapCause::IllegalInstruction,
+    TrapCause::Breakpoint,
+    TrapCause::EnvironmentCall,
+    TrapCause::LoadAddressMisaligned,
+    TrapCause::LoadAccessFault,
+    TrapCause::StoreAddressMisaligned,
+    TrapCause::StoreAccessFault,
+    TrapCause::EnvironmentCallFromU,
+    TrapCause::EnvironmentCallFromS,
+    TrapCause::InstructionPageFault,
+    TrapCause::LoadPageFault,
+    TrapCause::StorePageFault,
+];
+
+/// The snapshot cause codes of `profile`'s schema.
+fn causes(profile: Rv32iProfile) -> &'static [TrapCause] {
+    match profile {
+        Rv32iProfile::M1 | Rv32iProfile::M2 => &CAUSES,
+        Rv32iProfile::M3 => &CAUSES_M3,
+    }
+}
+
+/// Every cause a snapshot can hold is in [`CAUSES_M3`], and [`CAUSES`] is its prefix, so
+/// a cause from `M1` or `M2` keeps its schema 1 code.
 fn write_cause(w: &mut SnapshotWriter, cause: TrapCause) {
-    let code = CAUSES
+    let code = CAUSES_M3
         .iter()
         .position(|&c| c == cause)
         .expect("every cause is listed");
     w.u8(code as u8);
 }
 
-fn read_cause(r: &mut SnapshotReader<'_>) -> Result<TrapCause, RestoreError> {
+fn read_cause(
+    r: &mut SnapshotReader<'_>,
+    profile: Rv32iProfile,
+) -> Result<TrapCause, RestoreError> {
     let code = r.u8()?;
-    CAUSES
+    causes(profile)
         .get(usize::from(code))
         .copied()
         .ok_or(RestoreError::Decode(DecodeError::InvalidTag {
@@ -900,7 +1408,8 @@ fn read_cause(r: &mut SnapshotReader<'_>) -> Result<TrapCause, RestoreError> {
 }
 
 /// Tags 0 (retirement) and 1 (trap) are schema 1's; tags 2 (CSR operation) and 3 (`MRET`)
-/// exist only in schema 2 (`docs/m2-design.md` §6.4).
+/// exist only in schemas 2 and 3 (`docs/m2-design.md` §6.4), and tag 4 (`SRET`) only in
+/// schema 3 (`docs/m3-design.md` §5.5).
 fn write_outcome(w: &mut SnapshotWriter, outcome: Outcome) {
     match outcome {
         Outcome::Exec(ExecOutcome::Effect(e)) => {
@@ -934,6 +1443,7 @@ fn write_outcome(w: &mut SnapshotWriter, outcome: Outcome) {
             w.u32(op.next_pc);
         }
         Outcome::Mret => w.u8(3),
+        Outcome::Sret => w.u8(4),
     }
 }
 
@@ -962,10 +1472,10 @@ fn read_outcome(
             }))
         }
         (1, _) => Outcome::Exec(ExecOutcome::Trap(PendingTrap {
-            cause: read_cause(r)?,
+            cause: read_cause(r, profile)?,
             tval: r.u32()?,
         })),
-        (2, Rv32iProfile::M2) => {
+        (2, Rv32iProfile::M2 | Rv32iProfile::M3) => {
             let csr = r.u16()?;
             let code = r.u8()?;
             let op = *CSR_OPS
@@ -984,7 +1494,8 @@ fn read_outcome(
                 next_pc: r.u32()?,
             })
         }
-        (3, Rv32iProfile::M2) => Outcome::Mret,
+        (3, Rv32iProfile::M2 | Rv32iProfile::M3) => Outcome::Mret,
+        (4, Rv32iProfile::M3) => Outcome::Sret,
         (t, _) => return Err(tag("rv32 outcome", t)),
     })
 }
@@ -1004,6 +1515,12 @@ const CSR_NAMES: [&str; 8] = [
     "mstatus", "mie", "mip", "mtvec", "mscratch", "mepc", "mcause", "mtval",
 ];
 
+/// Inspect names of the `M3` CSRs, in [`privilege::SUPPORTED`] order.
+const CSR_NAMES_M3: [&str; 19] = [
+    "mstatus", "mie", "mip", "mtvec", "mscratch", "mepc", "mcause", "mtval", "sstatus", "sie",
+    "sip", "stvec", "sscratch", "sepc", "scause", "stval", "satp", "medeleg", "mideleg",
+];
+
 /// `x1` to `x31`, in index order.
 fn stored_registers() -> impl Iterator<Item = Reg> {
     (1..32).map(|i| Reg::new(i).expect("below 32"))
@@ -1014,14 +1531,14 @@ impl Component for Rv32iCpu {
         "rv32i.cpu"
     }
 
-    /// `mem` in both profiles; `irq` too in the `M2` profile.
+    /// `mem` in every profile; `irq` too in the `M2` and `M3` profiles.
     fn ports(&self) -> Vec<PortSpec> {
         let mut ports = vec![PortSpec {
             name: "mem",
             protocol: mem_v1::PROTOCOL,
             role: Role::Initiator,
         }];
-        if self.config.profile == Rv32iProfile::M2 {
+        if self.config.profile != Rv32iProfile::M1 {
             ports.push(PortSpec {
                 name: "irq",
                 protocol: irq_v0::PROTOCOL,
@@ -1053,25 +1570,29 @@ impl Component for Rv32iCpu {
             (Rv32iProfile::M1, Delivered::Message { .. }) => {
                 Err(SimError::ComponentFault("rv32 cpu: message is not mem.v1"))
             }
-            (Rv32iProfile::M2, Delivered::Message { port, msg }) => match (*port, msg) {
-                (PORT, Message::MemV1(msg)) => self.response(msg, ctx),
-                (PORT, _) => Err(SimError::ComponentFault(
-                    "rv32 cpu: message on mem is not mem.v1",
-                )),
-                (IRQ_PORT, Message::Irq(msg)) => self.irq(msg, ctx),
-                (IRQ_PORT, _) => Err(SimError::ComponentFault(
-                    "rv32 cpu: message on irq is not irq.v0",
-                )),
-                _ => Err(SimError::ComponentFault(
-                    "rv32 cpu: message on an unknown port",
-                )),
-            },
+            (Rv32iProfile::M2 | Rv32iProfile::M3, Delivered::Message { port, msg }) => {
+                match (*port, msg) {
+                    (PORT, Message::MemV1(msg)) => self.response(msg, ctx),
+                    (PORT, _) => Err(SimError::ComponentFault(
+                        "rv32 cpu: message on mem is not mem.v1",
+                    )),
+                    (IRQ_PORT, Message::Irq(msg)) => self.irq(msg, ctx),
+                    (IRQ_PORT, _) => Err(SimError::ComponentFault(
+                        "rv32 cpu: message on irq is not irq.v0",
+                    )),
+                    _ => Err(SimError::ComponentFault(
+                        "rv32 cpu: message on an unknown port",
+                    )),
+                }
+            }
         }
     }
 
     /// `pc`, `x1`…`x31`, `instret`, the execution state's name, and, once halted, the
     /// reason (§5.7). In the `M2` profile, then `mstatus`, `mie`, `mip`, `mtvec`,
-    /// `mscratch`, `mepc`, `mcause`, and `mtval` as read (`docs/m2-design.md` §6.5).
+    /// `mscratch`, `mepc`, `mcause`, and `mtval` as read (`docs/m2-design.md` §6.5). In
+    /// the `M3` profile, then `priv` (0 U, 1 S, 3 M) and the 19 `M3` CSRs as read, in
+    /// [`privilege::SUPPORTED`] order (`docs/m3-design.md` §5.6).
     fn inspect(&self) -> StateView {
         let mut fields = vec![("pc", Value::U64(u64::from(self.pc)))];
         for (name, reg) in REG_NAMES.iter().zip(stored_registers()) {
@@ -1082,7 +1603,7 @@ impl Component for Rv32iCpu {
         match self.state {
             State::Halted(Halt::Trap(trap)) => {
                 fields.push(("halt", Value::Str("trap".to_owned())));
-                fields.push(("cause", Value::Str(trap.cause.name().to_owned())));
+                fields.push(("cause", Value::Str(self.cause_name(trap.cause).to_owned())));
                 fields.push(("trap_pc", Value::U64(u64::from(trap.pc))));
                 fields.push(("tval", Value::U64(u64::from(trap.tval))));
             }
@@ -1091,10 +1612,24 @@ impl Component for Rv32iCpu {
             }
             _ => {}
         }
-        if self.config.profile == Rv32iProfile::M2 {
-            for (name, csr) in CSR_NAMES.iter().zip(csr::SUPPORTED) {
-                let value = self.csrs.read(csr).expect("every listed CSR is supported");
-                fields.push((name, Value::U64(u64::from(value))));
+        match self.config.profile {
+            Rv32iProfile::M1 => {}
+            Rv32iProfile::M2 => {
+                for (name, csr) in CSR_NAMES.iter().zip(csr::SUPPORTED) {
+                    let value = self.csrs.read(csr).expect("every listed CSR is supported");
+                    fields.push((name, Value::U64(u64::from(value))));
+                }
+            }
+            Rv32iProfile::M3 => {
+                let mode = self.m3.privilege.bits();
+                fields.push(("priv", Value::U64(u64::from(mode))));
+                for (name, csr) in CSR_NAMES_M3.iter().zip(privilege::SUPPORTED) {
+                    let value = self
+                        .m3
+                        .read(&self.csrs, csr)
+                        .expect("every listed CSR is supported");
+                    fields.push((name, Value::U64(u64::from(value))));
+                }
             }
         }
         StateView { fields }
@@ -1104,6 +1639,7 @@ impl Component for Rv32iCpu {
         match self.config.profile {
             Rv32iProfile::M1 => SNAPSHOT_SCHEMA,
             Rv32iProfile::M2 => SNAPSHOT_SCHEMA_M2,
+            Rv32iProfile::M3 => SNAPSHOT_SCHEMA_M3,
         }
     }
 
@@ -1115,6 +1651,11 @@ impl Component for Rv32iCpu {
     /// Schema 2 (`M2`): schema 1, then `mstatus.MIE`, `mstatus.MPIE`, `mie.MEIE` (`u8`
     /// 0/1), `mtvec`, `mscratch`, `mepc`, `mcause`, `mtval` (`u32`), and the `irq` input
     /// level (`u8` 0/1). The profile itself is never written.
+    ///
+    /// Schema 3 (`M3`, `docs/m3-design.md` §5.5): schema 2, then `priv`, `mstatus.SIE`,
+    /// `SPIE`, `SPP`, `MPP`, `SUM`, `MXR` (`u8`), `medeleg`, `stvec`, `sscratch`, `sepc`,
+    /// `scause`, `stval`, and `satp` (`u32`). Its cause codes and outcome tags extend
+    /// schema 2's.
     fn snapshot(&self, w: &mut SnapshotWriter) {
         self.write_config(w);
         w.u32(self.pc);
@@ -1162,7 +1703,7 @@ impl Component for Rv32iCpu {
                 }
             }
         }
-        if self.config.profile == Rv32iProfile::M2 {
+        if self.config.profile != Rv32iProfile::M1 {
             let c = &self.csrs;
             w.bool(c.mie);
             w.bool(c.mpie);
@@ -1174,17 +1715,38 @@ impl Component for Rv32iCpu {
             w.u32(c.mtval);
             w.bool(c.irq_level);
         }
+        if self.config.profile == Rv32iProfile::M3 {
+            let m = &self.m3;
+            w.u8(m.privilege.bits());
+            w.bool(m.sie);
+            w.bool(m.spie);
+            w.u8(m.spp.bits());
+            w.u8(m.mpp.bits());
+            w.bool(m.sum);
+            w.bool(m.mxr);
+            w.u32(m.medeleg);
+            w.u32(m.stvec);
+            w.u32(m.sscratch);
+            w.u32(m.sepc);
+            w.u32(m.scause);
+            w.u32(m.stval);
+            w.u32(m.satp);
+        }
     }
 
     /// Restores every field at once, after checking the snapshot against the configuration
     /// and the pending instruction. Sends nothing: pending events come back with the
-    /// runtime's queue.
+    /// runtime's queue. Schema 3 decodes everything, then validates, then builds
+    /// (`restore_m3`).
     fn restore(&mut self, r: &mut SnapshotReader<'_>, schema: u32) -> Result<(), RestoreError> {
         let invalid = RestoreError::InvalidState;
         if schema != self.snapshot_schema_version() {
             return Err(invalid(
                 "rv32 cpu: snapshot schema does not match the CPU profile",
             ));
+        }
+        if self.config.profile == Rv32iProfile::M3 {
+            return self.restore_m3(r);
         }
         let mut config = SnapshotWriter::new();
         self.write_config(&mut config);
@@ -1217,6 +1779,7 @@ impl Component for Rv32iCpu {
         let csrs = match self.config.profile {
             Rv32iProfile::M1 => CsrFile::new(),
             Rv32iProfile::M2 => read_csrs(r)?,
+            Rv32iProfile::M3 => unreachable!("schema 3 restores through restore_m3"),
         };
         self.pc = pc;
         self.regs = regs;

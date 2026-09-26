@@ -275,7 +275,10 @@ jobs:
   # for the fixed seeds, and the misaligned-access programs on SystemScope against the
   # pinned Spike, retirement by retirement; then the directed M2 Zicsr, CSR, and MRET
   # programs (docs/m2-design.md §4) with the M2 CPU profile against Spike with
-  # --isa=rv32i_zicsr, CSR writes included. The only job that builds or runs Spike.
+  # --isa=rv32i_zicsr, CSR writes included; then the directed M3 privilege programs
+  # (docs/m3-design.md §5, M3.2) with the M3 CPU profile against Spike with
+  # --priv=msu, modes and delegated exceptions included. The only job that builds or
+  # runs Spike.
   # A cached build is used only after `spike verify` checks it against the pin.
   spike:
     name: M1-A3 Spike differential (Linux)
@@ -296,7 +299,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: systemscope
-      # Spike's configure requires dtc; the differential runs Spike with --disable-dtb.
+      # Spike's configure requires dtc. The M1 and M2 differentials run Spike with
+      # --disable-dtb; the M3 one boots with its device tree, which Spike builds with dtc.
       - name: Install dtc
         run: |
           sudo apt-get update
@@ -313,7 +317,7 @@ jobs:
         run: cargo xtask spike verify ~/spike
       - name: rv32ui fixtures match their manifest
         run: cargo xtask rv32-fixtures verify
-      - name: M1-A3 and M2 CSR retirement differential (40 rv32ui, 64 generated, 9 misaligned, 20 M2 CSR)
+      - name: M1-A3, M2 CSR, and M3 privilege differential (40 rv32ui, 64 generated, 9 misaligned, 20 M2 CSR, 13 M3 privilege)
         run: cargo xtask spike diff ~/spike
       - name: Keep Spike's logs
         if: failure()

@@ -80,6 +80,26 @@ fn every_act4_test_passes_with_the_m2_cpu_profile() {
     );
 }
 
+/// The M3 CPU profile passes the same corpus in M-mode (`docs/m3-design.md` §15.4).
+#[test]
+fn every_act4_test_passes_with_the_m3_cpu_profile() {
+    let (manifest, report) = act4::run_corpus_with(&workspace_root(), Rv32iProfile::M3).unwrap();
+    let lines: Vec<String> = report.results.iter().map(|r| r.line()).collect();
+    assert_eq!(
+        report.accept(manifest.count),
+        Ok(()),
+        "{}",
+        lines.join(
+            "
+"
+        )
+    );
+    assert_eq!(
+        (report.selected, report.executed(), report.passed()),
+        (EXPECTED_TESTS, EXPECTED_TESTS, EXPECTED_TESTS)
+    );
+}
+
 /// The value of `NAME=value` or `NAME='value'` in the build script.
 fn script_value<'a>(script: &'a str, name: &str) -> &'a str {
     let line = script

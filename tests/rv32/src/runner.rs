@@ -20,7 +20,12 @@
 //! executes exactly as without it (`docs/m2-design.md` §6.1, §7.1). The runtime requires
 //! every port to be linked.
 //!
-//! **Pass rule:** the CPU halts with `Trap(EnvironmentCall)`, `gp == 1`, and `a0 == 0`.
+//! The `M3` profile runs them too, linked the same way. It starts in M-mode, where an
+//! RV32I program runs as with `M2`; only its name for the `ECALL` cause differs
+//! (`EnvironmentCallFromM`, `docs/m3-design.md` §5.3), so the pass rule takes the profile.
+//!
+//! **Pass rule:** the CPU halts with `Trap(EnvironmentCall)` (`EnvironmentCallFromM` with
+//! the `M3` profile), `gp == 1`, and `a0 == 0`.
 //! Anything else fails, including the instruction limit, a runtime fault, or a run that
 //! ends without a halt.
 
@@ -60,6 +65,16 @@ pub const PASS_GP: u32 = 1;
 pub const PASS_A0: u32 = 0;
 /// The trap cause `RVTEST_PASS` and `RVTEST_FAIL` end with.
 pub const PASS_CAUSE: &str = "EnvironmentCall";
+/// [`PASS_CAUSE`] as the `M3` profile names it.
+pub const PASS_CAUSE_M3: &str = "EnvironmentCallFromM";
+
+/// The pass cause of `profile`.
+pub fn pass_cause(profile: Rv32iProfile) -> &'static str {
+    match profile {
+        Rv32iProfile::M1 | Rv32iProfile::M2 => PASS_CAUSE,
+        Rv32iProfile::M3 => PASS_CAUSE_M3,
+    }
+}
 
 /// The session seed of `m1-reference` (§9).
 pub const SEED: u64 = 0;
@@ -175,9 +190,15 @@ pub struct Outcome {
 
 /// The pass rule: `Ok` if the test passed, otherwise why it failed.
 pub fn judge(outcome: &Outcome) -> Result<(), String> {
+    judge_with(outcome, Rv32iProfile::M1)
+}
+
+/// [`judge`] for a run with the CPU in `profile`.
+pub fn judge_with(outcome: &Outcome, profile: Rv32iProfile) -> Result<(), String> {
+    let pass = pass_cause(profile);
     match &outcome.end {
-        End::Trap { cause, .. } if cause == PASS_CAUSE => {}
-        other => return Err(format!("ended with {other}, not Trap({PASS_CAUSE})")),
+        End::Trap { cause, .. } if cause == pass => {}
+        other => return Err(format!("ended with {other}, not Trap({pass})")),
     }
     if outcome.gp != PASS_GP || outcome.a0 != PASS_A0 {
         return Err(format!(
@@ -220,8 +241,8 @@ pub fn platform_with_seed(image: &LoadImage, uart: bool, seed: u64) -> Runtime {
 }
 
 /// [`platform_with_seed`] with the CPU in `profile`. `m1-reference` is the `M1` profile;
-/// the `M2` profile runs the same RV32I programs on the same platform
-/// (`docs/m2-design.md` §6.1, §15.4), with its `irq` port linked to a [`TiedLowIrq`]
+/// the `M2` and `M3` profiles run the same RV32I programs on the same platform
+/// (`docs/m2-design.md` §6.1, §15.4), with their `irq` port linked to a [`TiedLowIrq`]
 /// added after the other components.
 pub fn platform_with_profile(
     image: &LoadImage,
@@ -287,7 +308,7 @@ pub fn platform_with_profile(
         let device = t.add_component("soc.uart", Box::new(device));
         t.connect((bus, "uart"), (device, "mem"), Some(link));
     }
-    if profile == Rv32iProfile::M2 {
+    if profile != Rv32iProfile::M1 {
         let irq = t.add_component("soc.irq_low", Box::new(TiedLowIrq));
         t.connect((irq, "irq"), (cpu, "irq"), Some(link));
     }
@@ -496,7 +517,7 @@ pub fn run_fixture_with(
         name: fixture.name.clone(),
         blake3: fixture.blake3,
         image_hash: image.image_hash,
-        verdict: judge(&outcome),
+        verdict: judge_with(&outcome, profile),
         outcome,
     })
 }

@@ -49,7 +49,8 @@ pub struct PendingTrap {
 ///
 /// Every cause of `docs/m1-design.md` §6. Pure execution raises most of them; the CPU
 /// raises `InstructionAccessFault` on a faulting fetch and `IllegalInstruction` when
-/// decoding fails.
+/// decoding fails. The `M3` profile adds the mode-dependent `ECALL` causes and the page
+/// faults (`docs/m3-design.md` §5.3); M1 and M2 never raise them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TrapCause {
     /// A taken branch, `JAL`, or `JALR` whose target is not 4-byte aligned. `tval` is the
@@ -75,8 +76,23 @@ pub enum TrapCause {
     IllegalInstruction,
     /// `EBREAK`. `tval` is its `pc`.
     Breakpoint,
-    /// `ECALL`, the normal way an M1 program ends. `tval` is 0.
+    /// `ECALL`, the normal way an M1 program ends. `tval` is 0. In the `M3` profile it is
+    /// `ECALL` from M-mode, and M3 traces name it `EnvironmentCallFromM`
+    /// (`docs/m3-design.md` §5.3).
     EnvironmentCall,
+    /// `ECALL` from U-mode (`M3` only). `tval` is 0.
+    EnvironmentCallFromU,
+    /// `ECALL` from S-mode (`M3` only). `tval` is 0.
+    EnvironmentCallFromS,
+    /// A fetch the Sv32 walk refuses (`M3`). Defined at M3.2, raised from M3.3. `tval` is
+    /// the virtual address.
+    InstructionPageFault,
+    /// A load the Sv32 walk refuses (`M3`). Defined at M3.2, raised from M3.3. `tval` is
+    /// the virtual address.
+    LoadPageFault,
+    /// A store the Sv32 walk refuses (`M3`). Defined at M3.2, raised from M3.3. `tval` is
+    /// the virtual address.
+    StorePageFault,
 }
 
 impl TrapCause {
@@ -92,6 +108,43 @@ impl TrapCause {
             TrapCause::IllegalInstruction => "IllegalInstruction",
             TrapCause::Breakpoint => "Breakpoint",
             TrapCause::EnvironmentCall => "EnvironmentCall",
+            TrapCause::EnvironmentCallFromU => "EnvironmentCallFromU",
+            TrapCause::EnvironmentCallFromS => "EnvironmentCallFromS",
+            TrapCause::InstructionPageFault => "InstructionPageFault",
+            TrapCause::LoadPageFault => "LoadPageFault",
+            TrapCause::StorePageFault => "StorePageFault",
+        }
+    }
+
+    /// The cause's name in the `M3` profile's traces and inspect: [`TrapCause::name`],
+    /// except that `EnvironmentCall` is `EnvironmentCallFromM` (`docs/m3-design.md` §5.3,
+    /// §5.6). M1 and M2 keep `EnvironmentCall`.
+    pub const fn m3_name(self) -> &'static str {
+        match self {
+            TrapCause::EnvironmentCall => "EnvironmentCallFromM",
+            other => other.name(),
+        }
+    }
+
+    /// The architectural exception code, the value `mcause` or `scause` would hold and the
+    /// cause's `medeleg` bit (`docs/m3-design.md` §5.3). It is not the snapshot's code for
+    /// the cause, which has its own numbering (§5.5).
+    pub const fn code(self) -> u32 {
+        match self {
+            TrapCause::InstructionAddressMisaligned => 0,
+            TrapCause::InstructionAccessFault => 1,
+            TrapCause::IllegalInstruction => 2,
+            TrapCause::Breakpoint => 3,
+            TrapCause::LoadAddressMisaligned => 4,
+            TrapCause::LoadAccessFault => 5,
+            TrapCause::StoreAddressMisaligned => 6,
+            TrapCause::StoreAccessFault => 7,
+            TrapCause::EnvironmentCallFromU => 8,
+            TrapCause::EnvironmentCallFromS => 9,
+            TrapCause::EnvironmentCall => 11,
+            TrapCause::InstructionPageFault => 12,
+            TrapCause::LoadPageFault => 13,
+            TrapCause::StorePageFault => 15,
         }
     }
 }

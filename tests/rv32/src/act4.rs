@@ -1011,11 +1011,17 @@ fn uart_bytes(finished: &runner::Finished) -> Result<Vec<u8>, String> {
 /// other trap fails), and the UART must have printed exactly [`pass_output`]`(name)`:
 /// nothing before or after, no failure diagnostic, and no other test's summary.
 pub fn judge(name: &str, run: &Act4Run) -> Result<(), String> {
+    judge_with(name, run, Rv32iProfile::M1)
+}
+
+/// [`judge`] for a run with the CPU in `profile`, whose pass cause is
+/// [`runner::pass_cause`]`(profile)`.
+pub fn judge_with(name: &str, run: &Act4Run, profile: Rv32iProfile) -> Result<(), String> {
     let diagnostic = || match &run.output {
         Ok(bytes) => format!("the UART printed {:?}", String::from_utf8_lossy(bytes)),
         Err(e) => e.clone(),
     };
-    runner::judge(&run.outcome).map_err(|e| format!("{e}; {}", diagnostic()))?;
+    runner::judge_with(&run.outcome, profile).map_err(|e| format!("{e}; {}", diagnostic()))?;
     let output = run.output.as_ref().map_err(Clone::clone)?;
     let expected = pass_output(name);
     if output.as_slice() != expected.as_bytes() {
@@ -1041,7 +1047,7 @@ pub fn run_test_with(
         name: test.recorded.name.clone(),
         blake3: test.blake3,
         image_hash: image.image_hash,
-        verdict: judge(&test.recorded.name, &run),
+        verdict: judge_with(&test.recorded.name, &run, profile),
         outcome: run.outcome,
     })
 }
@@ -1052,8 +1058,8 @@ pub fn run_corpus(root: &Path) -> Result<(Act4Manifest, Report), String> {
     run_corpus_with(root, Rv32iProfile::M1)
 }
 
-/// [`run_corpus`] with the CPU in `profile`: the M2 profile must pass the same corpus
-/// (`docs/m2-design.md` §15.4).
+/// [`run_corpus`] with the CPU in `profile`: the M2 and M3 profiles must pass the same
+/// corpus (`docs/m2-design.md` §15.4, `docs/m3-design.md` §15.4).
 pub fn run_corpus_with(
     root: &Path,
     profile: Rv32iProfile,
