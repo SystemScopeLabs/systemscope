@@ -163,7 +163,7 @@ A delegated trap leaves `MIE`, `MPIE`, and `MPP` unchanged. A trap taken in M le
 
 - **Svade:** no retirement in the log writes a PTE except the eight setup stores from M-mode. Spike never set `A` or `D`; a missing `A`, or a missing `D` on a store, is a page fault.
 - **Priority:** alignment comes before translation (P4, P5) and before the access fault (P16, U11, U12). This matches m3-design §5.3's order. M3.3 still confirms the order against the specification text, as §5.3 requires.
-- **Not measured here:** a PTE read that faults on the bus, a level-0 walk, a pointer at level 0, an X-only page with `MXR`, S fetch from a `U` page with `SUM` = 1, and U-mode accesses through Sv32. They are M3.3's to measure.
+- **Not measured here:** a PTE read that faults on the bus, a level-0 walk, a pointer at level 0, an X-only page with `MXR`, S fetch from a `U` page with `SUM` = 1, and U-mode accesses through Sv32. They are M3.3's to measure; [m3-3-spike-appendix.md](m3-3-spike-appendix.md) records them.
 
 ## B.6 Divergences from m3-design §5.1
 
