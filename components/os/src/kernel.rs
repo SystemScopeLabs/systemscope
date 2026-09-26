@@ -10,9 +10,10 @@
 //!
 //! - **Prototype** ([`ModeledKernel::new`]): the M3.4a gate prototype, unchanged. An
 //!   `ENTER` runs the scripted operation or the failure shutdown of [`crate::core`].
-//! - **Processes** ([`ModeledKernel::with_processes`]): the M3.4b process model of
-//!   [`crate::procop`]. The first `ENTER` boots the plan's images; every later one is a
-//!   trap. The prototype operations never run in this mode.
+//! - **Processes** ([`ModeledKernel::with_processes`]): the process model and syscall
+//!   ABI of [`crate::procop`]. The first `ENTER` boots the plan's images; every later one
+//!   is a trap: a syscall, a fault, or an S-mode trap. The prototype operations never run
+//!   in this mode.
 //!
 //! Both share the gate, the engine, and the snapshot's first sections.
 //!
@@ -55,7 +56,9 @@
 //! by reissuing**: a `Wait` restores to waiting for the response already in the runtime's
 //! queue, and an `Issue` to waiting for its wake. With processes, the snapshot adds the
 //! kernel's metadata (§6.8): the PCBs, the run queue, the running PID, and the frame
-//! bitmap. Never RAM contents, never CPU state.
+//! bitmap; a syscall in progress is its stage: the `write` buffer, the pages found, the
+//! bytes output, or the result to return. Never RAM contents (the trap frame, user bytes,
+//! the UART's output), never CPU state.
 
 use std::collections::VecDeque;
 
@@ -82,6 +85,7 @@ use crate::process::{Context, Pcb, ProcState, Processes, perms_from_bits};
 use crate::procop::{Life, Model, Note, ProcOp, Stage};
 use crate::pte;
 use crate::space::{Region, Space, frames_needed, megapage_conflict};
+use crate::syscall::Buffer;
 
 /// The offset of `ENTER` in the `kgate` window.
 pub const ENTER: u64 = 0x0;
@@ -522,8 +526,8 @@ impl Component for ModeledKernel {
     }
 
     /// `phase` (`idle`, `issue`, `wait`), `op` (`none`, or the operation: `script` and
-    /// `shutdown` in prototype mode, the stage `create`, `read_frame`, `dispatch`, or
-    /// `shutdown` with processes), `step`, `held_txn` and `mem_txn` (the outstanding
+    /// `shutdown` in prototype mode, the stage `create`, `read_frame`, `walk`, `output`,
+    /// `return`, `dispatch`, or `shutdown` with processes), `step`, `held_txn` and `mem_txn` (the outstanding
     /// access's, `none` or the number), `next_txn`, and the due or outstanding access as
     /// `pending_kind` (`none`, `read`, `write`), `pending_addr`, and `pending_len` (0 with
     /// `none`).
@@ -622,7 +626,10 @@ impl Component for ModeledKernel {
     ///    (length-prefixed bytes); with processes `u8` 2, the stage (`u8`: 0 `Create`
     ///    with the PID and its reserved frames as a count and PPNs, 1 `ReadFrame`, 2
     ///    `Dispatch` with the PID and the 33 context words, 3 `Shutdown` with the
-    ///    reason), its step, and its working data;
+    ///    reason, 4 `Walk` with the buffer, the pages found as a count and PPNs, the
+    ///    table PPN, and the level `u8`, 5 `Output` with the buffer, the pages, and the
+    ///    bytes output, 6 `Return` with `sepc` and the result; a buffer is `sepc`, `buf`,
+    ///    and `n`), its step, and its working data;
     /// 4. the held `ENTER` (tag `u8` 0, or 1 then the `u64` txn);
     /// 5. the next `mem` `TxnId` (`u64`);
     /// 6. with processes only: the life (`u8`: 0 `AwaitBoot`, 1 `Up`, 2 `Down`); the
@@ -694,7 +701,10 @@ impl Component for ModeledKernel {
     /// before the first `ENTER`; and an operation its stage cannot be in: a creation that
     /// is not the next image's, with frames that are not the lowest free ones it needs, a
     /// frame read with no process running, a dispatch of another PID than the running
-    /// one, or a shutdown that was not decided.
+    /// one, a shutdown that was not decided, or a syscall stage with no process running,
+    /// with a buffer no `write` produces, with pages or a table that are not the running
+    /// process's mapping of the buffer, or with a count of bytes output that is not where
+    /// a chunk starts.
     fn restore(&mut self, r: &mut SnapshotReader<'_>, _: u32) -> Result<(), RestoreError> {
         let invalid = RestoreError::InvalidState;
         let mut config = SnapshotWriter::new();
@@ -794,10 +804,43 @@ enum RawOp {
 
 /// A decoded stage before it is checked.
 enum RawStage {
-    Create { pid: u32, frames: Vec<u32> },
+    Create {
+        pid: u32,
+        frames: Vec<u32>,
+    },
     ReadFrame,
-    Dispatch { pid: u32, context: Context },
-    Shutdown { reason: u32 },
+    Dispatch {
+        pid: u32,
+        context: Context,
+    },
+    Shutdown {
+        reason: u32,
+    },
+    Walk {
+        buffer: (u32, u32, u32),
+        pages: Vec<u32>,
+        table: u32,
+        level: u8,
+    },
+    Output {
+        buffer: (u32, u32, u32),
+        pages: Vec<u32>,
+        done: u32,
+    },
+    Return {
+        sepc: u32,
+        value: u32,
+    },
+}
+
+fn encode_buffer(b: &Buffer, w: &mut SnapshotWriter) {
+    w.u32(b.sepc);
+    w.u32(b.buf);
+    w.u32(b.n);
+}
+
+fn decode_buffer(r: &mut SnapshotReader<'_>) -> Result<(u32, u32, u32), RestoreError> {
+    Ok((r.u32()?, r.u32()?, r.u32()?))
 }
 
 fn encode_context(c: &Context, w: &mut SnapshotWriter) {
@@ -857,6 +900,33 @@ fn encode_stage(stage: &Stage, w: &mut SnapshotWriter) {
             w.u8(3);
             w.u32(*reason);
         }
+        Stage::Walk {
+            buffer,
+            pages,
+            table,
+            level,
+        } => {
+            w.u8(4);
+            encode_buffer(buffer, w);
+            encode_ppns(pages, w);
+            w.u32(*table);
+            w.u8(*level);
+        }
+        Stage::Output {
+            buffer,
+            pages,
+            done,
+        } => {
+            w.u8(5);
+            encode_buffer(buffer, w);
+            encode_ppns(pages, w);
+            w.u32(*done);
+        }
+        Stage::Return { sepc, value } => {
+            w.u8(6);
+            w.u32(*sepc);
+            w.u32(*value);
+        }
     }
 }
 
@@ -886,6 +956,21 @@ fn decode_op(r: &mut SnapshotReader<'_>) -> Result<RawOp, RestoreError> {
                 context: decode_context(r)?,
             },
             3 => RawStage::Shutdown { reason: r.u32()? },
+            4 => RawStage::Walk {
+                buffer: decode_buffer(r)?,
+                pages: decode_ppns(r)?,
+                table: r.u32()?,
+                level: r.u8()?,
+            },
+            5 => RawStage::Output {
+                buffer: decode_buffer(r)?,
+                pages: decode_ppns(r)?,
+                done: r.u32()?,
+            },
+            6 => RawStage::Return {
+                sepc: r.u32()?,
+                value: r.u32()?,
+            },
             tag => {
                 return Err(RestoreError::Decode(DecodeError::InvalidTag {
                     what: "modeled kernel stage",
@@ -1156,10 +1241,94 @@ fn proc_op(
             }
             Stage::Shutdown { reason }
         }
+        RawStage::Walk {
+            buffer,
+            pages,
+            table,
+            level,
+        } => {
+            let (buffer, space, expected) = syscall_space(config, model, buffer)?;
+            let va = buffer.page_va(pages.len());
+            let table_ok = match level {
+                1 => table == space.root,
+                0 => space.table_for(va) == Some(table),
+                _ => false,
+            };
+            if pages.len() >= buffer.pages() || !expected.starts_with(&pages) || !table_ok {
+                return Err(invalid(
+                    "modeled kernel: a walk that is not the running process's mapping",
+                ));
+            }
+            Stage::Walk {
+                buffer,
+                pages,
+                table,
+                level,
+            }
+        }
+        RawStage::Output {
+            buffer,
+            pages,
+            done,
+        } => {
+            let (buffer, _, expected) = syscall_space(config, model, buffer)?;
+            if pages != expected || !buffer.is_chunk_start(done) {
+                return Err(invalid(
+                    "modeled kernel: output that is not the running process's buffer",
+                ));
+            }
+            Stage::Output {
+                buffer,
+                pages,
+                done,
+            }
+        }
+        RawStage::Return { sepc, value } => {
+            if model.life != Life::Up || procs.current().is_none() {
+                return Err(invalid(
+                    "modeled kernel: a syscall return with no process running",
+                ));
+            }
+            Stage::Return { sepc, value }
+        }
     };
     ProcOp::from_parts(config, stage, step, data).ok_or(invalid(
         "modeled kernel: operation step or working data not reachable",
     ))
+}
+
+/// For a `write` stage: the buffer, which must be one a `write` produces; the running
+/// process's address space, rebuilt from its image; and the physical page of each buffer
+/// page from the first, as far as the pages are mapped readable.
+fn syscall_space(
+    config: &KernelConfig,
+    model: &Model,
+    (sepc, buf, n): (u32, u32, u32),
+) -> Result<(Buffer, Space, Vec<u32>), RestoreError> {
+    let invalid = RestoreError::InvalidState;
+    let pcb = model
+        .procs
+        .current()
+        .and_then(|pid| model.procs.pcb(pid))
+        .filter(|_| model.life == Life::Up)
+        .ok_or(invalid("modeled kernel: a write with no process running"))?;
+    let buffer = Buffer::new(sepc, buf, n)
+        .ok_or(invalid("modeled kernel: a write buffer no write produces"))?;
+    let boot = &model.plan.images[pcb.pid as usize - 1];
+    let mut frames = pcb.frames();
+    frames.sort_unstable();
+    let space = Space::build(config, &model.plan.layout, boot, &frames);
+    let expected = (0..buffer.pages())
+        .map_while(|i| {
+            let va = buffer.page_va(i);
+            pcb.regions.iter().find_map(|r| {
+                let page = (va.checked_sub(r.va)? / 4096) as usize;
+                let frame = *r.frames.get(page)?;
+                r.perms.read.then_some(frame)
+            })
+        })
+        .collect();
+    Ok((buffer, space, expected))
 }
 
 /// The checks that tie the process table to the life and the operation. On success the

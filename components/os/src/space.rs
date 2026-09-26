@@ -105,6 +105,8 @@ pub struct Space {
     pub regions: Vec<Region>,
     /// Every frame, in assignment order.
     frames: Vec<u32>,
+    /// The level-0 table of each touched 4 MiB slot: `(VPN[1], PPN)`.
+    slots: Vec<(u32, u32)>,
     /// The copies: `(source, destination, length)`, physical.
     copies: Vec<(u64, u64, u32)>,
     /// The PTE writes: `(address, value)`.
@@ -176,9 +178,16 @@ impl Space {
             tables,
             regions: regions(&boot.image, layout, &placed),
             frames: order,
+            slots,
             copies,
             ptes,
         }
+    }
+
+    /// The level-0 table that maps `va`'s 4 MiB slot, if the space has one.
+    pub fn table_for(&self, va: u32) -> Option<u32> {
+        let slot = vpn1(u64::from(va));
+        self.slots.iter().find(|s| s.0 == slot).map(|s| s.1)
     }
 
     /// Every frame of the address space, in assignment order.

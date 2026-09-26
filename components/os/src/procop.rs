@@ -1,4 +1,4 @@
-//! The process-mode pure core (`docs/m3-design.md` §6.3, §6.6, §6.7, §8.3): the kernel
+//! The process-mode pure core (`docs/m3-design.md` §6.3, §6.5–§6.7, §8.3): the kernel
 //! operations of a kernel with a [`ProcessPlan`], over the same abstract memory interface
 //! as [`crate::core`], with no runtime.
 //!
@@ -10,7 +10,9 @@
 //!
 //! ```text
 //! Boot:  Create(pid 1) → Create(pid 2) → … → Dispatch(head) | Shutdown
-//! Trap:  ReadFrame → Dispatch(head) | Shutdown
+//! Trap:  ReadFrame → Return
+//!                  → Walk → … → Output → … → Return          (write)
+//!                  → Dispatch(head) | Shutdown               (yield, exit, fault kill)
 //! ```
 //!
 //! - **Create** builds one process's address space ([`Space`]): zero, copy, map. Its
@@ -18,31 +20,45 @@
 //!   image with an `os.process.create` error before anything is written, and boot
 //!   continues (§6.4). When its last PTE is written, the process is admitted `Ready` at
 //!   the queue's tail with its initial context.
-//! - **ReadFrame** reads the whole trap frame. Then the kernel decides (§6.6, §6.7):
+//! - **ReadFrame** reads the whole trap frame. Then the kernel decides (§6.5–§6.7):
 //!   - `SPP = S`: shut down with reason 1;
-//!   - `scause = 8` (`ecall` from U): **the M3.4b cooperative switch point**. The frame
-//!     becomes the process's saved context with `sepc + 4`, the process goes to the
-//!     queue's tail, and the head is dispatched. No register is decoded: the syscall ABI
-//!     (§6.5) is M3.5's, which will route `sched_yield` to the same
-//!     [`Processes::yield_current`] and give the other numbers their meaning;
+//!   - `scause = 8` (`ecall` from U): a syscall, decoded from `a7` ([`Syscall`]):
+//!     - `getpid`, an unsupported number, and a `write` whose `fd`, count, or range ends
+//!       it at once: **Return** of the result;
+//!     - `write` of `n > 0` bytes: **Walk** every page of the buffer, then **Output**
+//!       the bytes, then **Return** `n`; a page the walk refuses returns `-EFAULT`
+//!       before any byte is output;
+//!     - `sched_yield`: the frame becomes the caller's context with `a0 = 0` and
+//!       `sepc + 4`, the caller goes to the queue's tail, and the head is dispatched;
+//!     - `exit` and `exit_group`: the caller becomes `Exited { status: a0 }`, its frames
+//!       are freed, and the head is dispatched;
 //!   - any other cause: the process becomes `Faulted { scause, sepc, stval }`, its
 //!     frames are freed, and the head is dispatched.
+//! - **Walk** reads one PTE of the caller's page table ([`walk_step`]).
+//! - **Output** reads one chunk of the buffer (at most 16 bytes, crossing no page) from
+//!   the physical page the walk found, then writes its bytes to UART TX one at a time.
+//! - **Return** writes the result to the frame's `a0`, then `sepc + 4` to its `sepc`.
+//!   No other word of the frame changes, and the caller keeps running.
 //! - **Dispatch** writes the head's context (`x1`–`x31`, `sepc`, `sstatus`), then its
 //!   `satp` and `action = Resume`, into the trap frame. The trampoline does the rest.
 //! - **Shutdown** writes `action = Shutdown` and the reason. With an empty queue the
 //!   reason is 0 only when every boot image became a process and every process exited
-//!   with status 0 (§6.6); in M3.4b no process can exit, so it is 1.
+//!   with status 0 (§6.6).
 //!
 //! Every metadata change happens at a stage boundary, in the same step as the completion
 //! that ends the stage; within a stage, the only kernel state that moves is the step and
-//! the working data.
+//! the working data. A syscall is therefore decided exactly once, when its frame read
+//! completes, and each of its effects (a byte at the UART, a word of the frame, a queue
+//! entry, an exit) is one access or one boundary that a restore never repeats.
 //!
 //! # Working data
 //!
 //! A Create holds the bytes of the copy between its read and its write; a ReadFrame the
-//! frame bytes read so far; a Dispatch the context it is writing, which has left the PCB
-//! (the process is `Running`) and has not all reached the frame yet. All of it is dropped
-//! when the operation ends (§6.8).
+//! frame bytes read so far; a Walk the PTE it read; an Output the chunk it read, until its
+//! last byte reaches the UART; a Dispatch the context it is writing, which has left the
+//! PCB (the process is `Running`) and has not all reached the frame yet. A write's
+//! buffer, the pages the walk has found, and its progress live in its stages. All of it
+//! is dropped when the operation ends (§6.8).
 
 use systemscope_contracts::trace::Value;
 
@@ -52,6 +68,10 @@ use crate::image::{ProcessPlan, perm_str};
 use crate::process::{CONTEXT_BYTES, Context, Pcb, ProcState, Processes, Violation};
 use crate::pte;
 use crate::space::{Space, frames_needed, megapage_conflict};
+use crate::syscall::{
+    A0, Buffer, EBADF, EFAULT, ENOSYS, FRAME_A0, FRAME_A1, FRAME_A2, FRAME_A7, SYS_WRITE, Syscall,
+    WRITE_MAX, WalkStep, neg, pte_address, walk_step,
+};
 
 /// The offset of `sstatus` in the trap frame.
 pub const FRAME_SSTATUS: u64 = 0x80;
@@ -76,6 +96,12 @@ pub const SEGMENT_KIND: &str = "os.load.segment";
 pub const SWITCH_KIND: &str = "os.process.switch";
 /// Trace kind of a fault kill (§6.8): `pid`, `cause`, `epc`, `tval`.
 pub const FAULT_KIND: &str = "os.process.fault";
+/// Trace kind of a decoded syscall (§6.8): `pid`, `nr`, `a0`, `a1`, `a2`.
+pub const SYSCALL_ENTER_KIND: &str = "os.syscall.enter";
+/// Trace kind of a syscall's result (§6.8): `pid`, `nr`, `ret` (the `a0` bit pattern).
+pub const SYSCALL_EXIT_KIND: &str = "os.syscall.exit";
+/// Trace kind of an `exit` or `exit_group` (§6.8): `pid`, `status` (`I64`).
+pub const EXIT_KIND: &str = "os.process.exit";
 
 /// Where a kernel with processes is in its life.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -123,6 +149,34 @@ pub enum Stage {
         /// 0 or 1 (§7.4).
         reason: u32,
     },
+    /// Reading the level-`level` PTE for page `pages.len()` of a `write` buffer from the
+    /// table at `table`.
+    Walk {
+        /// The buffer.
+        buffer: Buffer,
+        /// The physical page of each buffer page found so far.
+        pages: Vec<u32>,
+        /// The PPN of the table the PTE is in: the caller's root at level 1.
+        table: u32,
+        /// 1 or 0.
+        level: u8,
+    },
+    /// Outputting the chunk of a checked `write` buffer that starts `done` bytes in.
+    Output {
+        /// The buffer.
+        buffer: Buffer,
+        /// The physical page of every buffer page.
+        pages: Vec<u32>,
+        /// The bytes already at the UART.
+        done: u32,
+    },
+    /// Writing a syscall's result to `a0`, then `sepc + 4`.
+    Return {
+        /// The caller's `sepc`, the `ecall`'s address.
+        sepc: u32,
+        /// The result, as the `a0` bit pattern.
+        value: u32,
+    },
 }
 
 impl Stage {
@@ -133,6 +187,9 @@ impl Stage {
             Stage::ReadFrame => "read_frame",
             Stage::Dispatch { .. } => "dispatch",
             Stage::Shutdown { .. } => "shutdown",
+            Stage::Walk { .. } => "walk",
+            Stage::Output { .. } => "output",
+            Stage::Return { .. } => "return",
         }
     }
 }
@@ -159,6 +216,12 @@ fn dispatch_chunks(config: &KernelConfig) -> Vec<(u64, u64)> {
 
 fn shutdown_chunks(config: &KernelConfig) -> Vec<(u64, u64)> {
     chunks(u64::from(config.trap_frame) + FRAME_ACTION, 8)
+}
+
+/// The physical address of `va` in `buffer`, whose pages are at `pages`.
+fn physical(buffer: &Buffer, pages: &[u32], va: u32) -> u64 {
+    let page = ((va >> 12) - (buffer.buf >> 12)) as usize;
+    u64::from(pages[page]) * crate::core::PAGE + u64::from(va & 0xFFF)
 }
 
 fn word(frame: &[u8], offset: u64) -> u32 {
@@ -232,6 +295,9 @@ impl ProcOp {
             Stage::ReadFrame => frame_chunks(config).len(),
             Stage::Dispatch { .. } => dispatch_chunks(config).len(),
             Stage::Shutdown { .. } => shutdown_chunks(config).len(),
+            Stage::Walk { .. } => 1,
+            Stage::Output { buffer, done, .. } => 1 + buffer.chunk(*done).1 as usize,
+            Stage::Return { .. } => 2,
         };
         u32::try_from(n).expect("a handful of accesses")
     }
@@ -244,7 +310,12 @@ impl ProcOp {
                 .iter()
                 .map(|c| c.1 as usize)
                 .sum(),
-            Stage::Dispatch { .. } | Stage::Shutdown { .. } => 0,
+            Stage::Output { buffer, done, .. } if step > 0 => buffer.chunk(*done).1 as usize,
+            Stage::Dispatch { .. }
+            | Stage::Shutdown { .. }
+            | Stage::Walk { .. }
+            | Stage::Output { .. }
+            | Stage::Return { .. } => 0,
         }
     }
 
@@ -282,6 +353,44 @@ impl ProcOp {
                 bytes[..4].copy_from_slice(&1u32.to_le_bytes());
                 bytes[4..].copy_from_slice(&reason.to_le_bytes());
                 written(shutdown_chunks(config), frame + FRAME_ACTION, &bytes)
+            }
+            Stage::Walk {
+                buffer,
+                pages,
+                table,
+                level,
+            } => (step == 0).then(|| Access::Read {
+                addr: pte_address(*table, buffer.page_va(pages.len()), *level),
+                len: 4,
+            }),
+            Stage::Output {
+                buffer,
+                pages,
+                done,
+            } => {
+                let (va, len) = buffer.chunk(*done);
+                match step {
+                    0 => Some(Access::Read {
+                        addr: physical(buffer, pages, va),
+                        len,
+                    }),
+                    _ if step <= len as usize => Some(Access::Write {
+                        addr: config.uart_tx,
+                        data: vec![self.data[step - 1]],
+                    }),
+                    _ => None,
+                }
+            }
+            Stage::Return { sepc, value } => {
+                let (offset, word) = match step {
+                    0 => (FRAME_A0, *value),
+                    1 => (crate::config::FRAME_SEPC, sepc.wrapping_add(4)),
+                    _ => return None,
+                };
+                Some(Access::Write {
+                    addr: frame + offset,
+                    data: word.to_le_bytes().to_vec(),
+                })
             }
         }
     }
@@ -340,6 +449,17 @@ fn shutdown_note(reason: u32, detail: String) -> Note {
         vec![
             ("reason", Value::U64(u64::from(reason))),
             ("detail", Value::Str(detail)),
+        ],
+    )
+}
+
+fn exit_note(pid: u32, nr: u32, ret: u32) -> Note {
+    note(
+        SYSCALL_EXIT_KIND,
+        vec![
+            ("pid", Value::U64(u64::from(pid))),
+            ("nr", Value::U64(u64::from(nr))),
+            ("ret", Value::U64(u64::from(ret))),
         ],
     )
 }
@@ -438,7 +558,161 @@ impl Model {
                 self.next_creation(config, pid as usize, notes).map(Some)
             }
             Stage::ReadFrame => self.decide(&op.data, notes).map(Some),
-            Stage::Dispatch { .. } | Stage::Shutdown { .. } => Ok(None),
+            Stage::Walk {
+                buffer,
+                mut pages,
+                level,
+                ..
+            } => {
+                let pte = word(&op.data, 0);
+                let va = buffer.page_va(pages.len());
+                let stage = match walk_step(pte, level, va) {
+                    WalkStep::Next(table) => Stage::Walk {
+                        buffer,
+                        pages,
+                        table,
+                        level: 0,
+                    },
+                    WalkStep::Page(ppn) => {
+                        pages.push(ppn);
+                        if pages.len() == buffer.pages() {
+                            Stage::Output {
+                                buffer,
+                                pages,
+                                done: 0,
+                            }
+                        } else {
+                            Stage::Walk {
+                                buffer,
+                                pages,
+                                table: self.running_root()?,
+                                level: 1,
+                            }
+                        }
+                    }
+                    WalkStep::Fault => {
+                        return self
+                            .ret(SYS_WRITE, buffer.sepc, neg(EFAULT), notes)
+                            .map(Some);
+                    }
+                };
+                Ok(Some(ProcOp::new(stage)))
+            }
+            Stage::Output {
+                buffer,
+                pages,
+                done,
+            } => {
+                let done = done + buffer.chunk(done).1;
+                if done == buffer.n {
+                    return self.ret(SYS_WRITE, buffer.sepc, buffer.n, notes).map(Some);
+                }
+                Ok(Some(ProcOp::new(Stage::Output {
+                    buffer,
+                    pages,
+                    done,
+                })))
+            }
+            Stage::Dispatch { .. } | Stage::Shutdown { .. } | Stage::Return { .. } => Ok(None),
+        }
+    }
+
+    /// The running process's root table.
+    fn running_root(&self) -> Result<u32, Violation> {
+        let pid = self
+            .procs
+            .current()
+            .ok_or(Violation("a syscall with no process running"))?;
+        Ok(self
+            .procs
+            .pcb(pid)
+            .ok_or(Violation("running PID has no PCB"))?
+            .root)
+    }
+
+    /// Returns `value` from syscall `nr` to the running process, which called it at
+    /// `sepc`: the `os.syscall.exit` record and the Return stage.
+    fn ret(
+        &self,
+        nr: u32,
+        sepc: u32,
+        value: u32,
+        notes: &mut Vec<Note>,
+    ) -> Result<ProcOp, Violation> {
+        let pid = self
+            .procs
+            .current()
+            .ok_or(Violation("a syscall with no process running"))?;
+        notes.push(exit_note(pid, nr, value));
+        Ok(ProcOp::new(Stage::Return { sepc, value }))
+    }
+
+    /// The syscall in `frame` (§6.5), decided once, when the frame read completes.
+    fn syscall(&mut self, frame: &[u8], notes: &mut Vec<Note>) -> Result<ProcOp, Violation> {
+        let pid = self
+            .procs
+            .current()
+            .ok_or(Violation("a syscall with no process running"))?;
+        let sepc = word(frame, crate::config::FRAME_SEPC);
+        let nr = word(frame, FRAME_A7);
+        let (a0, a1, a2) = (
+            word(frame, FRAME_A0),
+            word(frame, FRAME_A1),
+            word(frame, FRAME_A2),
+        );
+        notes.push(note(
+            SYSCALL_ENTER_KIND,
+            vec![
+                ("pid", Value::U64(u64::from(pid))),
+                ("nr", Value::U64(u64::from(nr))),
+                ("a0", Value::U64(u64::from(a0))),
+                ("a1", Value::U64(u64::from(a1))),
+                ("a2", Value::U64(u64::from(a2))),
+            ],
+        ));
+        match Syscall::decode(nr) {
+            Syscall::GetPid => self.ret(nr, sepc, pid, notes),
+            Syscall::Unsupported(_) => self.ret(nr, sepc, neg(ENOSYS), notes),
+            Syscall::Write => {
+                if a0 != 1 && a0 != 2 {
+                    return self.ret(nr, sepc, neg(EBADF), notes);
+                }
+                let n = a2.min(WRITE_MAX);
+                if n == 0 {
+                    return self.ret(nr, sepc, 0, notes);
+                }
+                // A range past 2^32 is not a range of the address space; it would need the
+                // top page, which no address space maps.
+                let Some(buffer) = Buffer::new(sepc, a1, n) else {
+                    return self.ret(nr, sepc, neg(EFAULT), notes);
+                };
+                Ok(ProcOp::new(Stage::Walk {
+                    buffer,
+                    pages: Vec::new(),
+                    table: self.running_root()?,
+                    level: 1,
+                }))
+            }
+            Syscall::SchedYield => {
+                let mut context = Context::from_frame(frame);
+                context.regs[A0] = 0;
+                context.pc = sepc.wrapping_add(4);
+                notes.push(exit_note(pid, nr, 0));
+                self.procs.yield_current(context)?;
+                self.dispatch_next(pid, notes)
+            }
+            Syscall::Exit | Syscall::ExitGroup => {
+                let status = a0 as i32;
+                self.procs.end_current(ProcState::Exited { status })?;
+                notes.push(note(
+                    EXIT_KIND,
+                    vec![
+                        ("pid", Value::U64(u64::from(pid))),
+                        ("status", Value::I64(i64::from(status))),
+                    ],
+                ));
+                self.dispatch_next(pid, notes)
+            }
         }
     }
 
@@ -525,10 +799,7 @@ impl Model {
             return Ok(ProcOp::new(Stage::Shutdown { reason: 1 }));
         }
         if scause == ECALL_FROM_U {
-            let mut context = Context::from_frame(frame);
-            context.pc = sepc.wrapping_add(4);
-            let pid = self.procs.yield_current(context)?;
-            return self.dispatch_next(pid, notes);
+            return self.syscall(frame, notes);
         }
         let pid = self.procs.end_current(ProcState::Faulted {
             cause: scause,

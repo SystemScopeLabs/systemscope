@@ -449,6 +449,12 @@ impl Harness {
     /// Writes a trap frame for a trap with `scause`, `sepc`, `stval`, and `sstatus`, and
     /// `x_i = 0x100 · i + tag` in every register, then runs the `Trap` operation.
     pub fn trap(&mut self, scause: u32, sepc: u32, stval: u32, sstatus: u32, tag: u32) -> Stop {
+        self.write_frame(scause, sepc, stval, sstatus, tag);
+        self.op(TRAP_FRAME, None)
+    }
+
+    /// Writes the trap frame [`Harness::trap`] runs.
+    pub fn write_frame(&mut self, scause: u32, sepc: u32, stval: u32, sstatus: u32, tag: u32) {
         let f = u64::from(TRAP_FRAME);
         for i in 1..=31u32 {
             self.mem.set_word(f + 4 * u64::from(i - 1), 0x100 * i + tag);
@@ -457,6 +463,34 @@ impl Harness {
         self.mem.set_word(f + 0x80, sstatus);
         self.mem.set_word(f + 0x84, scause);
         self.mem.set_word(f + 0x88, stval);
+    }
+
+    /// Writes the frame of an `ecall` from U at `sepc` with `a7 = nr` and `a0`–`a2` =
+    /// `args`, every other register as [`Harness::trap`] writes it.
+    pub fn write_syscall(&mut self, nr: u32, args: [u32; 3], sepc: u32, sstatus: u32, tag: u32) {
+        self.write_frame(8, sepc, 0, sstatus, tag);
+        let f = u64::from(TRAP_FRAME);
+        for (i, a) in args.into_iter().enumerate() {
+            self.mem.set_word(f + 0x24 + 4 * i as u64, a);
+        }
+        self.mem.set_word(f + 0x40, nr);
+    }
+
+    /// Runs syscall `nr` with `args` from `sepc` (see [`Harness::write_syscall`]).
+    pub fn syscall(&mut self, nr: u32, args: [u32; 3], sepc: u32, tag: u32) -> Stop {
+        self.write_syscall(nr, args, sepc, 0, tag);
+        self.op(TRAP_FRAME, None)
+    }
+
+    /// Runs `sched_yield` from `sepc` with `sstatus`.
+    pub fn sys_yield(&mut self, sepc: u32, sstatus: u32, tag: u32) -> Stop {
+        self.write_syscall(
+            124,
+            [0x0A00 + tag, 0x0B00 + tag, 0x0C00 + tag],
+            sepc,
+            sstatus,
+            tag,
+        );
         self.op(TRAP_FRAME, None)
     }
 
@@ -562,10 +596,34 @@ pub mod ksnap {
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum Stage {
-        Create { pid: u32, frames: Vec<u32> },
+        Create {
+            pid: u32,
+            frames: Vec<u32>,
+        },
         ReadFrame,
-        Dispatch { pid: u32, context: Vec<u32> },
-        Shutdown { reason: u32 },
+        Dispatch {
+            pid: u32,
+            context: Vec<u32>,
+        },
+        Shutdown {
+            reason: u32,
+        },
+        /// `buffer` is `(sepc, buf, n)`.
+        Walk {
+            buffer: (u32, u32, u32),
+            pages: Vec<u32>,
+            table: u32,
+            level: u8,
+        },
+        Output {
+            buffer: (u32, u32, u32),
+            pages: Vec<u32>,
+            done: u32,
+        },
+        Return {
+            sepc: u32,
+            value: u32,
+        },
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -614,6 +672,12 @@ pub mod ksnap {
         }
     }
 
+    fn put_buffer(e: &mut Encoder, (sepc, buf, n): (u32, u32, u32)) {
+        e.u32(sepc);
+        e.u32(buf);
+        e.u32(n);
+    }
+
     impl Snap {
         /// Decodes `bytes`, whose first `prefix` bytes are the configuration and plan.
         pub fn decode(bytes: &[u8], prefix: usize) -> Result<Snap, DecodeError> {
@@ -636,6 +700,21 @@ pub mod ksnap {
                         context: (0..33).map(|_| d.u32()).collect::<Result<_, _>>()?,
                     },
                     3 => Stage::Shutdown { reason: d.u32()? },
+                    4 => Stage::Walk {
+                        buffer: (d.u32()?, d.u32()?, d.u32()?),
+                        pages: words(&mut d)?,
+                        table: d.u32()?,
+                        level: d.u8()?,
+                    },
+                    5 => Stage::Output {
+                        buffer: (d.u32()?, d.u32()?, d.u32()?),
+                        pages: words(&mut d)?,
+                        done: d.u32()?,
+                    },
+                    6 => Stage::Return {
+                        sepc: d.u32()?,
+                        value: d.u32()?,
+                    },
                     t => panic!("stage {t}"),
                 };
                 Some(Op {
@@ -720,6 +799,33 @@ pub mod ksnap {
                     Stage::Shutdown { reason } => {
                         e.u8(3);
                         e.u32(*reason);
+                    }
+                    Stage::Walk {
+                        buffer,
+                        pages,
+                        table,
+                        level,
+                    } => {
+                        e.u8(4);
+                        put_buffer(&mut e, *buffer);
+                        put_words(&mut e, pages);
+                        e.u32(*table);
+                        e.u8(*level);
+                    }
+                    Stage::Output {
+                        buffer,
+                        pages,
+                        done,
+                    } => {
+                        e.u8(5);
+                        put_buffer(&mut e, *buffer);
+                        put_words(&mut e, pages);
+                        e.u32(*done);
+                    }
+                    Stage::Return { sepc, value } => {
+                        e.u8(6);
+                        e.u32(*sepc);
+                        e.u32(*value);
                     }
                 }
                 e.u32(op.step);

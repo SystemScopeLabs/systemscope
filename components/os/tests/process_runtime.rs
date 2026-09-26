@@ -61,22 +61,25 @@ fn check(w: &mut Vec<u32>, a: u32, b: u32) {
 }
 
 /// A worker: stores `marker` to its data page and its stack, yields, checks that its
-/// data, stack, registers, file bytes, and `.bss` are its own, yields again, and ends
-/// with `ebreak`. Its data segment is `[0, tag]` then 64 zero bytes.
+/// data, stack, registers, file bytes, and `.bss` are its own and that `sched_yield`
+/// returned 0, yields again (`a7` is still 124), and ends with `ebreak`. Its data
+/// segment is `[0, tag]` then 64 zero bytes.
 fn worker(tag: u32, marker: u32) -> Vec<u8> {
     let mut w = Vec::new();
     w.extend(li(T1, DATA));
     w.extend(li(T2, marker));
     w.push(sw(T2, T1, 0));
-    w.push(addi(A0, 0, tag as i32));
+    w.push(addi(S1, 0, tag as i32));
     w.extend(li(T5, STACK_TOP));
     check(&mut w, SP, T5);
     w.push(sw(T2, SP, -4));
+    w.push(addi(A7, 0, 124));
     w.push(ECALL);
+    check(&mut w, A0, 0);
     w.push(lw(T3, T1, 0));
     check(&mut w, T3, T2);
     w.push(addi(T4, 0, tag as i32));
-    check(&mut w, A0, T4);
+    check(&mut w, S1, T4);
     w.push(lw(T3, SP, -4));
     check(&mut w, T3, T2);
     w.push(lw(T3, T1, 4));

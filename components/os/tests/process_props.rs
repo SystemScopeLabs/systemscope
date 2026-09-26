@@ -1,7 +1,7 @@
 //! Properties of the process model (`docs/m3-design.md` §6.4, §6.6, §6.8) over random
 //! programs, pools, and trap sequences, checked against an independent oracle of the
 //! scheduler and the frame allocator written from the design text: PIDs in image order,
-//! lowest-free-first all-or-nothing reservation, a FIFO queue, the ecall switch and the
+//! lowest-free-first all-or-nothing reservation, a FIFO queue, the sched_yield switch and the
 //! fault kill of §17 M3.4b.
 
 mod common;
@@ -39,7 +39,7 @@ fn programs(n: std::ops::RangeInclusive<usize>) -> impl Strategy<Value = Vec<Vec
     proptest::collection::vec(program(), n)
 }
 
-/// A trap of the running process: an ecall (the M3.4b switch) or a fault.
+/// A trap of the running process: a `sched_yield` or a fault.
 #[derive(Clone, Copy, Debug)]
 enum Trap {
     Yield,
@@ -153,15 +153,18 @@ fn observed(h: &Harness) -> Oracle {
     }
 }
 
+/// Writes the frame of trap `t`, the `n`th: a `sched_yield` or a fault.
+fn write_trap(h: &mut Harness, t: Trap, n: u32) {
+    let sepc = 0x0001_0000 + 4 * n;
+    match t {
+        Trap::Yield => h.write_syscall(124, [0, 0, 0], sepc, 0, n),
+        Trap::Fault(c) => h.write_frame(c, sepc, 0x1000 * n, 0, n),
+    }
+}
+
 fn apply(h: &mut Harness, t: Trap, n: u32) {
-    let (cause, stval) = match t {
-        Trap::Yield => (8, 0),
-        Trap::Fault(c) => (c, 0x1000 * n),
-    };
-    assert_eq!(
-        h.trap(cause, 0x0001_0000 + 4 * n, stval, 0, n),
-        Stop::Released
-    );
+    write_trap(h, t, n);
+    assert_eq!(h.op(TRAP_FRAME, None), Stop::Released);
 }
 
 /// Runs boot and `traps` (stopping at shutdown), checking `each` after every operation.
@@ -457,15 +460,7 @@ proptest! {
                     break;
                 }
                 let n = idx as u32 - 1;
-                let (cause, stval) = match t { Trap::Yield => (8, 0), Trap::Fault(c) => (c, 0x1000 * n) };
-                let f = u64::from(TRAP_FRAME);
-                for i in 1..=31u32 {
-                    h.mem.set_word(f + 4 * u64::from(i - 1), 0x100 * i + n);
-                }
-                h.mem.set_word(f + 0x7C, 0x0001_0000 + 4 * n);
-                h.mem.set_word(f + 0x80, 0);
-                h.mem.set_word(f + 0x84, cause);
-                h.mem.set_word(f + 0x88, stval);
+                write_trap(&mut h, t, n);
                 o.trap(t);
             } else if !first {
                 continue;

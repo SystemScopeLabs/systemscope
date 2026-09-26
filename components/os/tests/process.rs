@@ -347,8 +347,8 @@ fn switching_is_fifo_through_the_trap_frame_and_contexts_move_not_copy() {
     let mut h = harness(&files);
     h.boot();
     assert_eq!(queue(&h), [2, 3]);
-    // A traps with an ecall: its frame becomes its context with sepc + 4.
-    assert_eq!(h.trap(8, 0x0001_0004, 0, 0x20, 0xA), Stop::Released);
+    // A yields: its frame becomes its context with a0 = 0 and sepc + 4.
+    assert_eq!(h.sys_yield(0x0001_0004, 0x20, 0xA), Stop::Released);
     let a = procs(&h).pcb(1).unwrap().context.unwrap();
     assert_eq!(a.pc, 0x0001_0008);
     assert_eq!(a.sstatus, 0x20);
@@ -366,14 +366,16 @@ fn switching_is_fifo_through_the_trap_frame_and_contexts_move_not_copy() {
     assert_eq!(h.frame(0x7C), 0x0001_0000);
     assert_eq!(h.frame(0x8C), 0x8000_0000 | root(&h, 2));
     // B → C → A.
-    assert_eq!(h.trap(8, 0x0001_0000, 0, 0, 0xB), Stop::Released);
+    assert_eq!(h.sys_yield(0x0001_0000, 0, 0xB), Stop::Released);
     assert_eq!(procs(&h).current(), Some(3));
     assert_eq!(queue(&h), [1, 2]);
-    assert_eq!(h.trap(8, 0x0001_0000, 0, 0, 0xC), Stop::Released);
+    assert_eq!(h.sys_yield(0x0001_0000, 0, 0xC), Stop::Released);
     assert_eq!(procs(&h).current(), Some(1));
     assert_eq!(queue(&h), [2, 3]);
     // A resumes exactly where it was: its saved registers, sepc + 4, sstatus.
     let mut want: Vec<u32> = (1..=31).map(|i| 0x100 * i + 0xA).collect();
+    // sched_yield's result in a0; its arguments and number as the caller left them.
+    (want[9], want[10], want[11], want[16]) = (0, 0x0B0A, 0x0C0A, 124);
     want.push(0x0001_0008);
     want.push(0x20);
     assert_eq!(frame_context(&h), want);
@@ -393,7 +395,7 @@ fn a_lone_process_yields_to_itself() {
     let files = [prog_a()];
     let mut h = harness(&files);
     h.boot();
-    assert_eq!(h.trap(8, 0x0001_0004, 0, 0, 1), Stop::Released);
+    assert_eq!(h.sys_yield(0x0001_0004, 0, 1), Stop::Released);
     assert_eq!(procs(&h).current(), Some(1));
     assert_eq!(queue(&h), Vec::<u32>::new());
     assert_eq!(h.frame(0x7C), 0x0001_0008);
@@ -703,7 +705,7 @@ fn the_snapshot_holds_kernel_metadata_only() {
     let files = [prog_a(), prog_b()];
     let mut h = Harness::new(config_with_pool(64), &files, plan_of(&files));
     h.boot();
-    h.trap(8, 0x0001_0004, 0, 0, 7);
+    h.sys_yield(0x0001_0004, 0, 7);
     let bytes = snapshot_of(&h.k);
     let snap = Snap::decode(&bytes, prefix(&files, 64)).unwrap();
     assert_eq!(snap.encode(), bytes);
@@ -1063,6 +1065,8 @@ fn every_step_boundary_restores_and_never_reissues() {
                 h.mem.set_word(f + 0x7C, sepc);
                 h.mem.set_word(f + 0x84, cause);
                 h.mem.set_word(f + 0x80, 0);
+                // a7: the ecalls are sched_yield.
+                h.mem.set_word(f + 0x40, 124);
             }
             h.enter(TRAP_FRAME).unwrap();
             boundary += 1;
