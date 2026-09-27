@@ -139,6 +139,19 @@ jobs:
         run: cargo nextest run -p systemscope-acceptance --locked --profile ci --no-fail-fast --test m2_golden
       - name: M2 golden verify
         run: cargo xtask m2-golden verify
+      # docs/m3-design.md §17.4: both M3 disks on m3-reference. Every boundary is decoded
+      # by an independent portable decoder, validated, restored into a fresh platform,
+      # and stepped; the stress points and spaced checkpoints resume to the end exactly.
+      # Both operating systems check the same committed golden file and portable
+      # snapshot. The exhaustive resume of every checkpoint is the m3-every-event job.
+      - name: M3.7 snapshot/restore (every boundary, stress points, portable snapshot, corruption)
+        run: cargo nextest run -p systemscope-acceptance --locked --profile ci --no-fail-fast --test m3_snapshot
+      - name: M3.7 observation invariance (O0-O5)
+        run: cargo nextest run -p systemscope-acceptance --locked --profile ci --no-fail-fast --test m3_observation
+      - name: M3.7 golden reproduction (in process, separate processes, drift)
+        run: cargo nextest run -p systemscope-acceptance --locked --profile ci --no-fail-fast --test m3_golden
+      - name: M3 golden verify
+        run: cargo xtask m3-golden verify
       - name: rv32ui fixtures, hello.elf, block_irq.elf, the M3 fixtures, and the ACT4 corpus unchanged
         shell: bash
         run: git diff --exit-code -- tests/rv32/fixtures tests/rv32/hello tests/rv32/block_irq tests/rv32/m3 tests/act4
@@ -163,6 +176,17 @@ jobs:
         with:
           name: m2-result-${{ matrix.os }}
           path: systemscope/target/m2-result
+          if-no-files-found: error
+      # This machine's own M3 result and portable snapshot, for the m3-cross-os job.
+      - name: Emit this machine's M3 result
+        run: cargo xtask m3-golden emit target/m3-result
+      - name: M3 result and committed golden hashes
+        shell: bash
+        run: sha256sum target/m3-result/* tests/golden/m3-reference.json tests/golden/m3-reference.mid.snap
+      - uses: actions/upload-artifact@v4
+        with:
+          name: m3-result-${{ matrix.os }}
+          path: systemscope/target/m3-result
           if-no-files-found: error
 
   # docs/m1-design.md §10.1 M1-A6, M1-A8: each operating system restores the portable
@@ -240,6 +264,76 @@ jobs:
           path: systemscope/target/m2-foreign
       - name: Check the ${{ matrix.from }} result and restore its snapshot
         run: cargo xtask m2-golden check target/m2-foreign
+
+  # docs/m3-design.md §17.4: each operating system restores the portable M3
+  # snapshot the other one took, taken during a write syscall, and checks the other
+  # one's golden result against the committed files and its own run.
+  m3-cross-os:
+    name: M3 cross-OS (${{ matrix.os }} checks ${{ matrix.from }})
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            from: ubuntu-latest
+          - os: ubuntu-latest
+            from: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: systemscope
+      # systemscope depends on `../contracts` by path (plan.md §10), so reproduce the
+      # sibling layout, with contracts pinned to a pushed revision (bump it deliberately).
+      - uses: actions/checkout@v4
+        with:
+          repository: SystemScopeLabs/contracts
+          ref: 90900a128d51f6b42e86dc789447882c90c52ef4
+          path: contracts
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: systemscope
+      - uses: actions/download-artifact@v4
+        with:
+          name: m3-result-${{ matrix.from }}
+          path: systemscope/target/m3-foreign
+      - name: Check the ${{ matrix.from }} result and restore its snapshot
+        run: cargo xtask m3-golden check target/m3-foreign
+
+  # docs/m3-design.md §9.2, §17.4: every checkpoint of the M3 reference scenario, no
+  # sampling, restored into a freshly built platform and run to the end, split into
+  # shards of about equal cost. Each must replay the uninterrupted run without a reissue
+  # and end in its state.
+  m3-every-event:
+    name: M3 every-event resume (shard ${{ matrix.shard }} of 8)
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: systemscope
+      # systemscope depends on `../contracts` by path (plan.md §10), so reproduce the
+      # sibling layout, with contracts pinned to a pushed revision (bump it deliberately).
+      - uses: actions/checkout@v4
+        with:
+          repository: SystemScopeLabs/contracts
+          ref: 90900a128d51f6b42e86dc789447882c90c52ef4
+          path: contracts
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: systemscope
+      - name: M3 fixtures match their manifest
+        run: cargo xtask m3-reference verify
+      - name: Resume every checkpoint of shard ${{ matrix.shard }}
+        run: cargo run --release --locked -p xtask -- m3-golden every-event shard ${{ matrix.shard }} 8
 
   # docs/m1-design.md §10.6: rebuilds the rv32ui fixtures from the pinned riscv-tests,
   # hello.elf from tests/rv32/hello, and block_irq.elf and its disk fixture from
