@@ -7,6 +7,10 @@
 //! - [`m2`] (`docs/m2-design.md` §13, §15.1): checkpoint and resume from every event of
 //!   `block_irq.elf` on `m2-reference`, observation invariance, and the golden files that
 //!   `cargo xtask m2-golden bless` writes.
+//! - [`m3`] (`docs/m3-design.md` §9.2, §17.4): the portable snapshot format and its
+//!   platform validation, checkpoint and resume from every event of the M3 scenario on
+//!   `m3-reference`, observation invariance, and the golden files that
+//!   `cargo xtask m3-golden bless` writes.
 //!
 //! Every check returns a `Result` instead of asserting, so the tests can also feed it
 //! doctored inputs and prove that it notices them.
@@ -17,6 +21,7 @@ pub mod golden;
 pub mod layout;
 pub mod m1;
 pub mod m2;
+pub mod m3;
 pub mod observation;
 pub mod process;
 

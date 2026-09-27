@@ -15,6 +15,16 @@
 //! - `m2-golden bless | verify | emit <dir> | check <dir>`: the same for `block_irq.elf`
 //!   on `m2-reference`, with `tests/golden/m2-reference.json` and
 //!   `tests/golden/m2-reference.mid.snap`.
+//! - `m3-golden bless | verify | emit <dir> | check <dir>`: the same for both M3 disks on
+//!   `m3-reference`, with `tests/golden/m3-reference.json` and
+//!   `tests/golden/m3-reference.mid.snap`. `verify` first verifies the M3 fixtures
+//!   against their manifest, then reruns both scenarios and the portable snapshot.
+//! - `m3-golden every-event [<from> <to> | shard <i> <n>]`: `docs/m3-design.md` §9.2's
+//!   resume from every event of the reference scenario, of checkpoints `<from>..<to>`, or
+//!   of shard `<i>` of `<n>` shards of about equal cost (for CI): each checkpoint
+//!   is restored into a freshly built platform and run to the end, and must replay the
+//!   uninterrupted run's events without reissuing anything and end in its state. Uses
+//!   every available core; a release build is much faster.
 //! - `rv32-fixtures build`: Linux only, with the pinned toolchain on `PATH`. Rebuilds the
 //!   40 `rv32ui` fixtures from the pinned `riscv-tests` with `tests/rv32/build-fixtures.sh`
 //!   (the only step that uses the network), `hello.elf` with
@@ -82,6 +92,8 @@ use std::process::{Command, ExitCode};
 use systemscope_acceptance::golden::{GOLDEN_PATH, Golden, MID_SNAPSHOT_PATH, describe_changes};
 use systemscope_acceptance::m1::golden as m1;
 use systemscope_acceptance::m2::golden as m2;
+use systemscope_acceptance::m3::golden as m3g;
+use systemscope_acceptance::m3::{Fixture as M3Fixture, checkpoint as m3c};
 use systemscope_rv32::act4::{self, ACT4_MANIFEST, ACT4_SCRIPT};
 use systemscope_rv32::block_irq::{
     self, BLOCK_IRQ_DIR, BLOCK_IRQ_MANIFEST, BLOCK_IRQ_SCRIPT, BlockIrqManifest,
@@ -103,6 +115,9 @@ use systemscope_rv32::{csrgen, privgen, vmgen};
 const USAGE: &str = "usage: cargo xtask bless\n       \
                      cargo xtask m1-golden bless | verify | emit <dir> | check <dir>\n       \
                      cargo xtask m2-golden bless | verify | emit <dir> | check <dir>\n       \
+                     cargo xtask m3-golden bless | verify | emit <dir> | check <dir> \
+                     | every-event [<from> <to> | shard <i> <n>]\n       \
+                     cargo xtask m3-reference manifest | run | verify\n       \
                      cargo xtask rv32-fixtures build | manifest [<cache-dir>] | verify\n       \
                      cargo xtask spike build | verify | diff | random [<dir>]\n       \
                      cargo xtask act4 build [<cache-dir>] | install <out-dir> | check <out-dir> \
@@ -111,6 +126,8 @@ const USAGE: &str = "usage: cargo xtask bless\n       \
 const M1_RESULT: &str = "m1-reference.json";
 /// The golden file's name in an `m2-golden emit` directory.
 const M2_RESULT: &str = "m2-reference.json";
+/// The golden file's name in an `m3-golden emit` directory.
+const M3_RESULT: &str = "m3-reference.json";
 /// Where `rv32-fixtures build` fetches and builds, relative to the workspace root.
 const RV32_CACHE: &str = "target/rv32-fixtures";
 /// Where `act4 build` keeps the pinned stack, relative to the workspace root.
@@ -131,6 +148,25 @@ fn main() -> ExitCode {
         ["m2-golden", "verify"] => m2_verify(),
         ["m2-golden", "emit", dir] => m2_emit(Path::new(dir)),
         ["m2-golden", "check", dir] => m2_check(Path::new(dir)),
+        ["m3-golden", "bless"] => m3_bless(),
+        ["m3-golden", "verify"] => m3_golden_verify(),
+        ["m3-golden", "emit", dir] => m3_emit(Path::new(dir)),
+        ["m3-golden", "check", dir] => m3_check(Path::new(dir)),
+        ["m3-golden", "every-event"] => m3_every_event(Checkpoints::All),
+        ["m3-golden", "every-event", "shard", i, n] => match (i.parse(), n.parse()) {
+            (Ok(i), Ok(n)) if i < n => m3_every_event(Checkpoints::Shard(i, n)),
+            _ => {
+                eprintln!("{USAGE}");
+                ExitCode::FAILURE
+            }
+        },
+        ["m3-golden", "every-event", from, to] => match (from.parse(), to.parse()) {
+            (Ok(from), Ok(to)) => m3_every_event(Checkpoints::Range(from..to)),
+            _ => {
+                eprintln!("{USAGE}");
+                ExitCode::FAILURE
+            }
+        },
         ["rv32-fixtures", "build"] => rv32_build(),
         ["rv32-fixtures", "manifest"] => rv32_manifest(&root().join(RV32_CACHE)),
         ["rv32-fixtures", "manifest", cache] => rv32_manifest(Path::new(cache)),
@@ -449,6 +485,173 @@ fn m2_check(dir: &Path) -> ExitCode {
         result,
         "the foreign M2 result equals the committed golden files and this machine's run, \
          and its snapshot restores here to the golden end",
+    )
+}
+
+fn m3_bless() -> ExitCode {
+    let root = root();
+    let json_path = root.join(m3g::GOLDEN_PATH);
+    let snap_path = root.join(m3g::MID_SNAPSHOT_PATH);
+    let old_json = fs::read_to_string(&json_path).ok();
+    let old = old_json.as_deref().and_then(|s| m3g::Golden::parse(s).ok());
+    let old_snap = fs::read(&snap_path).ok();
+
+    eprintln!("running both M3 disks on m3-reference...");
+    let (new, snapshot) = match m3g::Golden::generate(&root) {
+        Ok(generated) => generated,
+        Err(e) => {
+            eprintln!("not blessed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let json = new.render();
+
+    let mut changes = m3g::describe_changes(old.as_ref(), &new);
+    if old.is_some() && changes.is_empty() && old_json.as_deref() != Some(json.as_str()) {
+        changes.push(format!("~ {}: formatting only", m3g::GOLDEN_PATH));
+    }
+    if old_snap.as_deref() != Some(snapshot.as_slice()) && old.is_some_and(|o| o.mid == new.mid) {
+        changes.push(format!(
+            "~ {}: bytes differ from the recorded hash",
+            m3g::MID_SNAPSHOT_PATH
+        ));
+    }
+    if changes.is_empty() {
+        println!("M3 golden files are up to date");
+        return ExitCode::SUCCESS;
+    }
+    if let Err(e) = fs::create_dir_all(json_path.parent().expect("has a parent"))
+        .and_then(|()| fs::write(&json_path, json))
+        .and_then(|()| fs::write(&snap_path, &snapshot))
+    {
+        eprintln!("cannot write the M3 golden files: {e}");
+        return ExitCode::FAILURE;
+    }
+    println!("M3 golden files changed:");
+    for change in &changes {
+        println!("  {change}");
+    }
+    println!("wrote {} and {}", m3g::GOLDEN_PATH, m3g::MID_SNAPSHOT_PATH);
+    println!(
+        "Commit them on their own and explain in the commit body why the digests changed \
+         (see CONTRIBUTING.md)."
+    );
+    ExitCode::SUCCESS
+}
+
+/// The committed M3 golden file and portable snapshot.
+fn m3_committed(root: &Path) -> Result<(String, Vec<u8>), String> {
+    let json = fs::read_to_string(root.join(m3g::GOLDEN_PATH))
+        .map_err(|e| format!("{}: {e}", m3g::GOLDEN_PATH))?;
+    let snap = fs::read(root.join(m3g::MID_SNAPSHOT_PATH))
+        .map_err(|e| format!("{}: {e}", m3g::MID_SNAPSHOT_PATH))?;
+    Ok((json, snap))
+}
+
+fn m3_golden_verify() -> ExitCode {
+    let root = root();
+    if !m3_verify_fixtures(&root) {
+        return ExitCode::FAILURE;
+    }
+    let result = m3_committed(&root)
+        .map_err(|e| vec![e])
+        .and_then(|(json, snap)| m3g::Golden::verify(&root, &json, &snap));
+    report(
+        result,
+        &format!(
+            "both M3 disks match {}, and {} restores to it",
+            m3g::GOLDEN_PATH,
+            m3g::MID_SNAPSHOT_PATH
+        ),
+    )
+}
+
+fn m3_emit(dir: &Path) -> ExitCode {
+    let (golden, snapshot) = match m3g::Golden::generate(&root()) {
+        Ok(generated) => generated,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = fs::create_dir_all(dir)
+        .and_then(|()| fs::write(dir.join(M3_RESULT), golden.render()))
+        .and_then(|()| fs::write(dir.join(m3g::MID_FILE), &snapshot))
+    {
+        eprintln!("cannot write into {}: {e}", dir.display());
+        return ExitCode::FAILURE;
+    }
+    println!(
+        "wrote this machine's M3 result: {M3_RESULT} and {} ({} bytes, BLAKE3 {})",
+        m3g::MID_FILE,
+        golden.mid.size,
+        systemscope_rv32::hex(&golden.mid.blake3)
+    );
+    ExitCode::SUCCESS
+}
+
+fn m3_check(dir: &Path) -> ExitCode {
+    let root = root();
+    let result = m3_committed(&root)
+        .map_err(|e| vec![e])
+        .and_then(|(json, snap)| {
+            let read_error = |e: std::io::Error| vec![format!("{}: {e}", dir.display())];
+            let foreign_json = fs::read_to_string(dir.join(M3_RESULT)).map_err(read_error)?;
+            let foreign_snap = fs::read(dir.join(m3g::MID_FILE)).map_err(read_error)?;
+            m3g::Golden::check_foreign(&root, (&json, &snap), (&foreign_json, &foreign_snap))
+        });
+    report(
+        result,
+        "the foreign M3 result equals the committed golden files and this machine's run, \
+         and its snapshot restores here to the golden end",
+    )
+}
+
+/// The checkpoints `m3-golden every-event` resumes.
+enum Checkpoints {
+    All,
+    Range(std::ops::Range<usize>),
+    /// Shard `.0` of `.1` shards of about equal cost.
+    Shard(usize, usize),
+}
+
+fn m3_every_event(checkpoints: Checkpoints) -> ExitCode {
+    let root = root();
+    let result = M3Fixture::read(&root, Scenario::Reference).and_then(|fixture| {
+        let reference = m3c::reference(&fixture)?;
+        let all = 0..reference.events() + 1;
+        let range = match checkpoints {
+            Checkpoints::All => all,
+            Checkpoints::Range(range) => range,
+            Checkpoints::Shard(i, n) => m3c::balanced(all, reference.events(), n)
+                .get(i)
+                .cloned()
+                .unwrap_or(0..0),
+        };
+        let threads = std::thread::available_parallelism().map_or(1, usize::from);
+        eprintln!(
+            "resuming checkpoints {}..{} of {} events on {threads} threads...",
+            range.start,
+            range.end,
+            reference.events()
+        );
+        let sweep = m3c::every_event(&fixture, &reference, range, threads);
+        println!(
+            "{} checkpoints resumed, {} failed",
+            sweep.checked,
+            sweep.failures.len()
+        );
+        if sweep.checked == 0 {
+            return Err("no checkpoint in range".to_owned());
+        }
+        match sweep.failures.first() {
+            None => Ok(()),
+            Some((k, e)) => Err(format!("first failure at checkpoint {k}: {e}")),
+        }
+    });
+    report(
+        result.map_err(|e| vec![e]),
+        "every checkpoint replays the reference run without a reissue and ends in its state",
     )
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "systemscope-acceptance"
-description = "SystemScope M0 acceptance tests AT-1 to AT-3, M1 acceptance tests M1-A6 to M1-A8, M2 snapshot, observation, and golden acceptance, and their golden files"
+description = "SystemScope M0 acceptance tests AT-1 to AT-3, M1 acceptance tests M1-A6 to M1-A8, M2 and M3 snapshot, observation, and golden acceptance, and their golden files"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
