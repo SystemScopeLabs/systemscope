@@ -6,9 +6,19 @@ events, the same state, and the same trace, on every supported platform.
 
 ## Status
 
-**M3: modeled OS backend**, a frozen release candidate; see
-[docs/releases/m3-exit-audit.md](docs/releases/m3-exit-audit.md). It is not tagged yet.
-SystemScope is still an early system, not a usable simulator of real hardware.
+**M3: modeled OS backend** is complete and tagged `v0.4.0-m3`; see
+[docs/releases/m3-exit-audit.md](docs/releases/m3-exit-audit.md). The next milestone,
+**M4: Verification & Debugging Engine**, has a frozen design (M4.0), and its
+implementation has not started; M4.1 is next. SystemScope is still an early system, not a usable simulator of real
+hardware.
+
+| Milestone | Status | Tag |
+|---|---|---|
+| M0 | complete | `v0.1.0-m0` |
+| M1 | complete | `v0.2.0-m1` |
+| M2 | complete | `v0.3.0-m2` |
+| M3 | complete | `v0.4.0-m3` |
+| M4 | M4.0 design frozen; implementation not started ([docs/m4-design.md](docs/m4-design.md)) | none |
 
 On `m3-reference`, a bare-metal firmware boots a small modeled kernel. The kernel loads
 five user programs from a disk image through the DMA block controller. It runs them as
@@ -30,13 +40,13 @@ What each milestone provides:
     `mem.v1` protocol;
   - a host-side ELF32 loader for a checked subset of RISC-V executables;
   - the `m1-reference` platform.
-- **M2** (release candidate, [docs/releases/m2-exit-audit.md](docs/releases/m2-exit-audit.md)):
+- **M2** (`v0.3.0-m2`, [docs/releases/m2-exit-audit.md](docs/releases/m2-exit-audit.md)):
   - Zicsr, the machine CSRs, `MRET`, and machine external interrupts;
   - a level-sensitive `SimpleIrqController`;
   - `DmaBlockController` with DMA between RAM and `SimpleBlockMedia`, an abstract block
     store (`block.v0`, `irq.v0`);
   - the `m2-reference` platform.
-- **M3**:
+- **M3** (`v0.4.0-m3`, [docs/releases/m3-exit-audit.md](docs/releases/m3-exit-audit.md)):
   - a documented U/S/M privilege subset with `medeleg` delegation, `SRET`, and Sv32
     translation (Svade: no hardware A/D updates, no TLB);
   - `ModeledKernel`, a Rust kernel model behind a memory-mapped gate: executable-table
@@ -78,6 +88,7 @@ M0, the deterministic simulation kernel, is tagged `v0.1.0-m0`. More documents:
 - designs and exit criteria: [docs/m0-design.md](docs/m0-design.md),
   [docs/m1-design.md](docs/m1-design.md), [docs/m2-design.md](docs/m2-design.md), and
   [docs/m3-design.md](docs/m3-design.md);
+- the M4 design, frozen at M4.0: [docs/m4-design.md](docs/m4-design.md);
 - M1 release notes: [docs/releases/v0.2.0-m1.md](docs/releases/v0.2.0-m1.md);
 - the overall plan: [plan.md](plan.md).
 
@@ -96,8 +107,12 @@ systemscope (this repository)
 ├─ tests/acceptance/     M0 AT-1..AT-3, M1-A6..M1-A8, M2 and M3 snapshot/golden suites, golden files in tests/golden
 ├─ tests/rv32/           m1/m2/m3-reference builders, rv32ui fixtures, hello.elf, block_irq.elf, M3 firmware and user programs, Spike differential
 ├─ tests/act4/           the committed ACT4 RV32I corpus and its manifest
-└─ xtask/                bless, m1/m2/m3-golden, m3-reference, rv32-fixtures, spike, act4
+├─ xtask/                bless, m1/m2/m3-golden, m3-reference, rv32-fixtures, spike, act4
+├─ verification/         (planned, M4) systemscope-verify, the verification & debugging engine
+└─ visualizer/           (planned, M7+) the Visualizer / Interactive Debugger
 ```
+
+Directories marked *planned* do not exist yet.
 
 `systemscope` uses `contracts` from a sibling directory, and CI checks out a pinned commit
 of it.
@@ -108,13 +123,16 @@ of it.
 |---|---|
 | **M0** (`v0.1.0-m0`) | Time, event queue, component contract, deterministic DES, Perfetto trace |
 | **M1** (`v0.2.0-m1`) | RV32I CPU and RAM, bare-metal ELF execution, UART output |
-| **M2** (release candidate) | Interrupts, DMA, block storage (abstract SSD model) |
-| **M3** (release candidate) | Modeled OS backend: processes, syscalls, Sv32 virtual memory |
-| M4 (planned) | SystemScope Visualizer: topology, timeline, state, step, step back |
+| **M2** (`v0.3.0-m2`) | Interrupts, DMA, block storage (abstract SSD model) |
+| **M3** (`v0.4.0-m3`) | Modeled OS backend: processes, syscalls, Sv32 virtual memory |
+| M4 (M4.0 design frozen) | Verification & Debugging Engine: compare executions at stable architectural boundaries, locate the first divergence, produce structured diagnostic evidence, and build portable reproducers |
 | M5 (planned) | SystemVerilog CPU backend via Verilator |
 | M6 (planned) | Native guest OS backend: a C/assembly tiny kernel |
+| M7 (planned) | SystemScope Visualizer / Interactive Debugger: topology, timeline, state, step, step back, seek, breakpoint, filter, plus views of M4 divergences and reproducers |
 
-M4–M6 are not implemented. They are described in [plan.md](plan.md) §11.
+M0–M3 are complete. M4–M7 are not implemented. They are described in [plan.md](plan.md)
+§11, and M4 in the frozen design [docs/m4-design.md](docs/m4-design.md). The Visualizer was first
+planned as M4 and moved to M7, with its scope unchanged.
 
 ## Build and test
 

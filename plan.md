@@ -8,6 +8,8 @@ It connects the whole system, from hardware through OS, runtime, network, and GP
 
 **execution · state · events · tracing · replaceable implementations**
 
+Because every run is deterministic and every backend sits behind the same contracts, SystemScope can also compare two executions, or two implementations of the same contract, and show where and how they first differ. Verification and debugging are capabilities of the same execution model, not a separate product.
+
 ---
 
 ## 1. Design Principles
@@ -51,6 +53,13 @@ Users can drill into any layer, for example `Computer → CPU → Core → Pipel
 | **Execution Trace** | Follow every system-wide event caused by running a program: `PROCESS_CREATE`, `PAGE_FAULT`, `NVME_READ`, `TLB_MISS`, `L1_MISS`, `DRAM_READ`, `SYSCALL_ENTER`, `INTERRUPT`, `DMA_COMPLETE`, `PACKET_TX`, `GPU_DISPATCH`, … |
 | **State Inspector** | Inspect real state at any point in time. CPU: PC, registers, pipeline, ROB, cache, TLB. Process: PID, threads, address space, page table, FDs. SSD: queues, LBA, namespaces, controller, NAND mapping. |
 | **Timeline** | Play · Pause · Step · Step Back · Seek · Breakpoint · Filter. In effect, a debugger for the entire system. |
+
+These four remain the product's user-facing goal. They are built on two engine capabilities that the UI will consume:
+
+| Capability | Description |
+|---|---|
+| **Differential Verification** | Compare two executions or two backends at stable architectural boundaries, under a comparison profile, and locate the first boundary where they differ. |
+| **Reproducible Debugging** | Package a difference as a portable reproducer that rebuilds each compared side and replays the same result, byte for byte, on any supported host. |
 
 ---
 
@@ -172,32 +181,52 @@ Real-trace backends come later: QEMU, Linux perf, eBPF, ETW, SystemVerilog simul
 The two worlds **unify at the Event/Trace level only**.
 - Real traces are sampled and incomplete, so full `State` and `Snapshot` exist only for simulation backends.
 - Each backend declares what it provides as capabilities, such as `events`, `state`, `snapshot`, and `step_back`.
-- The UI enables features based on the declared capabilities.
+- The UI enables features based on the declared capabilities. The M4 verification engine uses the same idea: it chooses how to compare and search from what each backend declares ([docs/m4-design.md](docs/m4-design.md)).
 
 ---
 
 ## 8. Verification Strategy
 
 ```text
-             RISC-V Specification
-                      │
-           ┌──────────┴──────────┐
-           ▼                     ▼
-       Sail model              Spike
-  spec reference, ACT      functional cross-check
-  signatures               (commit-log lockstep)
-           │                     │
-           └──────────┬──────────┘
-                      ▼
-               Rust CPU (M1+)
-                      ▼  lockstep
-            SystemVerilog CPU (M5+)
+                   RISC-V Specification
+                            │
+               ┌────────────┴────────────┐
+               ▼                         ▼
+           Sail model                  Spike
+      ACT expected results     normalized retirement stream
+               │                         │
+               └────────────┬────────────┘
+                            ▼      oracles
+                  SystemScope model (M1–M3)
+             Rust CPU · SoC · Modeled OS backend
+                            │
+                            ▼
+            Verification & Debugging Engine (M4)
+   profile-defined comparison · primary architectural stream
+      ┌──────────────┬──────────────┬──────────────┐
+      ▼              ▼              ▼              ▼
+    first         structured     relevant      portable
+  divergence      state and      predecessor   reproducer
+  (search)        trace diff     slice         and corpus
+      └──────────────┴──────┬───────┴──────────────┘
+               ┌────────────┴────────────┐
+               ▼                         ▼
+     SystemVerilog CPU (M5)     Native Guest OS (M6)
+     Rust ↔ RTL differential    modeled ↔ native differential
+                            │
+                            ▼
+              Visualizer / Interactive Debugger (M7)
 ```
 
 - **riscv-tests** serve as processor unit tests.
-- **ACT (riscv-arch-test)** is the reference for architectural conformance. The Sail model generates its expected results. ACT does not replace full processor verification.
-- **Spike lockstep** runs from M1. At every instruction retirement it compares `PC`, `x0..x31`, CSRs, memory writes, and trap state.
-- **Rust ↔ SystemVerilog lockstep** runs from M5, via Verilator co-simulation. It also demonstrates concretely that backends are replaceable.
+- **ACT (riscv-arch-test)** is the reference for architectural conformance of the RV32I subset. The Sail model generates its expected results. ACT does not replace full processor verification, and SystemScope makes no privileged-architecture conformance claim.
+- **The Spike differential** runs from M1. Spike runs the same committed program with `--log-commits`, and the harness compares SystemScope's canonical `rv32.commit` records with Spike's commit log after both runs. Each retirement is normalized to `pc`, the instruction word, the register write, and the memory access. M2 adds the whitelisted CSR write, and M3 adds the privilege mode and exceptions delivered to S. It is a post-run stream comparison, not a live lockstep, and it reports the first differing retirement ([docs/m1-design.md §10.3](docs/m1-design.md#103-spike-differential)).
+- **The M4 Verification & Debugging Engine** turns a detected failure into a characterized, reproducible divergence. Each comparison follows a profile, which names one primary architectural stream. The engine compares executions at stable architectural boundaries, not at raw runtime events, and locates the first difference in that primary stream. Other streams and event-level traces are auxiliary diagnostic evidence. It reports structured state and trace differences and the recorded predecessor events, and it does not claim a root cause. It then packages the failure as a portable reproducer that rebuilds each side and replays identically on Linux and Windows. The current Spike differential becomes one adapter of this engine, and it is designed to accept further comparisons:
+  - Rust CPU ↔ Spike;
+  - Rust CPU ↔ SystemVerilog CPU (M5);
+  - Modeled OS ↔ Native Guest OS (M6);
+  - later, simulation ↔ trace-backed implementations.
+- **Rust ↔ SystemVerilog differential** runs from M5, via Verilator co-simulation, through the M4 engine. It also demonstrates concretely that backends are replaceable.
 - **Determinism acceptance tests** enforce Principle 2 in CI from M0 onward. They are specified in [docs/m0-design.md §9](docs/m0-design.md#9-deterministic-ci-acceptance-tests).
 
 ---
@@ -208,11 +237,11 @@ Each layer uses the language that fits its nature, and **each language is introd
 
 | Language | Purpose | Introduced |
 |---|---|---|
-| Rust | runtime, contracts, core models | M0 |
+| Rust | runtime, contracts, core models, verification & debugging engine (M4) | M0 |
 | (Perfetto UI) | early timeline visualization, no custom code | M0 |
 | RISC-V Assembly / C | bare-metal test programs | M1 |
 | Python | analysis, verification scripts, tooling | as needed |
-| TypeScript | SystemScope Visualizer | M4 |
+| TypeScript | SystemScope Visualizer / Interactive Debugger | M7 |
 | SystemVerilog | RTL implementations (via Verilator) | M5 |
 | C / Assembly | native guest kernel | M6 |
 | Schema / Protobuf | language-neutral contracts and trace format | once two or more languages share contracts |
@@ -229,7 +258,8 @@ SystemScopeLabs (GitHub org)
 └─ systemscope   this repository
    ├─ runtime/
    ├─ components/   rv32i/ · platform/ · storage/ · os/ …
-   ├─ visualizer/   (M4+)
+   ├─ verification/ (M4, planned; designed in docs/m4-design.md)
+   ├─ visualizer/   (M7+)
    ├─ tests/        acceptance tests
    └─ docs/
 ```
@@ -246,17 +276,20 @@ SystemScopeLabs (GitHub org)
 
 The final goal is not reduced. Instead, we cut out the **first complete system slice**. No milestone may hard-code a scenario. Everything must run through the component + event + state model.
 
-| Milestone | Scope | Exit criteria |
-|---|---|---|
-| **M0** | Time, event queue, component contract, deterministic DES, Perfetto trace | All criteria in [m0-design.md §10](docs/m0-design.md#10-m0-exit-criteria), including the three determinism acceptance tests passing in CI on Linux and Windows |
-| **M1** | RV32I CPU + RAM, bare-metal ELF execution, UART output | All criteria in [m1-design.md §11](docs/m1-design.md#11-m1-exit-criteria): the 40 selected `riscv-tests` rv32ui tests (all but `fence_i` and `ma_data`) pass under the SystemScope test environment, Spike commit-log lockstep matches, ACT4 RV32I passes, on Linux and Windows, with the M0 golden digests unchanged |
-| **M2** | Interrupts, DMA, block storage (abstract SSD model) | A bare-metal program completes a block read via a DMA-completion interrupt, and the acceptance tests still pass. Detailed criteria: [m2-design.md §18](docs/m2-design.md#18-m2-exit-criteria) |
-| **M3** | Modeled OS Backend: process, syscalls, Sv32 virtual memory | The full path from executable to output runs through models, with page tables living in simulated RAM |
-| **M4** | SystemScope Visualizer: topology, timeline, state, step, step back | The M3 scenario can be explored with step and step back in the UI |
-| **M5** | SystemVerilog CPU backend via Verilator | Matches the Rust CPU in lockstep and passes the same suites |
-| **M6** | Native Guest OS Backend: C/Assembly tiny kernel | Runs the M3 scenario with no changes to CPU code |
+| Milestone | Status | Scope | Exit criteria |
+|---|---|---|---|
+| **M0** | complete (`v0.1.0-m0`) | Time, event queue, component contract, deterministic DES, Perfetto trace | All criteria in [m0-design.md §10](docs/m0-design.md#10-m0-exit-criteria), including the three determinism acceptance tests passing in CI on Linux and Windows |
+| **M1** | complete (`v0.2.0-m1`) | RV32I CPU + RAM, bare-metal ELF execution, UART output | All criteria in [m1-design.md §11](docs/m1-design.md#11-m1-exit-criteria): the 40 selected `riscv-tests` rv32ui tests (all but `fence_i` and `ma_data`) pass under the SystemScope test environment, Spike commit-log lockstep matches, ACT4 RV32I passes, on Linux and Windows, with the M0 golden digests unchanged |
+| **M2** | complete (`v0.3.0-m2`) | Interrupts, DMA, block storage (abstract SSD model) | A bare-metal program completes a block read via a DMA-completion interrupt, and the acceptance tests still pass. Detailed criteria: [m2-design.md §18](docs/m2-design.md#18-m2-exit-criteria) |
+| **M3** | complete (`v0.4.0-m3`) | Modeled OS Backend: process, syscalls, Sv32 virtual memory | The full path from executable to output runs through models, with page tables living in simulated RAM. Detailed criteria: [m3-design.md §18](docs/m3-design.md#18-m3-exit-criteria) |
+| **M4** | M4.0 design frozen; M4.1 implementation next | Verification & Debugging Engine: deterministically locate, characterize, minimize, and reproduce the first divergence between two executions or implementations; design in [docs/m4-design.md](docs/m4-design.md) | For controlled, deliberately injected architectural divergences in the M3 reference system, SystemScope finds the first divergent boundary of the profile's primary architectural stream, and it reports the structured state and trace differences there. It then writes a portable reproducer, which replays the same verification result byte for byte on Linux and Windows. The M0–M3 behavior and golden files stay unchanged. Detailed criteria and the acceptance workload: [m4-design.md §28](docs/m4-design.md#28-m4-exit-criteria) |
+| **M5** | planned | SystemVerilog CPU backend via Verilator | Matches the Rust CPU at every compared architectural boundary through the M4 differential engine, and passes the same suites. Any divergence is reported with the M4 locator and reproducer |
+| **M6** | planned | Native Guest OS Backend: C/Assembly tiny kernel | Runs the M3 scenario with no changes to CPU code. Its architecturally observable behavior is compared with the Modeled OS backend through the M4 differential and reproducer infrastructure |
+| **M7** | planned | SystemScope Visualizer / Interactive Debugger: topology, timeline, state, step, step back, seek, breakpoint, filter | The M3 scenario can be explored with step and step back in the UI. The UI also shows M4 artifacts: first divergence, state and trace diffs, checkpoint positions, predecessor slices, and reproducers |
 
 The M3 first-slice scenario: `Executable → Storage → RAM → Process → CPU → Memory → Syscall → Kernel → Output`.
+
+The Visualizer was first planned as M4. It moved to M7 so that the UI is built on top of the verification, reproduction, and backend-comparison data it will display. Its scope is unchanged.
 
 After that, GPU and NIC plug into the same runtime.
 
@@ -279,6 +312,8 @@ We do not invent our own rules first. We study projects that have worked on thes
 - Explicit non-goals.
 - Snapshot serialization format, decided in M0 ([m0-design.md §12](docs/m0-design.md#12-open-questions)).
 - When to introduce host-parallel simulation (PDES), and how to keep it deterministic.
+
+The M4.0 freeze answered the verification questions: M4 targets backends that report architectural boundaries, not arbitrary systems; event-level comparison is a same-engine diagnostic, and architectural comparison works across backends; a slice follows only the links the trace records; fuzzing is not in M4's core, only deterministic seeded campaigns; and a trace-backed backend takes part through its outcome and architectural stream only. The M4 questions and their frozen answers are in [docs/m4-design.md §29](docs/m4-design.md#29-design-questions-and-frozen-answers).
 
 ---
 
