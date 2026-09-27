@@ -1,8 +1,8 @@
 # M3 Design: Modeled OS Backend
 
-> Status: Design frozen (M3.0), with M3.2 clarifications to §5.1, §5.3, §5.5, §15.1, §15.3, and §17 from [m3-2-spike-appendix.md](m3-2-spike-appendix.md), the M3.4b, M3.5, and M3.6 clarifications in §17.1–§17.3, and the M3.7 snapshot and golden freeze in §17.4 · Parent: [plan.md](../plan.md) · Builds on: [m2-design.md](m2-design.md), [m1-design.md](m1-design.md), [m0-design.md](m0-design.md)
+> Status: Design frozen (M3.0), with M3.2 clarifications to §5.1, §5.3, §5.5, §15.1, §15.3, and §17 from [m3-2-spike-appendix.md](m3-2-spike-appendix.md), the M3.4b, M3.5, and M3.6 clarifications in §17.1–§17.3, the M3.7 snapshot and golden freeze in §17.4, and the M3.8 exit audit in [releases/m3-exit-audit.md](releases/m3-exit-audit.md) · Parent: [plan.md](../plan.md) · Builds on: [m2-design.md](m2-design.md), [m1-design.md](m1-design.md), [m0-design.md](m0-design.md)
 
-This document is the architecture contract for M3. It fixes the decisions the M3 implementation steps (§17) depend on. §19.1 records the design choices accepted at the freeze and the alternatives considered. Nothing in it is implemented yet: M3.0 changes documentation only. The M2 reference platform is frozen, and nothing here changes it.
+This document is the architecture contract for M3. It fixes the decisions the M3 implementation steps (§17) depend on. §19.1 records the design choices accepted at the freeze and the alternatives considered. M3.1–M3.7 implemented it, and the M3.8 exit audit ([releases/m3-exit-audit.md](releases/m3-exit-audit.md)) checks every §18 criterion against evidence. The M2 reference platform is frozen, and nothing here changes it.
 
 ---
 
@@ -1067,14 +1067,16 @@ M3.7 freezes the M3 snapshot surface and the M3 golden files. It adds tests, too
 
 ## 18. M3 Exit Criteria
 
-- [ ] The `M3` CPU profile implements §5, checked by the Spike-directed tests, the `sv32_translate` and `take_mei` oracles, and every-event resume; the `M1` and `M2` profiles are unchanged.
-- [ ] `ModeledKernel` implements §6 and §8, checked by the pure kernel oracle and in the runtime.
-- [ ] The M3 scenario passes on `m3-reference` (§12.3) on Linux and Windows. Its path runs Executable → Storage → RAM → Process → CPU → Memory → Syscall → Kernel → Output entirely through models, with page tables in simulated RAM.
-- [ ] Snapshot/restore from every event, the §9.2 stress points, and the portable snapshot pass; observation invariance holds.
-- [ ] `tests/golden/m3-reference.json` is blessed once, and every M0, M1, and M2 golden file is byte-identical to its release.
-- [ ] No `contracts` change, or, if one proved necessary, it went through contracts first and a pin bump, and this document records it.
-- [ ] Every fixture (firmware, user programs, disk image) is pinned by a manifest.
-- [ ] Decisions and contract changes discovered during M3 are reflected back into this document.
+Checked by the M3.8 exit audit, [releases/m3-exit-audit.md](releases/m3-exit-audit.md) §13, which records the evidence for each criterion.
+
+- [x] The `M3` CPU profile implements §5, checked by the Spike-directed tests, the `sv32_translate` and `take_mei` oracles, and every-event resume; the `M1` and `M2` profiles are unchanged.
+- [x] `ModeledKernel` implements §6 and §8, checked by the pure kernel oracle and in the runtime.
+- [x] The M3 scenario passes on `m3-reference` (§12.3) on Linux and Windows. Its path runs Executable → Storage → RAM → Process → CPU → Memory → Syscall → Kernel → Output entirely through models, with page tables in simulated RAM.
+- [x] Snapshot/restore from every event, the §9.2 stress points, and the portable snapshot pass; observation invariance holds.
+- [x] `tests/golden/m3-reference.json` is blessed once, and every M0, M1, and M2 golden file is byte-identical to its release.
+- [x] No `contracts` change, or, if one proved necessary, it went through contracts first and a pin bump, and this document records it.
+- [x] Every fixture (firmware, user programs, disk image) is pinned by a manifest.
+- [x] Decisions and contract changes discovered during M3 are reflected back into this document.
 
 The M6 feasibility check (§15.1) is not an exit criterion. **The M6 feasibility check, if executed, is a validation of the CPU contract surface and is not a requirement to implement the M6 backend.**
 

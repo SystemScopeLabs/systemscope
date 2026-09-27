@@ -6,53 +6,97 @@ events, the same state, and the same trace, on every supported platform.
 
 ## Status
 
-**M1: RV32I architectural CPU** (`v0.2.0-m1`). SystemScope runs bare-metal RV32I ELF
-programs on the M0 kernel, and prints through a UART. It is still an early milestone,
-not a usable simulator of real hardware. M1 provides:
+**M3: modeled OS backend**, a frozen release candidate; see
+[docs/releases/m3-exit-audit.md](docs/releases/m3-exit-audit.md). It is not tagged yet.
+SystemScope is still an early system, not a usable simulator of real hardware.
 
-- `Rv32iCpu`: all 40 RV32I instructions at architectural fidelity (no pipeline), every
-  fetch and data access through memory, and the execution-environment trap boundary
-- `AddressBus`, sparse `Ram`, and a minimal `SimpleUart` (TX only), over the
-  fault-capable `mem.v1` protocol
-- a host-side ELF32 loader for a checked subset of `ET_EXEC` RISC-V images
-- the `m1-reference` platform: RAM at `0x8000_0000` (16 MiB), UART at `0x1000_0000`
-- every M0 guarantee on it: deterministic digests, snapshots that restore exactly and
-  portably, and observation that does not change results, checked against committed
-  golden files
+On `m3-reference`, a bare-metal firmware boots a small modeled kernel. The kernel loads
+five user programs from a disk image through the DMA block controller. It runs them as
+user processes in their own Sv32 address spaces and serves their system calls. Their
+output reaches the modeled UART:
 
-The CPU's behavior is checked against four independent sources: its own unit and
-property tests, 40 `riscv-tests` `rv32ui` tests, Spike retirement by retirement (those
-40 tests, 64 generated programs, and 9 misaligned-access programs), and 39 ACT4 RV32I
-tests with expected values from the Sail reference model. These are external validation,
+```text
+Executable → Storage → RAM → Process → CPU → Memory → Syscall → Kernel → Output
+```
+
+The whole path runs through models, with page tables in simulated RAM.
+
+What each milestone provides:
+
+- **M1** (`v0.2.0-m1`):
+  - `Rv32iCpu`: all 40 RV32I instructions at architectural fidelity (no pipeline), with
+    every fetch and data access through memory;
+  - `AddressBus`, sparse `Ram`, and a TX-only `SimpleUart`, over the fault-capable
+    `mem.v1` protocol;
+  - a host-side ELF32 loader for a checked subset of RISC-V executables;
+  - the `m1-reference` platform.
+- **M2** (release candidate, [docs/releases/m2-exit-audit.md](docs/releases/m2-exit-audit.md)):
+  - Zicsr, the machine CSRs, `MRET`, and machine external interrupts;
+  - a level-sensitive `SimpleIrqController`;
+  - `DmaBlockController` with DMA between RAM and `SimpleBlockMedia`, an abstract block
+    store (`block.v0`, `irq.v0`);
+  - the `m2-reference` platform.
+- **M3**:
+  - a documented U/S/M privilege subset with `medeleg` delegation, `SRET`, and Sv32
+    translation (Svade: no hardware A/D updates, no TLB);
+  - `ModeledKernel`, a Rust kernel model behind a memory-mapped gate: executable-table
+    boot from storage, processes, frame allocation, FIFO scheduling with `sched_yield`,
+    and a small Linux-numbered syscall subset (`write`, `exit`, `exit_group`,
+    `sched_yield`, `getpid`);
+  - the `m3-reference` platform.
+
+  The CPU does not know the kernel: the kernel works only through memory accesses and
+  the saved trap frame.
+
+Every milestone keeps the M0 guarantees, checked against committed golden files: the
+same digests on Linux and Windows, snapshots that restore exactly and portably at every
+event, and observation that does not change results.
+
+The CPU's behavior is checked against independent sources:
+- its own unit and property tests;
+- 40 `riscv-tests` `rv32ui` tests;
+- Spike, retirement by retirement: rv32ui, generated and misaligned-access programs, and
+  the directed M2 CSR, M3 privilege, and M3 Sv32 programs;
+- 39 ACT4 RV32I tests with expected values from the Sail reference model, on the M1, M2,
+  and M3 CPU profiles.
+
+The modeled kernel is checked against pure oracles. All of this is external validation,
 not a certification.
 
-SystemScope's capability is RV32I only. It does not implement Zicsr, privileged
-architecture, interrupts, or the M, A, F, D, and C extensions, and misaligned loads and
-stores trap. SystemScope does NOT implement Sm. Sm appears only in the pinned ACT4/UDB
-adapter configuration because that schema requires Sm-owned MXLEN. Privileged ACT tests
-are disabled.
+What SystemScope does not implement:
+- the M, A, F, D, and C extensions, and misaligned loads and stores (they trap);
+- timers, CLINT, PLIC, and preemption;
+- PMP, `MPRV`, ASIDs, a TLB, and hardware A/D updates;
+- a filesystem, `fork`/`exec`, and memory-management syscalls.
 
-M0, the deterministic simulation kernel, is tagged `v0.1.0-m0`. The designs and exit
-criteria are in [docs/m0-design.md](docs/m0-design.md) and
-[docs/m1-design.md](docs/m1-design.md), the M1 release notes in
-[docs/releases/v0.2.0-m1.md](docs/releases/v0.2.0-m1.md), and the overall plan in
-[plan.md](plan.md).
+The privileged support is the subset documented in [docs/m3-design.md](docs/m3-design.md)
+§5. SystemScope does NOT claim conformance to Sm, Ss, or Sv32. Sm appears only in the
+pinned ACT4/UDB adapter configuration, because that schema requires Sm-owned MXLEN.
+Privileged ACT tests are disabled.
+
+M0, the deterministic simulation kernel, is tagged `v0.1.0-m0`. More documents:
+- designs and exit criteria: [docs/m0-design.md](docs/m0-design.md),
+  [docs/m1-design.md](docs/m1-design.md), [docs/m2-design.md](docs/m2-design.md), and
+  [docs/m3-design.md](docs/m3-design.md);
+- M1 release notes: [docs/releases/v0.2.0-m1.md](docs/releases/v0.2.0-m1.md);
+- the overall plan: [plan.md](plan.md).
 
 ## Architecture
 
 ```text
-contracts   (SystemScopeLabs/contracts)   time, events, components, protocols (mem.v0, mem.v1), snapshots, trace, observation
+contracts   (SystemScopeLabs/contracts)   time, events, components, protocols (mem.v0, mem.v1, irq.v0, block.v0), snapshots, trace, observation
 systemscope (this repository)
 ├─ runtime/              scheduler, topology elaboration, lifecycle, snapshots, trace sinks
 ├─ components/toy/       M0: ToyCpu, ToyDma, ToyBus, ToyMemory
-├─ components/rv32i/     M1: decode, execution, Rv32iCpu
-├─ components/platform/  M1: AddressBus, Ram, SimpleUart
-├─ elf/                  M1: host-side ELF32 loader
+├─ components/rv32i/     M1–M3: decode, execution, CSRs, privilege, Sv32, Rv32iCpu
+├─ components/platform/  M1–M2: AddressBus, Ram, SimpleUart, SimpleIrqController, DmaBlockController, SimpleBlockMedia
+├─ components/os/        M3: ModeledKernel (gate, boot, processes, syscalls)
+├─ elf/                  M1: host-side ELF32 loader; M3: user-executable parser and executable table
 ├─ reference/            builds m0-reference
-├─ tests/acceptance/     M0 AT-1..AT-3, M1-A6..M1-A8, golden files in tests/golden
-├─ tests/rv32/           m1-reference builder, rv32ui fixtures, hello.elf, Spike differential, program generator
+├─ tests/acceptance/     M0 AT-1..AT-3, M1-A6..M1-A8, M2 and M3 snapshot/golden suites, golden files in tests/golden
+├─ tests/rv32/           m1/m2/m3-reference builders, rv32ui fixtures, hello.elf, block_irq.elf, M3 firmware and user programs, Spike differential
 ├─ tests/act4/           the committed ACT4 RV32I corpus and its manifest
-└─ xtask/                bless, m1-golden, rv32-fixtures, spike, act4
+└─ xtask/                bless, m1/m2/m3-golden, m3-reference, rv32-fixtures, spike, act4
 ```
 
 `systemscope` uses `contracts` from a sibling directory, and CI checks out a pinned commit
@@ -64,10 +108,13 @@ of it.
 |---|---|
 | **M0** (`v0.1.0-m0`) | Time, event queue, component contract, deterministic DES, Perfetto trace |
 | **M1** (`v0.2.0-m1`) | RV32I CPU and RAM, bare-metal ELF execution, UART output |
-| **M2** (next) | Interrupts, DMA, block storage (abstract SSD model); design in [docs/m2-design.md](docs/m2-design.md) |
+| **M2** (release candidate) | Interrupts, DMA, block storage (abstract SSD model) |
+| **M3** (release candidate) | Modeled OS backend: processes, syscalls, Sv32 virtual memory |
+| M4 (planned) | SystemScope Visualizer: topology, timeline, state, step, step back |
+| M5 (planned) | SystemVerilog CPU backend via Verilator |
+| M6 (planned) | Native guest OS backend: a C/assembly tiny kernel |
 
-Later milestones (a modeled OS, the visualizer, HDL and native OS backends) are
-described in [plan.md](plan.md) §11.
+M4–M6 are not implemented. They are described in [plan.md](plan.md) §11.
 
 ## Build and test
 
@@ -89,11 +136,14 @@ cargo nextest run --workspace --locked --no-fail-fast
 cargo test --workspace --doc --locked
 ```
 
-The M1 checks that need no external tool run on the committed files:
+The checks that need no external tool run on the committed files:
 
 ```sh
 cargo xtask rv32-fixtures verify
 cargo xtask m1-golden verify
+cargo xtask m2-golden verify
+cargo xtask m3-golden verify
+cargo xtask m3-reference verify
 cargo xtask act4 verify
 cargo xtask act4 run
 ```

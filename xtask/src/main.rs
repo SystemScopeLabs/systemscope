@@ -79,7 +79,7 @@
 //! - `act4 verify`: checks the committed corpus against its manifest, with no network,
 //!   ACT4, Sail, or compiler.
 //! - `act4 run`: `verify`, then M1-A4: runs every committed ACT4 ELF on `m1-reference`,
-//!   all of which must pass; then runs them all again with the M2 CPU profile.
+//!   all of which must pass; then runs them all again with the M2 and M3 CPU profiles.
 //!
 //! The `spike` tasks run `<dir>/bin/spike`, or the command in `SPIKE` if it is set: the
 //! same pinned build, reached another way (such as through WSL). Nothing else in the
