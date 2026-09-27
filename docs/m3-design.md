@@ -1,6 +1,6 @@
 # M3 Design: Modeled OS Backend
 
-> Status: Design frozen (M3.0), with M3.2 clarifications to §5.1, §5.3, §5.5, §15.1, §15.3, and §17 from [m3-2-spike-appendix.md](m3-2-spike-appendix.md), and the M3.4b, M3.5, and M3.6 clarifications in §17.1–§17.3 · Parent: [plan.md](../plan.md) · Builds on: [m2-design.md](m2-design.md), [m1-design.md](m1-design.md), [m0-design.md](m0-design.md)
+> Status: Design frozen (M3.0), with M3.2 clarifications to §5.1, §5.3, §5.5, §15.1, §15.3, and §17 from [m3-2-spike-appendix.md](m3-2-spike-appendix.md), the M3.4b, M3.5, and M3.6 clarifications in §17.1–§17.3, and the M3.7 snapshot and golden freeze in §17.4 · Parent: [plan.md](../plan.md) · Builds on: [m2-design.md](m2-design.md), [m1-design.md](m1-design.md), [m0-design.md](m0-design.md)
 
 This document is the architecture contract for M3. It fixes the decisions the M3 implementation steps (§17) depend on. §19.1 records the design choices accepted at the freeze and the alternatives considered. Nothing in it is implemented yet: M3.0 changes documentation only. The M2 reference platform is frozen, and nothing here changes it.
 
@@ -978,6 +978,90 @@ M3.6 delivers `m3-reference` and the M3 scenario: boot from the executable table
 
   A full every-event resume of the whole scenario (about 167,000 events), the §9.2 stress points, the portable snapshot, and the golden files are M3.7.
 - **Validation.** Twelve property tests check boot against an oracle, with an independent controller model. The oracle is built from §8.1–§8.3, the pure `systemscope-elf` validators, and the frame model, and never calls the kernel's boot state machine. The CI Linux job rebuilds the M3 fixtures with the pinned toolchain and requires them byte-identical. Linux and Windows both run the scenario and `cargo xtask m3-reference verify` from the committed bytes. The optional native-kernel feasibility check (§15.1) was not run.
+
+### 17.4 M3.7 Snapshot and Golden Freeze
+
+M3.7 freezes the M3 snapshot surface and the M3 golden files. It adds tests, tooling, and CI only. No CPU, bus, DMA, kernel, or runtime behavior changes, and no snapshot byte of an existing schema changes: the M1 and M2 golden files, whose snapshots and digests cover schema 1 of every component and the CPU's schema 2, are byte-identical. From M3.7 on, the layouts below are the portable M3 format, and changing any of them is a schema change.
+
+- **Inventory.** An `m3-reference` snapshot is the M0 runtime container (m0-design §7: magic `SSSNAP\0\0`, format version 1, the tick, the event queue, then the components in id order) with eight components. Each stores only its own state (§9.1):
+
+  | Id | Component | Schema | Owns |
+  |---|---|---|---|
+  | 0 | `Rv32iCpu`, `M3` profile | 3 | registers, `pc`, `priv`, the CSRs, the execution state with its walk (§5.5), its `TxnId` counter |
+  | 1 | `MultiMasterBus` | 1 | per region: the active transfer (master, original and downstream `TxnId`), each master's FIFO of queued requests, the round-robin cursor; the downstream counter |
+  | 2 | `Ram` | 1 | the stored pages; page tables, trap frames, and user pages are ordinary pages |
+  | 3 | `SimpleUart` | 1 | the bytes output |
+  | 4 | `SimpleIrqController` | 1 | pending, enable, the line |
+  | 5 | `DmaBlockController` | 1 | the registers, the latched command, engine, block, beat, the write buffer, both `TxnId` counters |
+  | 6 | `SimpleBlockMedia` | 1 | the image hash, the stored blocks, the pending operations |
+  | 7 | `ModeledKernel` | 1 | life, the gate state and its `TxnId` counter, the held `ENTER`, the operation and its stage, the process table, the run queue, the frame bitmap (§6.8, §17.1–§17.3) |
+
+  Nothing is stored twice. The kernel holds no RAM bytes and no registers of the running process, the CPU holds no kernel state, and the bus holds no request beyond the queued messages it forwards.
+- **Portable format.** Every integer is fixed-width little-endian. Every collection has a count and a canonical order: ascending ids, pages, blocks, and PIDs, or FIFO order where the order is itself state. Every enum has a documented tag, and every flag is a `u8` 0 or 1. Nothing in the bytes depends on `usize`, pointers, memory layout, hash-map order, paths, clocks, or the host. The same state always encodes to the same bytes: snapshot → restore → snapshot is byte-identical, and two runs from the same fixtures produce the same bytes at the same event.
+- **Independent decoder.** `tests/acceptance/src/m3/portable.rs` reads a snapshot from the documented layouts alone and shares no code with the components, so a layout that drifts from its documentation fails there even when the component still reads its own bytes back. It decodes every component before it checks anything, and it never panics. It refuses the reserved encodings that the component readers also refuse: a `priv`, `SPP`, or `MPP` outside §5.1, a tag past its range, or a RAM page that is not 4096 bytes or that appears twice.
+- **Platform validation.** Restore takes no context (m0-design §7). Cross-component consistency is therefore checked by the acceptance validator on the decoded snapshot, not by the runtime. It checks:
+  - **Transactions.** Each outstanding CPU, DMA, and kernel request is the latest of its counter and sits in exactly one place: the event queue, a bus FIFO, a region's active transfer (request, held, or response), or a response on its way back. Downstream transfers and media operations are accounted the same way. Nothing is in flight that no one waits for.
+  - **Gate.** A held `ENTER` exists exactly when an operation does. It is the CPU's store, held as `kgate`'s active transfer, and it comes from S.
+  - **CPU.** U code runs below RAM, and S and M code runs in it. A walk runs only with Sv32 on and not in M. At level 1 it reads `satp`'s root table; at level 0 it reads the table named by the valid level-1 pointer PTE of its address. That address is `pc` for a fetch and `rs1 + imm` for a load or store.
+  - **DMA.** With no latched command, the engine is idle at block 0, beat 0. Otherwise, block and beat are within the command, an outstanding beat is addressed `MEM_ADDR + 512·block + 16·beat`, and a WRITE has buffered 16 bytes per beat read.
+  - **Kernel.** Its checks:
+    - the current PID is the one Running process;
+    - the run queue is exactly the Ready processes;
+    - a PCB holds a context only while Ready (§6.4);
+    - the frame bitmap equals the frames owned by live processes and by the creation in progress;
+    - a `write`'s progress is at an output chunk start (§6.8);
+    - a boot stage has no process that has run, and a syscall stage has one running;
+    - after shutdown nothing is outstanding.
+- **Stress points (§9.2).** Every boundary of the reference scenario is classified by what its snapshot holds. Two readings make the list exact under Sv32:
+  - **Point 2.** "`FetchIssue` at `stvec`" is the first state after the delegated entry. With translation on, a fetch starts as a level-1 walk (`WalkIssue` with no instruction, §5.4). The point is therefore "`pc` = `stvec`, privilege S, and the fetch not yet issued", as either `FetchIssue` or that walk. This is how the CPU already behaves, not a change to it.
+  - **Point 8.** It is "U, the first dispatch of that process, and the fetch not yet issued".
+
+  All fourteen sub-points occur. For each, at least the first, middle, and last boundary resume exactly:
+  - mid-walk at both levels, for a fetch, a load, and a store;
+  - 23 delegated exception entries;
+  - `ENTER` held with the kernel's access in flight, at boot and during a syscall;
+  - a DMA beat in flight behind a `STATUS` poll;
+  - partial frame zeroing and a partial segment copy;
+  - a `write` with some bytes at the UART;
+  - a trap-frame write before `SRET`;
+  - the five first U fetches after `SRET`.
+- **Every event.** Three layers cover all 166,898 checkpoints (0 through 166,897 events) of the reference scenario:
+  - **Chained (test).** At every boundary, the snapshot is decoded, validated, restored into a freshly built platform, and compared by identity. The restored platform then dispatches the next event, which must equal the uninterrupted run's. The chain must end in the reference's final snapshot, digests, and UART output. The no-fault disk's 141,129 boundaries are decoded, validated, and classified.
+  - **Exhaustive (`cargo xtask m3-golden every-event`).** Every checkpoint is restored into a fresh platform and run to the end, untraced. It must replay the uninterrupted run's events, reissue nothing, and end in its snapshot and digests. CI runs it in eight shards of about equal cost.
+  - **Traced (test).** Resumed with the trace prefix: the stress points, 42 spaced checkpoints, and windows at the start, around the portable snapshot, and at the end. Each must reproduce exactly:
+    - the §12.3 judgment and the events;
+    - the canonical trace bytes and the trace digest;
+    - the metrics and the UART output;
+    - the final snapshot.
+- **No reissue.** This holds for each issuer: the CPU, DMA, and kernel masters, the bus's downstream counter, and the media.
+  - The transactions after a restore that predate it are exactly those in flight in its snapshot.
+  - Each of them completes once.
+  - New transactions continue the issuer's counter by one.
+
+  Counters are canonical, so the remaining `TxnId` sequence is the uninterrupted run's.
+- **Corruption.** A refused restore leaves the runtime `Faulted`, so nothing partial survives, and any later restore is refused with `InvalidState`. Each of the three layers that catch a doctored snapshot is tested:
+  - **Both the component readers and the decoder:** the container, schemas, lengths, tags, reserved encodings, counters, a walk's level, the bus's `kgate` direction, the engine, the kernel stage, life, the current PID, PCB states, the bitmap, and syscall progress.
+  - **The validator only**, where the state is valid locally but inconsistent across components: a U privilege at an S `pc`, a walk's table, a bus transfer's master or downstream id, a DMA beat or block, or a held `ENTER`'s transaction.
+  - **The resume only**, where the state is consistent but the continuation differs: a DMA or kernel `TxnId` counter, or the UART output.
+
+  Cuts and bit flips of the portable snapshot never panic.
+- **Portable snapshot.** `tests/golden/m3-reference.mid.snap` is point 3 during a syscall, made specific: the first boundary of the reference scenario with `ENTER` held, the kernel's access in flight, and a `write` in progress with some of its bytes at the UART (after 121,286 events). It restores on Linux and Windows and runs to the golden end with no reissue.
+- **Golden file.** For the reference and no-fault disks, `tests/golden/m3-reference.json` holds:
+  - the disk's BLAKE3;
+  - the halt, the SRST `ecall` from S at its `pc`, and the shutdown reason, `a1` of that `ecall` (1 and 0);
+  - the exact UART bytes and their BLAKE3;
+  - the §12.3 metrics: events, instructions retired, `os.*` records, syscalls, switches, exceptions, DMA commands, and UART bytes;
+  - the state, execution, and trace digests; the trace digest covers the canonical trace, so it freezes the whole trace;
+  - the final snapshot's size and BLAKE3, which is the state digest by definition.
+
+  Its `mid_snapshot` entry is the portable snapshot's manifest: the scenario, the checkpoint, the events before it, the component schemas, the seed, the compatibility id, the firmware and disk BLAKE3, and the size and BLAKE3. Every value equals M3.6's.
+- **Workflow.** The `cargo xtask m3-golden` commands:
+  - **`bless`** writes both files, and only on purpose.
+  - **`verify`** checks the M3 fixtures against their manifest first. It then reruns both disks and the portable snapshot and compares every field and byte (LF only, no trailing byte).
+  - **`emit <dir>`** writes this machine's files.
+  - **`check <dir>`** checks another machine's files against the committed ones and restores its snapshot.
+
+  CI never blesses. Each OS runs `verify`, and in the M3 cross-OS job each checks the files the other emitted.
 
 ---
 
